@@ -93,13 +93,13 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = 10
+n_epochs = 3
 learning_rate = 1e-3
-batch_per_epoch = 400
+batch_per_epoch = 256
 batch_size_order = 16
 val_size_order = 10
 scale_factor = 1
-test_size_order = 782
+test_size = 782
 
 USE_FFT = False
 
@@ -169,7 +169,7 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
     for i in range(N_ris):
         for j in range(N_ris):
             H_SI[i, j] = 1/(rx[j] - tx[i]) * np.exp(- 1j * 2 * np.pi * (rx[j] - tx[i]) / wavelength)
-    H_SI = 1e-6 * H_SI * N_ris/ np.linalg.norm(H_SI,'fro')   # Normalization
+    H_SI = 5e-6 * H_SI * N_ris/ np.linalg.norm(H_SI,'fro')   # Normalization
     
     for ii in range(num_samples):
         # 获取用户位置
@@ -327,8 +327,8 @@ with tf.name_scope("array_response_construction"):
     from0toN = tf.cast(tf.range(0, N, 1), tf.float32)
 
 with tf.name_scope("channel_sensing"):
-    hidden_size = 256
-    layer_neuron_size = 256
+    hidden_size = 128
+    layer_neuron_size = 128
     A1 = tf.get_variable("A1", shape=[hidden_size, layer_neuron_size], dtype=tf.float32, initializer=he_init)
     A2 = tf.get_variable("A2", shape=[layer_neuron_size, layer_neuron_size], dtype=tf.float32, initializer=he_init)
     A3 = tf.get_variable("A3", shape=[layer_neuron_size, layer_neuron_size], dtype=tf.float32, initializer=he_init)
@@ -382,9 +382,9 @@ with tf.name_scope("channel_sensing"):
         ris_her_unnorm = x3 @ A4 + b4
         ris_her_r = ris_her_unnorm[:, 0:N_ris]  # real part
         ris_her_i = ris_her_unnorm[:, N_ris:2*N_ris] # imaginary part
-        theta_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i))) # normalization
-        theta_real = ris_her_r / theta_tmp
-        theta_imag = ris_her_i / theta_tmp
+        theta_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i), axis=1, keepdims=True)) # normalization per sample
+        theta_real = tf.divide(ris_her_r , theta_tmp)
+        theta_imag = tf.divide(ris_her_i , theta_tmp)
         theta = tf.concat([theta_real, theta_imag], axis=1)   
         theta_T = tf.reshape(theta, [-1, 1, 2 * N_ris])
         theta_list.append(theta_T[:, 0, :])
@@ -426,7 +426,7 @@ with tf.name_scope("channel_sensing"):
     ris_her_unnorm = x3 @ A4 + b4
     ris_her_r = ris_her_unnorm[:, 0:N_ris]  # real part
     ris_her_i = ris_her_unnorm[:, N_ris:2*N_ris] # imaginary part
-    theta_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i))) # normalization
+    theta_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i), axis=1, keepdims=True)) # normalization per sample
     theta_real = ris_her_r / theta_tmp
     theta_imag = ris_her_i / theta_tmp
     
@@ -575,7 +575,7 @@ with tf.Session() as sess:
         epoch_u2_losses = []
         
         for rnd_indices in range(batch_per_epoch):
-            # 生成训练数据
+            # Training set
             channel_true_train, set_location_user_train = generate_irs_user_channel(
                 None, location_ris_1, num_samples=batch_size_order*delta_inv, Rician_factor=Rician_factor)
             A_T_1_real, _ = channel_complex2real(channel_true_train)
@@ -610,7 +610,7 @@ with tf.Session() as sess:
             snr_db_val = 10*np.log10(np.mean(snr_eff_val))
             print(f" SNR_eff [dB]: {snr_db_val:.6f}, SINR[dB]: {10*np.log10(np.mean(sinr_val)):.6f}")
 
-        # 早停检查
+        # Early Stop
         if loss_val < best_val - 1e-9:
             best_val = loss_val
             wait = 0
@@ -623,7 +623,7 @@ with tf.Session() as sess:
                 print("Early stopping at epoch", epoch)
                 break
     
-    # 从训练集中选择样本进行测试
+    # Validation samples from training set
     num_test_samples = 10
     sample_indices = random.sample(range(len(set_location_user_val)), num_test_samples)
     
@@ -650,36 +650,34 @@ with tf.Session() as sess:
         theta_test_list.append(theta_test_cplx)
         location_list.append(location_user_target)
     
-    # 保存训练样本测试结果
-    model_filename = os.path.join(drive_save_path, f'validate_data_sample.mat')
-    sio.savemat(model_filename, dict(
-        performance=np.array(train_losses),
-        snr_const=snr_const,
-        N=N, N_ris=N_ris,
-        epoch=n_epochs, 
-        delta_inv=delta_inv,
-        mean_true_alpha=mean_true_alpha,
-        loc_true_list=location_list,
-        std_per_dim_alpha=std_per_dim_alpha,
-        noiseSTD_per_dim=noiseSTD_per_dim, 
-        tau=tau,
-        theta_test_list=theta_test_list
-    ))
+    # # 保存训练样本测试结果
+    # model_filename = os.path.join(drive_save_path, f'validate_data_sample.mat')
+    # sio.savemat(model_filename, dict(
+    #     performance=np.array(train_losses),
+    #     snr_const=snr_const,
+    #     N=N, N_ris=N_ris,
+    #     epoch=n_epochs, 
+    #     delta_inv=delta_inv,
+    #     mean_true_alpha=mean_true_alpha,
+    #     loc_true_list=location_list,
+    #     std_per_dim_alpha=std_per_dim_alpha,
+    #     noiseSTD_per_dim=noiseSTD_per_dim, 
+    #     tau=tau,
+    #     theta_test_list=theta_test_list
+    # ))
     
     # TESTING 
-    performance = np.zeros([1, scale_factor])
-    for j in range(scale_factor):
-        print(j)
-        location_user_target = np.empty([num_users, 3])
-        coordinate_k = np.array([-25, 41, -20])
-        # coordinate_k2 = np.array([-25, 2*55.5-41, -20])
-        location_user_target[0, :] = coordinate_k
-        # location_user_target[1, :] = coordinate_k2
+    
+    sinr_test_set = []
+    interference_pow_set = []
+    test_loc = []
+
+    for j in range(test_size):
         
         # 使用简化的信道生成函数
         channel_true_test, set_location_user_test = generate_irs_user_channel(
-            location_user_target, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
-        A_T_1_real_test, channel_bs_irs_user_test = channel_complex2real(channel_true_test)
+            None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
+        A_T_1_real_test, _ = channel_complex2real(channel_true_test)
         
         feed_dict_test = {
             loc_input: np.array(set_location_user_test),
@@ -687,30 +685,26 @@ with tf.Session() as sess:
             lay['P']: Pvec[0],
             H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
             H_b_placeholder: channel_true_test[2]
-
         }
         
-        mse_loss, phi_hat_test, theta_test = sess.run([loss, loc_hat, theta_list], feed_dict=feed_dict_test)
-        performance[0, j] = mse_loss
+        mse_loss, sinr_test, theta_test, interference_pow_test = sess.run([loss, sinr, theta_list, interference_pow], feed_dict=feed_dict_test)
         theta_test = np.array(theta_test)
         theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
-        radio_map, theta_test = generate_radio_map(theta_test_cplx)
+        # radio_map, theta_test = generate_radio_map(theta_test_cplx)
+        sinr_test_set.append(sinr_test)
+        interference_pow_set.append(interference_pow)
+        test_loc.append(set_location_user_test)
 
-# 保存最终结果
-# model_filename = os.path.join(drive_save_path, f'interpret_closeBS_fullRician_3D_1RIS_newcoordinateSISO_N_{N}_tau_{tau}_snr_{int(snr_const[0])}.mat')
+# Save the final results
+# model_filename = os.path.join(drive_save_path, f'TEST_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}.mat')
 # sio.savemat(model_filename, dict(
-#     performance=performance,
-#     snr_const=snr_const,
-#     N=N, N_ris=N_ris,
-#     epoch=n_epochs, 
-#     delta_inv=delta_inv,
-#     mean_true_alpha=mean_true_alpha,
-#     theta_test=theta_test_cplx,
-#     radio_map=radio_map,
-#     loc_true=location_user_target,
-#     std_per_dim_alpha=std_per_dim_alpha,
-#     noiseSTD_per_dim=noiseSTD_per_dim, 
-#     tau=tau
+#     snr_const = snr_const,
+#     N = N, N_ris = N_ris, tau = tau,
+#     epoch = n_epochs, 
+#     theta_test = theta_test_cplx,
+#     loc_true = test_loc,
+#     sinr_test = sinr_test_set,
+#     interference_pow = interference_pow_set
 # ))
 
 
@@ -784,7 +778,7 @@ with tf.Session() as sess:
     saver.restore(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}') #
     
     # Example: test on new random user locations
-    num_test_samples = 1
+    num_test_samples = 5
     test_losses = []
     test_theta_list = []
     test_location_list = []
