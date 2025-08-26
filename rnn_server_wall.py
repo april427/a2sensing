@@ -212,7 +212,6 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
         # set_location_user.append(np.array([aoa_irs_y, pathloss_irs_user]))
         set_location_user.append(np.array([np.arcsin(aoa_irs_y_k), d_k])[:, np.newaxis])
         
-        # 生成IRS-用户信道
         # Xiyu: This is considered when the RIS is a rectangular array
         i1 = np.mod(np.arange(num_elements_irs), irs_Nh)
         i2 = np.floor(np.arange(num_elements_irs) / irs_Nh)
@@ -229,9 +228,6 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
 
         channel_irs_user.append( x_BD* tmp + H_SI[:,:,np.newaxis])
         H_b.append(x_BD* tmp.squeeze())
-    # # 为保持与原代码兼容的数据结构，我们需要返回完整的通道元组，但BS相关通道为空
-    # dummy_bs_user = np.zeros((num_samples, N_ris, num_user), dtype=complex)  # 空BS-用户通道
-    # dummy_bs_irs = np.zeros((num_samples, N_ris, num_elements_irs), dtype=complex)  # 空BS-IRS通道
     
     channels = (H_SI, np.array(channel_irs_user), H_b) 
     # Channel typle: self-interference, IRS-user, backscattered
@@ -243,13 +239,12 @@ def channel_complex2real(channels):
     (num_sample, num_elements_irs, _, num_user) = channel_irs_user.shape
     num_antenna_bs = N_ris
     
-    # 简化后只需要IRS-用户通道的实数表示
     A_T_real = np.zeros([num_sample, 2 * num_elements_irs, 2 * num_antenna_bs, num_user])
     set_channel_combine_irs = np.zeros([num_sample, num_antenna_bs, num_elements_irs, num_user], dtype=complex)
     
     for kk in range(num_user):
         channel_irs_user_k = channel_irs_user[:, :, :, kk]
-        # 直接将通道reshape至 (num_sample, num_elements_irs, num_elements_irs)  
+        # (num_sample, num_elements_irs, num_elements_irs)  
         channel_combine_irs = channel_irs_user_k.reshape(num_sample, num_elements_irs, num_elements_irs)
         set_channel_combine_irs[:, :, :, kk] = channel_combine_irs
         
@@ -541,7 +536,7 @@ training_op = tf.train.AdamOptimizer(lr).minimize(loss_reg, global_step=global_s
 init = tf.global_variables_initializer()
 saver = tf.train.Saver()
 
-# 验证集
+# Validation Set
 channel_true_val, set_location_user_val = generate_irs_user_channel(
     None, location_ris_1, num_samples=val_size_order*delta_inv, Rician_factor=Rician_factor)
 A_T_1_real_val, _ = channel_complex2real(channel_true_val)

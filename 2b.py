@@ -71,6 +71,7 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
     
     channel_irs_user = []
     set_location_user = []
+    H_b = []
 
     wavelength = Wavelength
 
@@ -79,10 +80,10 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
     tx = np.arange(0, N_ris, 1) * (wavelength/2)
     rx = np.arange(N_ris, N_ris*2, 1) * (wavelength/2)
     H_SI = np.zeros((N_ris, N_ris), dtype=complex)
-    # for i in range(N_ris):
-    #     for j in range(N_ris):
-    #         H_SI[i, j] = 1/(rx[j] - tx[i]) * np.exp(- 1j * 2 * np.pi * (rx[j] - tx[i]) / wavelength)
-    # H_SI = 1e-6 * H_SI * N_ris/ np.linalg.norm(H_SI,'fro')   # Normalization
+    for i in range(N_ris):
+        for j in range(N_ris):
+            H_SI[i, j] = 1/(rx[j] - tx[i]) * np.exp(- 1j * 2 * np.pi * (rx[j] - tx[i]) / wavelength)
+    H_SI = 5e-6 * H_SI * N_ris/ np.linalg.norm(H_SI,'fro')   # Normalization
     
     for ii in range(num_samples):
         # 获取用户位置
@@ -129,24 +130,24 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
         # Xiyu: This is considered when the RIS is a rectangular array
         i1 = np.mod(np.arange(num_elements_irs), irs_Nh)
         i2 = np.floor(np.arange(num_elements_irs) / irs_Nh)
-        
+
         tmp = np.random.normal(loc=0, scale=np.sqrt(0.5), size=[num_elements_irs, num_elements_irs, num_user]) \
-              + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[num_elements_irs, num_elements_irs, num_user])
-        
+              + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[ num_elements_irs, num_elements_irs, num_user])
+
         for k in range(num_user):
             a_irs_user = np.exp(1j * np.pi * (i1 * aoa_irs_y[k] * aoa_irs_cos_z[k] + i2 * aoa_irs_z[k])) # steering vector norm is N_ris
             a_irs_user = a_irs_user[:, np.newaxis]
 
-            tmp[:,:, k] = np.sqrt(Rician_factor/(1+Rician_factor)) *(a_irs_user @ np.transpose(np.conj( a_irs_user))) + np.sqrt(1/(1+Rician_factor)) * tmp[:,:, k]
+            tmp[ :,:, k] = np.sqrt(Rician_factor/(1+Rician_factor)) *(a_irs_user @ np.transpose(np.conj( a_irs_user))) + np.sqrt(1/(1+Rician_factor)) * tmp[:,:, k]
             tmp[:,:,k] = tmp[:,:, k] * pathloss_irs_user[k] # Backscattered channel
-            
+
         channel_irs_user.append( x_BD* tmp + H_SI[:,:,np.newaxis])
-    
+        H_b.append(x_BD* tmp.squeeze())
     # # 为保持与原代码兼容的数据结构，我们需要返回完整的通道元组，但BS相关通道为空
     # dummy_bs_user = np.zeros((num_samples, N_ris, num_user), dtype=complex)  # 空BS-用户通道
     # dummy_bs_irs = np.zeros((num_samples, N_ris, num_elements_irs), dtype=complex)  # 空BS-IRS通道
     
-    channels = (H_SI, np.array(channel_irs_user), tmp) 
+    channels = (H_SI, np.array(channel_irs_user), H_b) 
     # Channel typle: self-interference, IRS-user, backscattered
     return channels, set_location_user
 
@@ -227,6 +228,69 @@ def calculate_beam_pattern(theta_vector, angles):
         beam_pattern.append(beam_gain)
     
     return np.array(beam_pattern)
+
+# %%
+def plot_beam_patterns(theta_complex, true_location, save_path=None):
+    """
+    Plot beam patterns at different time steps
+    """
+    tau_steps = theta_complex.shape[0]
+    
+    # Angle range for beam pattern visualization
+    angles = np.linspace(-np.pi/2, np.pi/2, 181)
+    angles_deg = angles * 180 / np.pi
+    
+    # Calculate beam patterns for each time step
+    beam_patterns = []
+    for t in range(tau_steps):
+        theta_t = theta_complex[t, :]
+        beam_pattern = calculate_beam_pattern(theta_t, angles)
+        beam_patterns.append(beam_pattern)
+    
+    beam_patterns = np.array(beam_patterns)
+    
+    num_plots = 8 if tau_steps>1 else 1
+    # Create subplots
+    fig, axes = plt.subplots( 1, num_plots,  figsize=(16,8))
+    # axes = axes.flatten()
+    
+    # Calculate true UE angle based on location
+    d_k = true_location[0][1]
+    true_angle_deg = true_location[0][0] * 180 / np.pi
+    true_angle_sin = np.arcsin(np.clip(true_angle_deg, -1, 1)) * 180 / np.pi
+    
+    # Plot the last 4 time steps
+    for t in range(num_plots):
+        if num_plots == 1:
+            ax = axes
+        else:
+            ax = axes[t]
+
+        # Plot beam pattern in dB
+        beam_dB = 10 * np.log10(beam_patterns[tau_steps - num_plots + t] / np.max(beam_patterns[tau_steps - num_plots + t]))
+        ax.plot(angles_deg, beam_dB, 'b-', linewidth=2)
+        
+        # Mark true UE angle
+        ax.axvline(true_angle_deg, color='r', linestyle='--', linewidth=2, label='True UE')
+        
+        ax.set_xlabel('Angle (degrees)')
+        ax.set_ylabel('Beam Gain (dB)')
+        ax.set_title(f'Time Step {t+1}')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([-40, 0])
+        ax.set_xlim([-90, 90])
+        
+        if t == 0:
+            ax.legend()
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    plt.show()
+    
+    return beam_patterns
 
 #####################################################
 class MLPBlock(tf.keras.layers.Layer):
@@ -322,9 +386,9 @@ batch_per_epoch = 400
 batch_size_order = 16
 batch_size_val = 10000
 scale_factor = 1
-test_size_order = 782
+test_size = 782
 
-model_path = 
+model_path = f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}'
 
 USE_FFT = False
 
@@ -339,7 +403,7 @@ he_init = tf.variance_scaling_initializer()  # Define initialization method
 
 # Place Holders
 loc_input = tf.placeholder(tf.float32, shape=(None, 2, num_users), name="loc_input")
-channel_bs_irs_user = tf.placeholder(tf.float32, shape=(None, 2 * N_ris, 2 * N_ris, num_users), name="channel_bs_irs_user")
+channel_bs_irs_user = tf.placeholder(tf.complex64, shape=(None,  N_ris, N_ris, num_users), name="channel_bs_irs_user")
 H_SI_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_ris), name="H_SI")
 H_b_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_ris), name="H_b")
 
@@ -353,7 +417,7 @@ with tf.name_scope("array_response_construction"):
     
 
 with tf.name_scope("channel_sensing"):
-    hidden_size1 = 512
+    hidden_size1 = 256
     RNN1 = RNN(hidden_size1, 'rnn_1')
     
     MLP_user1_transmit = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_user1_transmit')
@@ -393,15 +457,15 @@ with tf.name_scope("channel_sensing"):
         v_her = MLP_user1_transmit(h_old1)  # this is actually the MLP for receive beamformer
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm)
-        v1 = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
-        v1 = tf.reshape(v1, [-1, N_ris, 1])
+        vr = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
+        vr = tf.reshape(vr, [-1, N_ris, 1])
 
         'user 1 design next transimit beamformer based on  h_old1'
         v_her = MLP_user1_receive(h_old1)  # this is actually the MLP for transimit beamformer
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm)
-        v2 = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
-        v2 = tf.reshape(v2, [-1, N_ris, 1])
+        theta_T_complex = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
+        theta_T_complex = tf.reshape(theta_T_complex, [-1, N_ris, 1])
 
     'calculate SINR'
     MLP_bf1 = MLPBlock(3, [1024, 1024, 2 * N_ris], name='mlp_bf1')
@@ -416,13 +480,29 @@ with tf.name_scope("channel_sensing"):
     H_SI_tf = H_SI_placeholder
     H_b_hat = H_b_placeholder
 
-    sig_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_b_hat, v2))**2
-    interference_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_SI_tf, v2))**2
+    batch_size = tf.shape(loc_input)[0]
+    def compute_G_for_batch(H_SI_batch):
+        s, u, v = tf.linalg.svd(H_SI_batch)
+        s_inv = tf.where(s > 1e-8, 1.0 / s, tf.zeros_like(s))
+        s_inv_complex = tf.cast(s_inv, tf.complex64)
+        H_SI_pinv = tf.matmul(v, tf.matmul(tf.linalg.diag(s_inv_complex), tf.linalg.adjoint(u)))
+        middle = tf.matmul(H_SI_batch, H_SI_pinv)
+        I = tf.eye(N_ris, dtype=tf.complex64)
+        return I - middle
+
+    G = tf.map_fn(compute_G_for_batch, H_SI_tf, dtype=tf.complex64)  # (batch, N_ris, N_ris)
+    G_Hb = tf.matmul(G, H_b_hat)  # (batch, N_ris, N_ris)
+    G_Hb_theta = tf.matmul(G_Hb, theta_T_complex)  # (batch, N_ris, 1)
+    power = lay['P'] * tf.abs( tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ G_Hb_theta) ** 2   # (batch,)
+    snr_eff = power / ( 2*(noiseSTD_per_dim**2)*N_ris)
+
+    sig_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_b_hat, theta_T_complex))**2
+    interference_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_SI_tf, theta_T_complex))**2
     sinr = sig_pow / (interference_pow + 2*(noiseSTD_per_dim**2)*N_ris)
     
 
 ####### Loss Function
-loss = -sinr
+loss = - tf.reduce_mean(sinr, axis=[0, 1, 2])
 ####### Optimizer
 optimizer = tf.train.AdamOptimizer(learning_rate)
 training_op = optimizer.minimize(loss, name="training_op")
@@ -436,7 +516,7 @@ A_T_1_real_val, _ = channel_complex2real(channel_true_val)
 
 feed_dict_val = {
     loc_input: np.array(set_location_user_val),
-    channel_bs_irs_user: A_T_1_real_val,
+    channel_bs_irs_user: channel_true_val[1],  # Use complex channel directly
     lay['P']: Pvec[0],
     H_SI_placeholder: np.tile(channel_true_val[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
     H_b_placeholder: channel_true_val[2]
@@ -448,38 +528,241 @@ with tf.Session() as sess:
         init.run()
     else:
         saver.restore(sess, model_path)
-    best_loss, opt_loss, rnd_loss = sess.run([loss, bf_gain_opt, bf_gain_rnd], feed_dict=feed_dict_val)
-    print(-best_loss, opt_loss, rnd_loss)
-    print(tf.test.is_gpu_available())  # Prints whether or not GPU is on
+    
+    # Early stop
+    best_val = 1e9
+    wait = 0
+    PATIENCE = 20
+    print(tf.test.is_gpu_available())  
+
     no_increase = 0
+
     for epoch in range(n_epochs):
         batch_iter = 0
-        for rnd_indices in range(batch_per_epoch):
-            alpha_train = np.random.normal(loc=np.real(mean_true_alpha), scale=std_per_dim_alpha,
-                                           size=[batch_size_train, L]) \
-                          + 1j * np.random.normal(loc=np.real(mean_true_alpha), scale=std_per_dim_alpha,
-                                                  size=[batch_size_train, L])
-            phi_1_train = np.random.uniform(low=phi_min, high=phi_max, size=[batch_size_train, L])
-            phi_2_train = np.random.uniform(low=phi_min, high=phi_max, size=[batch_size_train, L])
-            feed_dict_train = {alpha_input: alpha_train,
-                               phi_input_1: phi_1_train,
-                               phi_input_2: phi_2_train,
-                               lay['P']: P_snr}
+        epoch_train_losses = []
+        epoch_u1_losses = []
+        epoch_u2_losses = []
 
-            sess.run(training_op, feed_dict=feed_dict_train)
+        for rnd_indices in range(batch_per_epoch):
+            channel_true_train, set_location_user_train = generate_irs_user_channel(
+                None, location_ris_1, num_samples=batch_size_order*delta_inv, Rician_factor=Rician_factor)
+            A_T_1_real, _ = channel_complex2real(channel_true_train)
+            H_SI_batch = channel_true_train[0]  # Self-interference channel
+            H_b_batch = channel_true_train[2]   # Backscattered channel
+            
+            feed_dict_batch = {
+                loc_input: np.array(set_location_user_train),
+                channel_bs_irs_user: channel_true_train[1],  # Use complex channel directly
+                lay['P']: Pvec[0],
+                H_SI_placeholder: np.tile(H_SI_batch[np.newaxis, :, :], (len(set_location_user_train), 1, 1)),  # Broadcast to batch
+                H_b_placeholder: H_b_batch  # Shape: (batch, N_ris, N_ris)
+            }
+
+            _, train_loss_val, sinr_val = sess.run(
+                [training_op, loss, sinr], feed_dict=feed_dict_batch
+            )
+            
+            epoch_train_losses.append(train_loss_val)
             batch_iter += 1
+        
+        avg_train_loss = np.mean(epoch_train_losses)
         loss_val = sess.run(loss, feed_dict=feed_dict_val)
-        print('epoch', epoch, '  loss_test:%2.5f' % -loss_val, ' dB:%2.3f' % (10 * np.log10(-best_loss)),
-              '  opt_test:%2.3f' % (10 * np.log10(opt_loss)), 'no_increase:', no_increase)
-        if epoch % 10 == 9:  # Every 10 iterations it checks if the validation performace is improved, then saves parameters
-            if loss_val < best_loss:
+        
+        print('epoch', epoch,
+              '  train_loss:%2.7f' % avg_train_loss,
+              '  val_loss:%2.7f' % loss_val,
+              '  best_val:%2.7f' % best_val)
+        
+        if epoch % 4 == 3:  # Every 4 iterations it checks if the validation performace is improved, then saves parameters
+            if loss_val < best_val:
                 save_path = saver.save(sess, model_path)
-                best_loss = loss_val
+                best_val = loss_val
                 no_increase = 0
             else:
                 no_increase = no_increase + 10
+        
+        if epoch % 5 == 0:
+            print(f" SINR[dB]: {10*np.log10(np.mean(sinr_val)):.6f}")
 
-    # sio.savemat('./results/RNN_tau_'+str(tau)+'.mat',{'bf_gain_dB':(10*np.log10(-best_loss)),
-    #                                         'bf_gain_opt_dB':(10*np.log10(opt_loss)),
-    #                                         'bf_gain_rnd_dB':(10*np.log10(rnd_loss)),
-    #                                         'N1_N2_tau_L':(N1,N2,tau,L), 'phi_min_max':(phi_min,phi_max),'snrdB':snrdB})
+        # Early Stop
+        if loss_val < best_val - 1e-9:
+            best_val = loss_val
+            wait = 0
+            saver.save(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}')
+            with open(os.path.join(drive_save_path, "best_val_loss.txt"), "w") as f:
+                f.write(str(best_val))
+        else:
+            wait += 1
+            if wait == PATIENCE:
+                print("Early stopping at epoch", epoch)
+                break
+
+    # Validation samples from training set
+    num_test_samples = 10
+    sample_indices = random.sample(range(len(set_location_user_val)), num_test_samples)
+    
+    train_losses = []
+    theta_test_list = []
+    location_list = []
+    
+    for sample_index in sample_indices:
+        location_user_target = set_location_user_val[sample_index]
+        A_T_1_real_test = A_T_1_real_val[sample_index]
+        
+        feed_dict_test = {
+            loc_input: np.expand_dims(location_user_target, axis=0),
+            channel_bs_irs_user: channel_true_val[1],
+            lay['P']: Pvec[0],
+            H_SI_placeholder: np.tile(channel_true_val[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
+            H_b_placeholder: channel_true_val[2]
+        }
+        
+        mse_loss, theta_test, v_test = sess.run([loss, theta_T_complex, v_complex], feed_dict=feed_dict_test)
+        train_losses.append(mse_loss)
+        theta_test_list.append(theta_test)
+        location_list.append(location_user_target)
+    
+    # # 保存训练样本测试结果
+    # model_filename = os.path.join(drive_save_path, f'validate_data_sample.mat')
+    # sio.savemat(model_filename, dict(
+    #     performance=np.array(train_losses),
+    #     snr_const=snr_const,
+    #     N=N, N_ris=N_ris,
+    #     epoch=n_epochs, 
+    #     delta_inv=delta_inv,
+    #     mean_true_alpha=mean_true_alpha,
+    #     loc_true_list=location_list,
+    #     std_per_dim_alpha=std_per_dim_alpha,
+    #     noiseSTD_per_dim=noiseSTD_per_dim, 
+    #     tau=tau,
+    #     theta_test_list=theta_test_list
+    # ))
+    
+    # TESTING 
+    
+    sinr_test_set = []
+    interference_pow_set = []
+    test_loc = []
+
+    for j in range(test_size):
+        
+        # 使用简化的信道生成函数
+        channel_true_test, set_location_user_test = generate_irs_user_channel(
+            None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
+        A_T_1_real_test, _ = channel_complex2real(channel_true_test)
+        
+        feed_dict_test = {
+            loc_input: np.array(set_location_user_test),
+            channel_bs_irs_user: channel_true_test[1],
+            lay['P']: Pvec[0],
+            H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
+            H_b_placeholder: channel_true_test[2]
+        }
+        
+        mse_loss, sinr_test, theta_test, interference_pow_test = sess.run([loss, sinr, theta_list, interference_pow], feed_dict=feed_dict_test)
+        theta_test = np.array(theta_test)
+        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
+        # radio_map, theta_test = generate_radio_map(theta_test_cplx)
+        sinr_test_set.append(sinr_test)
+        interference_pow_set.append(interference_pow)
+        test_loc.append(set_location_user_test)
+
+# Save the final results
+# model_filename = os.path.join(drive_save_path, f'TEST_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}.mat')
+# sio.savemat(model_filename, dict(
+#     snr_const = snr_const,
+#     N = N, N_ris = N_ris, tau = tau,
+#     epoch = n_epochs, 
+#     theta_test = theta_test_cplx,
+#     loc_true = test_loc,
+#     sinr_test = sinr_test_set,
+#     interference_pow = interference_pow_set
+# ))    
+
+# %% 
+# Load the saved model and perform TESTING
+with tf.Session() as sess:
+    # Restore the trained model
+    saver.restore(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}') #
+    
+    # Example: test on new random user locations
+    num_test_samples = 5
+    test_losses = []
+    test_theta_list = []
+    test_location_list = []
+    
+    for _ in range(num_test_samples):
+        # Generate a random user location
+        location_user_test = generate_location(num_users)
+        channel_true_test, set_location_user_test = generate_irs_user_channel(
+            location_user_test, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
+        A_T_1_real_test, _ = channel_complex2real(channel_true_test)
+        print(set_location_user_test)
+        H_SI = channel_true_test[0][np.newaxis, :, :]  # Self-interference channel
+        feed_dict_test = {
+            loc_input: np.array(set_location_user_test),
+            channel_bs_irs_user: channel_true_test[1],
+            lay['P']: Pvec[0],
+            H_SI_placeholder: H_SI,  # Add batch dimension
+            H_b_placeholder: channel_true_test[2]    # Add batch dimension
+        }
+
+        mse_loss,  theta_test,   sinr_test, sig_pow_test, interference_pow_test = sess.run(
+                [loss,  theta_list,  sinr, sig_pow, interference_pow], 
+                feed_dict=feed_dict_test)
+        test_losses.append(mse_loss)
+        theta_test = np.array(theta_test)
+        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
+        test_theta_list.append(theta_test_cplx)
+        test_location_list.append(location_user_test)
+
+        print(f" SNR_eff: {10*np.log10(np.mean(snr_eff_test)):.6f}")
+        print(f" SINR: {10*np.log10(np.mean(sinr_test)):.6f}")
+        print(f" Signal Power: {np.mean(sig_pow_test):.6f}")
+        print(f" Interference Power: {np.mean(interference_pow_test):.6f}")
+
+        # visualize 
+        plot_beam_patterns(
+            theta_test_cplx.squeeze(), set_location_user_test,
+            save_path=None#f'{drive_save_path}/demo_beam_patterns_{i+1}.png'
+        )
+
+
+        ### Optimum coherent beamformer 
+        i1 = np.mod(np.arange(16), 16)
+        
+        H_b_hat = channel_true_test[2][0]
+        if np.all(H_SI) ==0:
+            theta_opti = 1/np.sqrt(N_ris)*np.exp(1j * np.pi * (i1 * np.sin(set_location_user_test[0][0][0]))) 
+            H_B = np.matmul(np.conj(H_b_hat).transpose(), H_b_hat)
+
+        else:
+            # Rayleigh quotient
+            H_B = np.matmul(np.conj(H_b_hat).transpose(), H_b_hat)
+            H_A = np.matmul(np.conj(H_SI.squeeze()).transpose(), H_SI.squeeze()) + 2*(noiseSTD_per_dim**2)/Pvec[0] * np.eye(N_ris)
+            eigv, s, _ = np.linalg.svd(np.matmul(np.linalg.inv(H_A), H_B ))
+            theta_opti = eigv[:,0]
+
+
+        midterm = np.matmul(H_SI.squeeze(),  np.linalg.pinv(H_SI.squeeze()) )
+        G = np.eye(N_ris) - midterm 
+
+        ## estimated H_b_hat 
+        angle = set_location_user_test[0][ 0][0]  # real angle (batch,)
+        distance = set_location_user_test[0][ 1][0]  # real distance (batch,)
+
+        # For a ULA along y-axis, steering vector: a = exp(1j * pi * n * sin(angle)), n=0,...,N_ris-1
+        n = np.arange(N_ris)  # (N_ris,)
+        steering_vec = np.exp(1j * np.pi * n * np.sin(angle))
+        coeff =  (Wavelength**2 / (4 * np.pi * distance)**2) * np.exp(1j * (2 * np.pi * distance / Wavelength))
+        H_b_hat = coeff * np.matmul(steering_vec[:,np.newaxis], np.conj(steering_vec[:,np.newaxis]).transpose())  # (batch, N_ris, N_ris)
+
+        sinr_opti = Pvec[0]*np.sum(np.abs(H_b_hat @ theta_opti)**2)/(Pvec[0]*np.sum(np.abs(H_SI.squeeze() @ theta_opti)**2) +2*(noiseSTD_per_dim**2)*N_ris )
+        print(f"SINR of optimal beam: {10*np.log10(sinr_opti):.3f} ")
+        print(f"Signal Power: {Pvec[0]*np.sum(np.abs(H_b_hat @ theta_opti)**2):.3f} ")
+        print(f"Interference Power: {Pvec[0]*np.sum(np.abs(H_SI.squeeze() @ theta_opti)**2):.3f} ")
+
+        plot_beam_patterns(
+            theta_opti[np.newaxis,:], set_location_user_test,
+            save_path=None
+        )    

@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 
 BD_beamInit/
+
+BD_2beamsInit/
