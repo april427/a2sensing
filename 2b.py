@@ -55,9 +55,9 @@ def generate_location(num_users):
     z1 = -20.0
     location_user[0, :] = np.array([x1, y1, z1])
 
-    if num_users >= 2:
-        y2 = 2 * y_wall - y1
-        location_user[1, :] = np.array([x1, y2, z1])
+    # if num_users >= 2:
+    #     y2 = 2 * y_wall - y1
+    #     location_user[1, :] = np.array([x1, y2, z1])
 
     return location_user
 
@@ -380,7 +380,7 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = 2
+n_epochs = 8
 learning_rate = 1e-3
 batch_per_epoch = 400
 batch_size_order = 16
@@ -424,7 +424,8 @@ with tf.name_scope("channel_sensing"):
     MLP_user1_receive = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_user1_receive')
 
     A_T_k1 = channel_bs_irs_user[:,:,:,0] # channel within coherence time
-
+    theta_list =[] # list of complex transmit beamforming
+    v_list = [] # list of complex receive beamforming
     
     for t in range(tau):
         'initailization'
@@ -444,7 +445,7 @@ with tf.name_scope("channel_sensing"):
             v_complex = tf.complex(v_uplink_real, v_uplink_imag)
             v2 = v_complex / tf.norm(v_complex, axis=1, keepdims=True)
 
-        'user 1 observes the next measurement'
+        'BS observes the next measurement'
         y_noiseless1 = tf.transpose(tf.conj(v1), perm=[0, 2, 1]) @ A_T_k1 @ v2
         noise1 = tf.complex(tf.random_normal(tf.shape(y_noiseless1), mean=0.0, stddev=noiseSTD_per_dim), \
                             tf.random_normal(tf.shape(y_noiseless1), mean=0.0, stddev=noiseSTD_per_dim))
@@ -452,20 +453,22 @@ with tf.name_scope("channel_sensing"):
         y_complex1 = tf.reshape(y_complex1, [-1, 1])
         y_real = tf.concat([tf.real(y_complex1), tf.imag(y_complex1)], axis=1) #/ tf.sqrt(lay['P'])
 
-        'user 1 design next receive beamformer based on  h_old1'
+        'BS design next receive beamformer based on  h_old1'
         h_old1, c_old1 = RNN1((y_real, h_old1, c_old1))
         v_her = MLP_user1_transmit(h_old1)  # this is actually the MLP for receive beamformer
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm)
         vr = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
         vr = tf.reshape(vr, [-1, N_ris, 1])
+        v_list.append(vr)
 
-        'user 1 design next transimit beamformer based on  h_old1'
+        'BS design next transimit beamformer based on  h_old1'
         v_her = MLP_user1_receive(h_old1)  # this is actually the MLP for transimit beamformer
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm)
         theta_T_complex = tf.complex(v_her[:, 0:N_ris], v_her[:, N_ris:2 * N_ris])
         theta_T_complex = tf.reshape(theta_T_complex, [-1, N_ris, 1])
+        theta_list.append(theta_T_complex)
 
     'calculate SINR'
     MLP_bf1 = MLPBlock(3, [1024, 1024, 2 * N_ris], name='mlp_bf1')
@@ -481,7 +484,7 @@ with tf.name_scope("channel_sensing"):
     H_b_hat = H_b_placeholder
 
     batch_size = tf.shape(loc_input)[0]
-    def compute_G_for_batch(H_SI_batch):
+    def compute_G_for_batch(H_SI_batch):   # G = I - H_SI H_SI^{\dagger}
         s, u, v = tf.linalg.svd(H_SI_batch)
         s_inv = tf.where(s > 1e-8, 1.0 / s, tf.zeros_like(s))
         s_inv_complex = tf.cast(s_inv, tf.complex64)
@@ -494,15 +497,15 @@ with tf.name_scope("channel_sensing"):
     G_Hb = tf.matmul(G, H_b_hat)  # (batch, N_ris, N_ris)
     G_Hb_theta = tf.matmul(G_Hb, theta_T_complex)  # (batch, N_ris, 1)
     power = lay['P'] * tf.abs( tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ G_Hb_theta) ** 2   # (batch,)
-    snr_eff = power / ( 2*(noiseSTD_per_dim**2)*N_ris)
+    snr_eff = power / ( 2*(noiseSTD_per_dim**2))
 
     sig_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_b_hat, theta_T_complex))**2
     interference_pow = lay['P'] * tf.abs(tf.transpose(tf.conj(v_complex), perm=[0,2,1]) @ tf.matmul(H_SI_tf, theta_T_complex))**2
-    sinr = sig_pow / (interference_pow + 2*(noiseSTD_per_dim**2)*N_ris)
+    sinr = sig_pow / (interference_pow + 2*(noiseSTD_per_dim**2))
     
 
 ####### Loss Function
-loss = - tf.reduce_mean(sinr, axis=[0, 1, 2])
+loss = - tf.log(tf.reduce_mean(sinr))
 ####### Optimizer
 optimizer = tf.train.AdamOptimizer(learning_rate)
 training_op = optimizer.minimize(loss, name="training_op")
@@ -514,12 +517,17 @@ channel_true_val, set_location_user_val = generate_irs_user_channel(
     None, location_ris_1, num_samples=batch_size_val, Rician_factor=Rician_factor)
 A_T_1_real_val, _ = channel_complex2real(channel_true_val)
 
+# Fix the H_b conversion issue
+H_b_val = np.array(channel_true_val[2])
+if H_b_val.ndim == 4 and H_b_val.shape[-1] == 1:
+    H_b_val = H_b_val.squeeze(axis=-1)
+
 feed_dict_val = {
     loc_input: np.array(set_location_user_val),
     channel_bs_irs_user: channel_true_val[1],  # Use complex channel directly
     lay['P']: Pvec[0],
     H_SI_placeholder: np.tile(channel_true_val[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
-    H_b_placeholder: channel_true_val[2]
+    H_b_placeholder: H_b_val
 }
 
 ###########  Training
@@ -614,29 +622,13 @@ with tf.Session() as sess:
             channel_bs_irs_user: channel_true_val[1],
             lay['P']: Pvec[0],
             H_SI_placeholder: np.tile(channel_true_val[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
-            H_b_placeholder: channel_true_val[2]
+            H_b_placeholder: H_b_val
         }
         
-        mse_loss, theta_test, v_test = sess.run([loss, theta_T_complex, v_complex], feed_dict=feed_dict_test)
+        mse_loss, theta_test, v_test = sess.run([loss, theta_list, v_list], feed_dict=feed_dict_test)
         train_losses.append(mse_loss)
         theta_test_list.append(theta_test)
         location_list.append(location_user_target)
-    
-    # # 保存训练样本测试结果
-    # model_filename = os.path.join(drive_save_path, f'validate_data_sample.mat')
-    # sio.savemat(model_filename, dict(
-    #     performance=np.array(train_losses),
-    #     snr_const=snr_const,
-    #     N=N, N_ris=N_ris,
-    #     epoch=n_epochs, 
-    #     delta_inv=delta_inv,
-    #     mean_true_alpha=mean_true_alpha,
-    #     loc_true_list=location_list,
-    #     std_per_dim_alpha=std_per_dim_alpha,
-    #     noiseSTD_per_dim=noiseSTD_per_dim, 
-    #     tau=tau,
-    #     theta_test_list=theta_test_list
-    # ))
     
     # TESTING 
     
@@ -650,18 +642,21 @@ with tf.Session() as sess:
         channel_true_test, set_location_user_test = generate_irs_user_channel(
             None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
         A_T_1_real_test, _ = channel_complex2real(channel_true_test)
+
+        H_b_test = np.array(channel_true_test[2])
+        if H_b_test.ndim == 4 and H_b_test.shape[-1] == 1:
+            H_b_test = H_b_test.squeeze(axis=-1)
         
         feed_dict_test = {
             loc_input: np.array(set_location_user_test),
             channel_bs_irs_user: channel_true_test[1],
             lay['P']: Pvec[0],
             H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
-            H_b_placeholder: channel_true_test[2]
+            H_b_placeholder: H_b_test
         }
         
         mse_loss, sinr_test, theta_test, interference_pow_test = sess.run([loss, sinr, theta_list, interference_pow], feed_dict=feed_dict_test)
         theta_test = np.array(theta_test)
-        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
         # radio_map, theta_test = generate_radio_map(theta_test_cplx)
         sinr_test_set.append(sinr_test)
         interference_pow_set.append(interference_pow)
@@ -686,7 +681,7 @@ with tf.Session() as sess:
     saver.restore(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}') #
     
     # Example: test on new random user locations
-    num_test_samples = 5
+    num_test_samples = 3
     test_losses = []
     test_theta_list = []
     test_location_list = []
@@ -699,24 +694,27 @@ with tf.Session() as sess:
         A_T_1_real_test, _ = channel_complex2real(channel_true_test)
         print(set_location_user_test)
         H_SI = channel_true_test[0][np.newaxis, :, :]  # Self-interference channel
+
+        H_b_test = np.array(channel_true_test[2])
+        if H_b_test.ndim == 4 and H_b_test.shape[-1] == 1:
+            H_b_test = H_b_test.squeeze(axis=-1)
+
         feed_dict_test = {
             loc_input: np.array(set_location_user_test),
             channel_bs_irs_user: channel_true_test[1],
             lay['P']: Pvec[0],
             H_SI_placeholder: H_SI,  # Add batch dimension
-            H_b_placeholder: channel_true_test[2]    # Add batch dimension
+            H_b_placeholder: H_b_test    # Add batch dimension
         }
 
-        mse_loss,  theta_test,   sinr_test, sig_pow_test, interference_pow_test = sess.run(
-                [loss,  theta_list,  sinr, sig_pow, interference_pow], 
+        mse_loss,  theta_test, v_test,  sinr_test, sig_pow_test, interference_pow_test = sess.run(
+                [loss,  theta_list, v_list, sinr, sig_pow, interference_pow], 
                 feed_dict=feed_dict_test)
         test_losses.append(mse_loss)
-        theta_test = np.array(theta_test)
-        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
-        test_theta_list.append(theta_test_cplx)
+        theta_test_cplx = np.array(theta_test)
+        v_cplx = np.array(v_test) 
         test_location_list.append(location_user_test)
 
-        print(f" SNR_eff: {10*np.log10(np.mean(snr_eff_test)):.6f}")
         print(f" SINR: {10*np.log10(np.mean(sinr_test)):.6f}")
         print(f" Signal Power: {np.mean(sig_pow_test):.6f}")
         print(f" Interference Power: {np.mean(interference_pow_test):.6f}")
@@ -724,27 +722,36 @@ with tf.Session() as sess:
         # visualize 
         plot_beam_patterns(
             theta_test_cplx.squeeze(), set_location_user_test,
-            save_path=None#f'{drive_save_path}/demo_beam_patterns_{i+1}.png'
+            save_path=None
         )
-
 
         ### Optimum coherent beamformer 
         i1 = np.mod(np.arange(16), 16)
         
         H_b_hat = channel_true_test[2][0]
-        if np.all(H_SI) ==0:
+        if np.all(H_SI) == 0:
             theta_opti = 1/np.sqrt(N_ris)*np.exp(1j * np.pi * (i1 * np.sin(set_location_user_test[0][0][0]))) 
             H_B = np.matmul(np.conj(H_b_hat).transpose(), H_b_hat)
-
         else:
-            # Rayleigh quotient
+            # Rayleigh quotient with numerical stability
             H_B = np.matmul(np.conj(H_b_hat).transpose(), H_b_hat)
             H_A = np.matmul(np.conj(H_SI.squeeze()).transpose(), H_SI.squeeze()) + 2*(noiseSTD_per_dim**2)/Pvec[0] * np.eye(N_ris)
-            eigv, s, _ = np.linalg.svd(np.matmul(np.linalg.inv(H_A), H_B ))
-            theta_opti = eigv[:,0]
+            
+            # Add numerical stability
+            H_A_reg = H_A + 1e-8 * np.eye(N_ris)  # Regularization
+            H_B_reg = H_B + 1e-8 * np.eye(N_ris)  # Regularization
+            
+            try:
+                eigv, s, _ = np.linalg.svd(np.matmul(np.linalg.pinv(H_A_reg), H_B_reg))
+                theta_opti = eigv[:,0]
+            except np.linalg.LinAlgError:
+                # Fallback to simple steering vector if SVD fails
+                angle = set_location_user_test[0][0][0]
+                theta_opti = 1/np.sqrt(N_ris)*np.exp(1j * np.pi * (i1 * np.sin(angle)))
 
-
-        midterm = np.matmul(H_SI.squeeze(),  np.linalg.pinv(H_SI.squeeze()) )
+        # Numerical stability for G matrix calculation
+        H_SI_pinv = np.linalg.pinv(H_SI.squeeze())
+        midterm = np.matmul(H_SI.squeeze(), H_SI_pinv)
         G = np.eye(N_ris) - midterm 
 
         ## estimated H_b_hat 
@@ -757,12 +764,17 @@ with tf.Session() as sess:
         coeff =  (Wavelength**2 / (4 * np.pi * distance)**2) * np.exp(1j * (2 * np.pi * distance / Wavelength))
         H_b_hat = coeff * np.matmul(steering_vec[:,np.newaxis], np.conj(steering_vec[:,np.newaxis]).transpose())  # (batch, N_ris, N_ris)
 
-        sinr_opti = Pvec[0]*np.sum(np.abs(H_b_hat @ theta_opti)**2)/(Pvec[0]*np.sum(np.abs(H_SI.squeeze() @ theta_opti)**2) +2*(noiseSTD_per_dim**2)*N_ris )
-        print(f"SINR of optimal beam: {10*np.log10(sinr_opti):.3f} ")
-        print(f"Signal Power: {Pvec[0]*np.sum(np.abs(H_b_hat @ theta_opti)**2):.3f} ")
-        print(f"Interference Power: {Pvec[0]*np.sum(np.abs(H_SI.squeeze() @ theta_opti)**2):.3f} ")
+        sig_pow_opti = Pvec[0]*np.abs( np.transpose(np.conj(theta_opti))@ H_b_hat @ theta_opti)**2
+        interference_pow_opti = Pvec[0]*np.abs(np.transpose(np.conj(theta_opti))@ H_SI.squeeze() @ theta_opti)**2
+        sinr_opti = sig_pow_opti / (interference_pow_opti + 2*(noiseSTD_per_dim**2) + 1e-12)
+
+
+        print(f"SINR of optimal beam: {10*np.log10(np.maximum(sinr_opti, 1e-12)):.3f} ")
+        print(f"Signal Power: {sig_pow_opti:.3f} ")
+        print(f"Interference Power: {interference_pow_opti:.3f} ")
 
         plot_beam_patterns(
             theta_opti[np.newaxis,:], set_location_user_test,
             save_path=None
         )    
+# %%
