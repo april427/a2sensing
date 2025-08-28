@@ -28,6 +28,8 @@ import scipy.io as sio
 import os
 from keras.layers import BatchNormalization, Dense
 import random
+from manifold_optimization import *
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -372,7 +374,7 @@ location_user = None
 
 # Sensing parameters
 tau = 10  # Pilot length
-snr_const = 20 
+snr_const = 10 
 snr_const = np.array([snr_const]) 
 ref_dis = 5
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)
@@ -380,7 +382,7 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = 8
+n_epochs = 2
 learning_rate = 1e-3
 batch_per_epoch = 400
 batch_size_order = 16
@@ -446,12 +448,15 @@ with tf.name_scope("channel_sensing"):
             v2 = v_complex / tf.norm(v_complex, axis=1, keepdims=True)
 
         'BS observes the next measurement'
-        y_noiseless1 = tf.transpose(tf.conj(v1), perm=[0, 2, 1]) @ A_T_k1 @ v2
+        y_noiseless1 = A_T_k1 @ v2
         noise1 = tf.complex(tf.random_normal(tf.shape(y_noiseless1), mean=0.0, stddev=noiseSTD_per_dim), \
                             tf.random_normal(tf.shape(y_noiseless1), mean=0.0, stddev=noiseSTD_per_dim))
-        y_complex1 = tf.complex(tf.sqrt(lay['P']), 0.0) * y_noiseless1 + noise1
+        y_complex1 = tf.complex(tf.sqrt(lay['P']), 0.0) * y_noiseless1 + noise1      # without receive beamforming
+        y_complex2 = tf.transpose(tf.conj(v1), perm=[0, 2, 1]) @ y_complex1     # after receive beamforming
+        
         y_complex1 = tf.reshape(y_complex1, [-1, 1])
-        y_real = tf.concat([tf.real(y_complex1), tf.imag(y_complex1)], axis=1) #/ tf.sqrt(lay['P'])
+        y_complex2 = tf.reshape(y_complex2, [-1, 1])
+        y_real = tf.concat([tf.real(y_complex1), tf.imag(y_complex1), tf.real(y_complex2), tf.imag(y_complex2)], axis=1) #/ tf.sqrt(lay['P'])
 
         'BS design next receive beamformer based on  h_old1'
         h_old1, c_old1 = RNN1((y_real, h_old1, c_old1))
@@ -630,49 +635,60 @@ with tf.Session() as sess:
         theta_test_list.append(theta_test)
         location_list.append(location_user_target)
     
-    # TESTING 
+    ########################## TESTING 
     
     sinr_test_set = []
     interference_pow_set = []
     test_loc = []
+    sig_pow_set = []
+    theta_test_set = []
+
+    # optimal beamforming using Riemannian optimization
+    rieman_opti_theta_set = []
+    rieman_opti_v_set = []
+    rieman_opti_sig_pow_set = []
+    rieman_opti_int_pow_set = []
+
 
     for j in range(test_size):
         
-        # 使用简化的信道生成函数
         channel_true_test, set_location_user_test = generate_irs_user_channel(
             None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
         A_T_1_real_test, _ = channel_complex2real(channel_true_test)
-
-        H_b_test = np.array(channel_true_test[2])
-        if H_b_test.ndim == 4 and H_b_test.shape[-1] == 1:
-            H_b_test = H_b_test.squeeze(axis=-1)
         
         feed_dict_test = {
             loc_input: np.array(set_location_user_test),
-            channel_bs_irs_user: channel_true_test[1],
+            channel_bs_irs_user: A_T_1_real_test,
             lay['P']: Pvec[0],
-            H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_val), 1, 1)),
-            H_b_placeholder: H_b_test
+            H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_test), 1, 1)),
+            H_b_placeholder: channel_true_test[2]
         }
-        
-        mse_loss, sinr_test, theta_test, interference_pow_test = sess.run([loss, sinr, theta_list, interference_pow], feed_dict=feed_dict_test)
-        theta_test = np.array(theta_test)
-        # radio_map, theta_test = generate_radio_map(theta_test_cplx)
-        sinr_test_set.append(sinr_test)
-        interference_pow_set.append(interference_pow)
-        test_loc.append(set_location_user_test)
 
-# Save the final results
-# model_filename = os.path.join(drive_save_path, f'TEST_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}.mat')
-# sio.savemat(model_filename, dict(
-#     snr_const = snr_const,
-#     N = N, N_ris = N_ris, tau = tau,
-#     epoch = n_epochs, 
-#     theta_test = theta_test_cplx,
-#     loc_true = test_loc,
-#     sinr_test = sinr_test_set,
-#     interference_pow = interference_pow_set
-# ))    
+        _, sinr_test, sinr2_test, theta_test, sig_pow_test, interference_pow_test = \
+                sess.run([loss, sinr, theta_list, sig_pow, interference_pow], 
+                                feed_dict=feed_dict_test)
+
+        theta_test = np.array(theta_test)
+        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
+        
+        sinr_test_set.append(sinr_test)
+        interference_pow_set.append(interference_pow_test)
+        sig_pow_set.append(sig_pow_test)
+        test_loc.append(set_location_user_test)
+        theta_test_set.append(theta_test_cplx)
+
+        ## Generate channel coherent optimal beamformer results
+        H_b_test = channel_true_test[2][0]
+        H_SI_test = channel_true_test[0]
+        c = 2*noiseSTD_per_dim**2/Pvec[0]
+        theta_star, v_star, val = solve_with_random_restarts(H_b_test, H_SI_test, c, restarts=20)
+        sig_pow_opti_rieman = Pvec[0] * np.abs(np.conj(v_star).T @ H_b_test @ theta_star)**2
+        int_pow_opti_rieman = Pvec[0] * np.abs(np.conj(v_star).T @ H_SI_test @ theta_star)**2
+
+        rieman_opti_theta_set.append(theta_star)
+        rieman_opti_v_set.append(v_star)
+        rieman_opti_sig_pow_set.append(sig_pow_opti_rieman)
+        rieman_opti_int_pow_set.append(int_pow_opti_rieman)
 
 # %% 
 # Load the saved model and perform TESTING
@@ -681,7 +697,7 @@ with tf.Session() as sess:
     saver.restore(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}') #
     
     # Example: test on new random user locations
-    num_test_samples = 3
+    num_test_samples = 2
     test_losses = []
     test_theta_list = []
     test_location_list = []
@@ -720,10 +736,10 @@ with tf.Session() as sess:
         print(f" Interference Power: {np.mean(interference_pow_test):.6f}")
 
         # visualize 
-        plot_beam_patterns(
-            theta_test_cplx.squeeze(), set_location_user_test,
-            save_path=None
-        )
+        # plot_beam_patterns(
+        #     theta_test_cplx.squeeze(), set_location_user_test,
+        #     save_path=None
+        # )
 
         ### Optimum coherent beamformer 
         i1 = np.mod(np.arange(16), 16)
@@ -768,13 +784,23 @@ with tf.Session() as sess:
         interference_pow_opti = Pvec[0]*np.abs(np.transpose(np.conj(theta_opti))@ H_SI.squeeze() @ theta_opti)**2
         sinr_opti = sig_pow_opti / (interference_pow_opti + 2*(noiseSTD_per_dim**2) + 1e-12)
 
+        ### Using manifold optimization
+        c = 2*noiseSTD_per_dim**2/Pvec[0]
+        theta_star, v_star, val = solve_with_random_restarts(H_b_hat, H_SI.squeeze(), c, restarts=20)
+        sig_pow_opti_mani = Pvec[0]*np.abs( np.transpose(np.conj(v_star))@ H_b_hat @ theta_star)**2
+        interference_pow_opti_mani = Pvec[0]*np.abs(np.transpose(np.conj(v_star))@ H_SI.squeeze() @ theta_star)**2
+        sinr_opti_mani = sig_pow_opti_mani / (interference_pow_opti_mani + 2*(noiseSTD_per_dim**2) + 1e-12)
 
         print(f"SINR of optimal beam: {10*np.log10(np.maximum(sinr_opti, 1e-12)):.3f} ")
         print(f"Signal Power: {sig_pow_opti:.3f} ")
         print(f"Interference Power: {interference_pow_opti:.3f} ")
 
-        plot_beam_patterns(
-            theta_opti[np.newaxis,:], set_location_user_test,
-            save_path=None
-        )    
+        print(f"SINR of optimal beam (manifold): {10*np.log10(np.maximum(sinr_opti_mani, 1e-12)):.3f} ")
+        print(f"Signal Power (manifold): {sig_pow_opti_mani:.3f} ")
+        print(f"Interference Power (manifold): {interference_pow_opti_mani:.3f} ")
+
+        # plot_beam_patterns(
+        #     theta_opti[np.newaxis,:], set_location_user_test,
+        #     save_path=None
+        # )    
 # %%
