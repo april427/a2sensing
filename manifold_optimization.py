@@ -12,7 +12,8 @@ try:
     import autograd.numpy as anp
 except ImportError:
     os.system('pip install autograd')
-    import autograd.numpy as anp
+
+import autograd.numpy as anp
 
 import numpy as np
 
