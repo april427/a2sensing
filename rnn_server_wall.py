@@ -87,8 +87,8 @@ Rician_factor = args.rician_factor  # Rician factor
 location_user = None
 
 # Sensing parameters
-tau = args.tau  # Pilot length
-snr_const = args.snr
+tau = 16#args.tau  # Pilot length
+snr_const = 10#args.snr
 snr_const = np.array([snr_const]) 
 ref_dis = 5
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**2
@@ -96,13 +96,13 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = args.n_epochs
+n_epochs = 60#args.n_epochs
 learning_rate = 1e-3
-batch_per_epoch = 256
-batch_size_order = 16
+batch_per_epoch = 128
+batch_size_order = 14
 val_size_order = 10
 scale_factor = 1
-test_size = 1000
+test_size = 2000
 
 USE_FFT = False
 
@@ -321,8 +321,8 @@ with tf.name_scope("channel_sensing"):
     interference_pow = lay['P'] * tf.reduce_sum(tf.abs( tf.matmul(H_SI_tf, theta_T_complex))**2, axis=1)
     sinr = sig_pow / (interference_pow + 2*(noiseSTD_per_dim**2)*N_ris)
 
-    sp = lay['P'] * tf.abs(tf.linalg.adjoint(theta_T_complex) @ tf.matmul(H_b_hat, theta_T_complex))**2
-    intp = lay['P'] * (tf.abs(tf.linalg.adjoint(theta_T_complex) @ tf.matmul(H_SI_tf, theta_T_complex))**2) 
+    sp = lay['P'] * tf.abs(tf.linalg.adjoint(theta_T_complex) @ H_b_hat @ theta_T_complex)**2
+    intp = lay['P'] * (tf.abs(tf.linalg.adjoint(theta_T_complex) @  H_SI_tf @ theta_T_complex)**2) 
     sinr_tr =  sp / ( intp + 2*(noiseSTD_per_dim**2))
 
 loss = - tf.log(tf.reduce_mean(sinr_tr))
@@ -339,7 +339,7 @@ global_step = tf.train.get_or_create_global_step()
 l2 = 1e-4
 reg_term = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 loss_reg = loss + l2 * reg_term
-lr = tf.train.exponential_decay(learning_rate, global_step, decay_steps=500, decay_rate=0.8)
+lr = tf.train.exponential_decay(learning_rate, global_step, decay_steps=500, decay_rate=0.9)
 training_op = tf.train.AdamOptimizer(lr).minimize(loss_reg, global_step=global_step)
 
 init = tf.global_variables_initializer()
@@ -379,7 +379,7 @@ with tf.Session() as sess:
         for rnd_indices in range(batch_per_epoch):
             # Training set
             channel_true_train, set_location_user_train = generate_irs_user_channel(
-                None, location_ris_1, num_samples=batch_size_order*delta_inv, Rician_factor=Rician_factor)
+                None, location_ris_1, num_samples=batch_size_order*delta_inv, Rician_factor=Rician_factor) # 16*32 samples
             A_T_1_real, _ = channel_complex2real(channel_true_train)
             H_SI_batch = channel_true_train[0]  # Self-interference channel
             H_b_batch = channel_true_train[2]   # Backscattered channel
@@ -392,23 +392,23 @@ with tf.Session() as sess:
                 H_b_placeholder: H_b_batch  # Shape: (batch, N_ris, N_ris)
             }
             
-            _, train_loss_val, snr_eff_val, sinr_val = sess.run(
-                                    [training_op, loss, snr_eff, sinr], feed_dict=feed_dict_batch
+            _, train_loss_val, sinr_val = sess.run(
+                                    [training_op, loss, sinr_tr], feed_dict=feed_dict_batch
             )
             
             epoch_train_losses.append(train_loss_val)
             batch_iter += 1
         
         avg_train_loss = np.mean(epoch_train_losses)
-        loss_val, per_user_val = sess.run([loss, user_loss], feed_dict=feed_dict_val)
+        loss_val = sess.run(loss, feed_dict=feed_dict_val)
         
         print('epoch', epoch,
               '  train_loss:%2.7f' % avg_train_loss,
               '  val_loss:%2.7f' % loss_val,
               '  best_val:%2.7f' % best_val)
         if epoch % 5 == 0:
-            snr_db_val = 10*np.log10(np.mean(snr_eff_val))
-            print(f" SNR_eff [dB]: {snr_db_val:.6f}, SINR[dB]: {10*np.log10(np.mean(sinr_val)):.6f}")
+            
+            print(f"  SINR[dB]: {10*np.log10(np.mean(sinr_val)):.6f}")
 
         # Early Stop
         if loss_val < best_val - 1e-9:
@@ -470,35 +470,36 @@ with tf.Session() as sess:
     rieman_opti_sinr_set = []
 
 
+    
+        
+    channel_true_test, set_location_user_test = generate_irs_user_channel(
+        None, location_ris_1, num_samples=test_size, Rician_factor=Rician_factor)
+    A_T_1_real_test, _ = channel_complex2real(channel_true_test)
+    
+    feed_dict_test = {
+        loc_input: np.array(set_location_user_test),
+        channel_bs_irs_user: A_T_1_real_test,
+        lay['P']: Pvec[0],
+        H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_test), 1, 1)),
+        H_b_placeholder: channel_true_test[2]
+    }
+
+    _,  sinr_tr_test, theta_test, sig_pow_test, interference_pow_test = \
+            sess.run([loss, sinr_tr, theta_list, sp, intp], 
+                            feed_dict=feed_dict_test)
+
+    theta_test = np.array(theta_test)
+    theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
+    
+    sinr_test_set = sinr_tr_test[:,np.newaxis]
+    interference_pow_set = interference_pow_test[:, np.newaxis]
+    sig_pow_set = sig_pow_test[:, np.newaxis]
+    test_loc = np.expand_dims(set_location_user_test, axis = 1)
+    theta_test_set = np.expand_dims(theta_test_cplx.transpose(1, 0, 2), axis=2)
+ 
     for j in range(test_size):
-        
-        channel_true_test, set_location_user_test = generate_irs_user_channel(
-            None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
-        A_T_1_real_test, _ = channel_complex2real(channel_true_test)
-        
-        feed_dict_test = {
-            loc_input: np.array(set_location_user_test),
-            channel_bs_irs_user: A_T_1_real_test,
-            lay['P']: Pvec[0],
-            H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_test), 1, 1)),
-            H_b_placeholder: channel_true_test[2]
-        }
-
-        _, sinr_test, sinr_tr_test, theta_test, sig_pow_test, interference_pow_test = \
-                sess.run([loss, sinr, sinr_tr, theta_list, sp, intp], 
-                                feed_dict=feed_dict_test)
-
-        theta_test = np.array(theta_test)
-        theta_test_cplx = theta_test[:, :, 0:N_ris] + 1j * theta_test[:, :, N_ris:2*N_ris]
-        
-        sinr_test_set.append(sinr_tr_test)
-        interference_pow_set.append(interference_pow_test)
-        sig_pow_set.append(sig_pow_test)
-        test_loc.append(set_location_user_test)
-        theta_test_set.append(theta_test_cplx)
-
         ## Generate channel coherent optimal beamformer results
-        H_b_test = channel_true_test[2][0]
+        H_b_test = channel_true_test[2][j]
         H_SI_test = channel_true_test[0]
         H_B = np.matmul(np.conj(H_b_test).transpose(), H_b_test)
         H_A = np.matmul(np.conj(H_SI_test.squeeze()).transpose(), H_SI_test.squeeze()) + \

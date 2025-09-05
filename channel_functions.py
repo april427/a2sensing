@@ -44,7 +44,7 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
     if user_locations is None:
         num_user = num_users  # 使用全局变量
     else:
-        num_user = user_locations.shape[0] if user_locations.ndim == 2 else user_locations.shape[1]
+        num_user = num_users#user_locations.shape[0] if user_locations.ndim == 2 else user_locations.shape[1]
     
     channel_irs_user = []
     set_location_user = []
@@ -106,6 +106,8 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
         # Xiyu: This is considered when the RIS is a rectangular array
         i1 = np.mod(np.arange(num_elements_irs), irs_Nh)
         i2 = np.floor(np.arange(num_elements_irs) / irs_Nh)
+
+        Rician_factor = 10**(Rician_factor/10)
 
         tmp = np.random.normal(loc=0, scale=np.sqrt(0.5), size=[num_elements_irs, num_elements_irs, num_user]) \
               + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[ num_elements_irs, num_elements_irs, num_user])
@@ -201,7 +203,24 @@ def calculate_beam_pattern(theta_vector, angles):
     
     return np.array(beam_pattern)
 
-def plot_beam_patterns(theta_complex, true_location, save_path=None):
+def calc_beam_pattern(theta_vector, angles, v_vector=None):
+    """Calculate beam pattern for given beamforming vector and angles"""
+    beam_pattern = []
+    n = np.arange(N_ris)
+    
+    for angle in angles:
+        # Steering vector for uniform linear array
+        steering_vec = np.exp(1j * np.pi * n * np.sin(angle))[:, np.newaxis]
+        H = steering_vec @ steering_vec.T
+        if v_vector is not None:
+            beam_gain = np.abs(np.conj(v_vector[0,]).transpose() @ H @ theta_vector[0,])**2
+        else:
+            beam_gain = np.abs(np.conj(theta_vector) @ H @ theta_vector)**2
+        beam_pattern.append(beam_gain)
+    
+    return np.array(beam_pattern)
+
+def plot_beam_patterns(theta_complex, true_location, v_vector=None, save_path=None):
     """
     Plot beam patterns at different time steps
     """
@@ -215,14 +234,21 @@ def plot_beam_patterns(theta_complex, true_location, save_path=None):
     beam_patterns = []
     for t in range(tau_steps):
         theta_t = theta_complex[t, :]
-        beam_pattern = calculate_beam_pattern(theta_t, angles)
+        if v_vector is not None:
+            v_t = v_vector[t,:]
+            beam_pattern = calc_beam_pattern(theta_t, angles, v_t)
+        else:
+            beam_pattern = calc_beam_pattern(theta_t, angles)   
         beam_patterns.append(beam_pattern)
     
     beam_patterns = np.array(beam_patterns)
     
-    num_plots = 8 if tau_steps>1 else 1
+    num_plots = tau_steps
     # Create subplots
-    fig, axes = plt.subplots( 1, num_plots,  figsize=(16,8))
+    if tau_steps>1:
+        fig, axes = plt.subplots( 2, int(num_plots/2),  figsize=(16,8))
+    else:
+        fig, axes = plt.subplots(1, 1, figsize=(4,3))
     # axes = axes.flatten()
     
     # Calculate true UE angle based on location
@@ -235,10 +261,11 @@ def plot_beam_patterns(theta_complex, true_location, save_path=None):
         if num_plots == 1:
             ax = axes
         else:
-            ax = axes[t]
+            ax = axes[int(np.floor(t/(num_plots/2))), int(np.mod(t, (num_plots/2)))]
 
         # Plot beam pattern in dB
         beam_dB = 10 * np.log10(beam_patterns[tau_steps - num_plots + t] / np.max(beam_patterns[tau_steps - num_plots + t]))
+        beam_dB = beam_dB.squeeze()
         ax.plot(angles_deg, beam_dB, 'b-', linewidth=2)
         
         # Mark true UE angle
@@ -248,7 +275,7 @@ def plot_beam_patterns(theta_complex, true_location, save_path=None):
         ax.set_ylabel('Beam Gain (dB)')
         ax.set_title(f'Time Step {t+1}')
         ax.grid(True, alpha=0.3)
-        ax.set_ylim([-40, 0])
+        ax.set_ylim([-60, 0])
         ax.set_xlim([-90, 90])
         
         if t == 0:

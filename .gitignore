@@ -7,3 +7,12 @@ __pycache__/
 BD_beamInit/
 
 BD_2beamsInit/
+
+*.ipynb
+parse_args.py
+plots.py 
+
+debug_*
+retest_benchmark.py
+
+/figs

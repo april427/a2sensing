@@ -116,7 +116,7 @@ Rician_factor = 10
 location_user = None
 
 # Sensing parameters
-tau = args.tau  # Pilot length
+tau = 16# args.tau  # Pilot length
 snr_const = args.snr
 snr_const = np.array([snr_const])
 ref_dis = 5
@@ -125,10 +125,10 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = args.n_epochs
+n_epochs = 200#args.n_epochs
 learning_rate = 1e-3
-batch_per_epoch = 256
-batch_size_order = 16
+batch_per_epoch = 128
+batch_size_order = 4
 batch_size_val = 10000
 scale_factor = 1
 test_size = 2000
@@ -162,7 +162,7 @@ with tf.name_scope("array_response_construction"):
     
 
 with tf.name_scope("channel_sensing"):
-    hidden_size1 = 256
+    hidden_size1 = 512
     RNN1 = RNN(hidden_size1, 'rnn_1')
     
     MLP_user1_transmit = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_user1_transmit')
@@ -283,7 +283,9 @@ feed_dict_val = {
     H_b_placeholder: H_b_val
 }
 
-###########  Training
+#%%
+###########  Training ##########
+
 with tf.Session() as sess:
     if initial_run == 1:
         init.run()
@@ -293,7 +295,7 @@ with tf.Session() as sess:
     # Early stop
     best_val = 1e9
     wait = 0
-    PATIENCE = 20
+    PATIENCE = 40
     print(tf.test.is_gpu_available())  
 
     no_increase = 0
@@ -406,36 +408,35 @@ with tf.Session() as sess:
     rieman_opti_int_pow_set = []
     rieman_opti_sinr_set = []
 
+        
+    channel_true_test, set_location_user_test = generate_irs_user_channel(
+        None, location_ris_1, num_samples=test_size, Rician_factor=Rician_factor)
+
+    feed_dict_test = {
+        loc_input: np.array(set_location_user_test),
+        channel_bs_irs_user: channel_true_test[1],  # Use complex channel directly
+        lay['P']: Pvec[0],
+        H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_test), 1, 1)),
+        H_b_placeholder: channel_true_test[2]
+    }
+
+    _, sinr_test, theta_test, v_test, sig_pow_test, interference_pow_test = \
+            sess.run([loss, sinr, theta_list, v_list, sig_pow, interference_pow], 
+                            feed_dict=feed_dict_test)
+
+    theta_test = np.array(theta_test)
+    v_test = np.array(v_test)
+
+    sinr_test_set = sinr_test[:,np.newaxis]
+    interference_pow_set = interference_pow_test[:,np.newaxis]
+    sig_pow_set = sig_pow_test[:,np.newaxis]
+    test_loc = np.expand_dims(set_location_user_test, axis = 1)
+    theta_test_set = np.expand_dims(theta_test.transpose(1,0,2,3), axis=2 ) 
+    v_test_set = np.expand_dims( v_test.transpose(1,0,2,3), axis = 2)
 
     for j in range(test_size):
-        
-        channel_true_test, set_location_user_test = generate_irs_user_channel(
-            None, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
-
-        feed_dict_test = {
-            loc_input: np.array(set_location_user_test),
-            channel_bs_irs_user: channel_true_test[1],  # Use complex channel directly
-            lay['P']: Pvec[0],
-            H_SI_placeholder: np.tile(channel_true_test[0][np.newaxis, :, :], (len(set_location_user_test), 1, 1)),
-            H_b_placeholder: channel_true_test[2]
-        }
-
-        _, sinr_test, theta_test, v_test, sig_pow_test, interference_pow_test = \
-                sess.run([loss, sinr, theta_list, v_list, sig_pow, interference_pow], 
-                                feed_dict=feed_dict_test)
-
-        theta_test = np.array(theta_test)
-        v_test = np.array(v_test)
-
-        sinr_test_set.append(sinr_test)
-        interference_pow_set.append(interference_pow_test)
-        sig_pow_set.append(sig_pow_test)
-        test_loc.append(set_location_user_test)
-        theta_test_set.append(theta_test)
-        v_test_set.append(v_test)
-
         ## Generate channel coherent optimal beamformer results
-        H_b_test = channel_true_test[2][0]
+        H_b_test = channel_true_test[2][j]
         H_SI_test = channel_true_test[0]
         c = 2*noiseSTD_per_dim**2
         theta_star, v_star, _ = solve_with_random_restarts(np.sqrt(Pvec[0])*H_b_test, np.sqrt(Pvec[0])*H_SI_test, c, restarts=20)
@@ -507,9 +508,16 @@ with tf.Session() as sess:
         v_cplx = np.array(v_test) 
         test_location_list.append(location_user_test)
 
+        plot_beam_patterns(
+            theta_test_cplx, set_location_user_test, v_cplx, 
+            save_path=None
+        ) 
+
         print(f" SINR: {10*np.log10(np.mean(sinr_test)):.6f}")
         print(f" Signal Power: {np.mean(sig_pow_test):.6f}")
         print(f" Interference Power: {np.mean(interference_pow_test):.6f}")
+
+
 
         ### Optimum coherent beamformer 
         i1 = np.mod(np.arange(16), 16)
@@ -559,8 +567,8 @@ with tf.Session() as sess:
         print(f"Signal Power (manifold): {sig_pow_opti_mani:.3f} ")
         print(f"Interference Power (manifold): {interference_pow_opti_mani:.3f} ")
 
-        # plot_beam_patterns(
-        #     theta_opti[np.newaxis,:], set_location_user_test,
-        #     save_path=None
-        # )    
+        plot_beam_patterns(
+            theta_star[np.newaxis,np.newaxis,:], set_location_user_test, v_star[np.newaxis, np.newaxis, :], 
+            save_path=None
+        )    
 # %%
