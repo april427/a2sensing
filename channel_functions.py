@@ -215,7 +215,7 @@ def calc_beam_pattern(theta_vector, angles, v_vector=None):
         if v_vector is not None:
             beam_gain = np.abs(np.conj(v_vector[0,]).transpose() @ H @ theta_vector[0,])**2
         else:
-            beam_gain = np.abs(np.conj(theta_vector) @ H @ theta_vector)**2
+            beam_gain = np.abs(np.conj(theta_vector).transpose() @ H @ theta_vector)**2
         beam_pattern.append(beam_gain)
     
     return np.array(beam_pattern)
@@ -227,7 +227,7 @@ def plot_beam_patterns(theta_complex, true_location, v_vector=None, save_path=No
     tau_steps = theta_complex.shape[0]
     
     # Angle range for beam pattern visualization
-    angles = np.linspace(-np.pi/2, np.pi/2, 181)
+    angles = np.linspace(-np.pi/2, np.pi/2, 360)
     angles_deg = angles * 180 / np.pi
     
     # Calculate beam patterns for each time step

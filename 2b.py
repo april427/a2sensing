@@ -116,8 +116,8 @@ Rician_factor = 10
 location_user = None
 
 # Sensing parameters
-tau = 16# args.tau  # Pilot length
-snr_const = args.snr
+tau = 10# args.tau  # Pilot length
+snr_const = 10#args.snr
 snr_const = np.array([snr_const])
 ref_dis = 5
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**2
@@ -162,11 +162,11 @@ with tf.name_scope("array_response_construction"):
     
 
 with tf.name_scope("channel_sensing"):
-    hidden_size1 = 512
+    hidden_size1 = 256
     RNN1 = RNN(hidden_size1, 'rnn_1')
     
-    MLP_user1_transmit = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_user1_transmit')
-    MLP_user1_receive = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_user1_receive')
+    MLP_user1_transmit = MLPBlock(3, [256, 256, 2 * N_ris], name='mlp_user1_transmit')
+    MLP_user1_receive = MLPBlock(3, [256, 256, 2 * N_ris], name='mlp_user1_receive')
 
     A_T_k1 = channel_bs_irs_user[:,:,:,0] # channel within coherence time
     theta_list =[] # list of complex transmit beamforming
@@ -221,7 +221,7 @@ with tf.name_scope("channel_sensing"):
         theta_list.append(theta_T_complex)
 
     'calculate SINR'
-    MLP_bf1 = MLPBlock(3, [1024, 1024, 2 * N_ris], name='mlp_bf1')
+    MLP_bf1 = MLPBlock(3, [512, 512, 2 * N_ris], name='mlp_bf1')
 
     'receive beamformer'
     v_tmp = MLP_bf1(c_old1)
@@ -475,14 +475,22 @@ with tf.Session() as sess:
     saver.restore(sess, f'{drive_save_path}/params_RiK10_mono_N_{N_ris}_tau_{tau}_snr_{int(snr_const[0])}') #
     
     # Example: test on new random user locations
-    num_test_samples = 2
+    num_test_samples = 1
     test_losses = []
     test_theta_list = []
     test_location_list = []
     
     for _ in range(num_test_samples):
         # Generate a random user location
-        location_user_test = generate_location(num_users)
+        test_angle = 1.00988728#np.random.uniform(-np.pi/2, np.pi/2)  # Random angle between -90 and 90 degrees
+        test_distance = 5.0  # 5 meters
+
+        # Convert to Cartesian coordinates
+        x = test_distance * np.cos(test_angle)
+        y = test_distance * np.sin(test_angle)
+        z = -20  # Ground level
+        
+        location_user_test = np.array([[x, y, z]])#generate_location(num_users)
         channel_true_test, set_location_user_test = generate_irs_user_channel(
             location_user_test, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
         print(set_location_user_test)
@@ -559,9 +567,9 @@ with tf.Session() as sess:
         interference_pow_opti_mani = Pvec[0]*np.abs(np.transpose(np.conj(v_star))@ H_SI.squeeze() @ theta_star)**2
         sinr_opti_mani = sig_pow_opti_mani / (interference_pow_opti_mani + 2*(noiseSTD_per_dim**2) + 1e-12)
 
-        print(f"SINR of optimal beam: {10*np.log10(np.maximum(sinr_opti, 1e-12)):.3f} ")
-        print(f"Signal Power: {sig_pow_opti:.3f} ")
-        print(f"Interference Power: {interference_pow_opti:.3f} ")
+        # print(f"SINR of optimal beam: {10*np.log10(np.maximum(sinr_opti, 1e-12)):.3f} ")
+        # print(f"Signal Power: {sig_pow_opti:.3f} ")
+        # print(f"Interference Power: {interference_pow_opti:.3f} ")
 
         print(f"SINR of optimal beam (manifold): {10*np.log10(np.maximum(sinr_opti_mani, 1e-12)):.3f} ")
         print(f"Signal Power (manifold): {sig_pow_opti_mani:.3f} ")

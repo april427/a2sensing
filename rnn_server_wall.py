@@ -87,7 +87,7 @@ Rician_factor = args.rician_factor  # Rician factor
 location_user = None
 
 # Sensing parameters
-tau = 16#args.tau  # Pilot length
+tau = 10#args.tau  # Pilot length
 snr_const = 10#args.snr
 snr_const = np.array([snr_const]) 
 ref_dis = 5
@@ -96,7 +96,7 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**
 
 'Learning Parameters'
 initial_run = 1   # 0: Continue training; 1: Starts from scratch
-n_epochs = 60#args.n_epochs
+n_epochs = 200#args.n_epochs
 learning_rate = 1e-3
 batch_per_epoch = 128
 batch_size_order = 14
@@ -358,7 +358,7 @@ feed_dict_val = {
     H_b_placeholder: channel_true_val[2]
 }
 # %%
-# Training
+######################## Training ###################
 with tf.Session() as sess:
     if initial_run == 1:
         init.run()
@@ -563,7 +563,15 @@ with tf.Session() as sess:
     
     for _ in range(num_test_samples):
         # Generate a random user location
-        location_user_test = generate_location(num_users)
+        test_angle = 1.00988728#np.random.uniform(-np.pi/2, np.pi/2)  # Random angle between -90 and 90 degrees
+        test_distance = 5.0  # 5 meters
+
+        # Convert to Cartesian coordinates
+        x = test_distance * np.cos(test_angle)
+        y = test_distance * np.sin(test_angle)
+        z = -20  # Ground level
+        
+        location_user_test = np.array([[x, y, z]])#generate_location(num_users)
         channel_true_test, set_location_user_test = generate_irs_user_channel(
             location_user_test, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
         A_T_1_real_test, _ = channel_complex2real(channel_true_test)
