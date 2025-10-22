@@ -1,3 +1,6 @@
+"""This is to train the AP"""
+"""Two beamformers v and w """
+
 # %%
 import os
 try:

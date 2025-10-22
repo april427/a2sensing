@@ -10,7 +10,7 @@ tf.disable_v2_behavior()
 import scipy.io
 import matplotlib.pyplot as plt
 from keras.layers import BatchNormalization, Dense
-from manifold_optimization import solve_x_equals_y_fast
+from manifold_optimization import solve_x_equals_y_fast, solve_with_random_restarts
 from parse_args import parse_args
 from channel_functions import *
 
@@ -51,7 +51,7 @@ Rician_factor = args.rician_factor
 location_user = None
 
 tau = args.tau
-snr_const = args.snr
+snr_const = 30#args.snr
 snr_const = np.array([snr_const]) 
 ref_dis = 5
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**2
@@ -648,13 +648,23 @@ def test_single_location(model_path, user_location, network_type):
                 print(f"  SINR: {np.asarray(sinr_db).item():.2f} dB")
                 print(f"  Signal Power: {sig_pow:.6f}")
                 print(f"  Interference Power: {interference_pow:.6f}")
-                
+
+                sinr_steps = np.zeros(theta_list.shape[0])
+                for i in range(theta_list.shape[0]):
+                    p = theta_list[i, 0:N_ris] + 1j * theta_list[i, N_ris:2*N_ris]
+                    p = p / np.linalg.norm(p)
+
+                    sinr_steps[i] = Pvec* np.abs(np.conj(p).transpose() @ H_b_test.squeeze() @ p)**2 / \
+                        ((Pvec* np.abs(np.conj(p).transpose() @ channel_true_test[0] @ p)**2 + \
+                            2*noiseSTD_per_dim**2))
+
                 return {
                     'sinr_db': np.asarray(sinr_db).item(),
                     'sig_pow': sig_pow,
                     'interference_pow': interference_pow,
                     'theta_list': theta_list,
-                    'user_location': user_location
+                    'user_location': user_location,
+                    'sinr_steps': sinr_steps
                 }
                 
             elif network_type == '2b':
@@ -689,14 +699,31 @@ def test_single_location(model_path, user_location, network_type):
                 print(f"  SINR: {np.asarray(sinr_db).item():.2f} dB")
                 print(f"  Signal Power: {sig_pow:.6f}")
                 print(f"  Interference Power: {interference_pow:.6f}")
+
+                # calculate the optimal theta and v
+                H_SI_test = channel_true_test[0]
+                c = 2*noiseSTD_per_dim**2
+                theta_star, v_star, _ = solve_with_random_restarts(np.sqrt(Pvec)*H_b_test.squeeze(), np.sqrt(Pvec)*H_SI_test, c, restarts=20)
                 
+                sinr_steps = np.zeros(theta_list.shape[0])
+                for i in range(theta_list.shape[0]):
+                    p = theta_list[i, :]
+                    q = v_list[i, :]
+
+                    sinr_steps[i] = Pvec* np.abs(np.conj(q).transpose() @ H_b_test.squeeze() @ p)**2 / \
+                        ((Pvec* np.abs(np.conj(q).transpose() @ H_SI_test @ p)**2 + \
+                            2*noiseSTD_per_dim**2))
+
                 return {
                     'sinr_db': np.asarray(sinr_db).item(),
                     'sig_pow': sig_pow,
                     'interference_pow': interference_pow,
                     'theta_list': theta_list,
                     'v_list': v_list,
-                    'user_location': user_location
+                    'user_location': user_location,
+                    'theta_star': theta_star,
+                    'v_star': v_star,
+                    'sinr_steps': sinr_steps
                 }
             
         except Exception as e:
@@ -720,7 +747,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Set a specific test location
-    test_angle = 1.00988728#np.random.uniform(-np.pi/2, np.pi/2)  # Random angle between -90 and 90 degrees
+    test_angle = np.random.uniform(-np.pi/2, np.pi/2)  # Random angle between -90 and 90 degrees 1.00988728
     test_distance = 5.0  # 5 meters
 
     # Convert to Cartesian coordinates
@@ -750,6 +777,8 @@ if __name__ == "__main__":
     ]
     
     results_all = {}
+    beam_data_single = None
+    beam_data_dual = None
     
     for model_config in models_to_test:
         print(f"\\n{'='*40}")
@@ -770,22 +799,114 @@ if __name__ == "__main__":
         if results is not None:
             results_all[model_config['name']] = results
             
-            # Plot beam patterns
+            # Plot beam patterns comparison
             if 'v_list' not in results:
-                theta_test_cplx = results['theta_list'][ :, 0:N_ris] + 1j * results['theta_list'][ :, N_ris:2*N_ris]
-                plot_beam_patterns(
-                    theta_test_cplx, 
-                    [[test_angle, test_distance]], 
-                    save_path=None
-                )
+                theta_test_cplx = results['theta_list'][:, 0:N_ris] + 1j * results['theta_list'][:, N_ris:2*N_ris]
+                # Store beam pattern data instead of plotting immediately
+                if model_config['name'] == 'BD_beamInit':
+                    beam_data_single = {
+                        'theta': theta_test_cplx,
+                        'location': [[test_angle, test_distance]],
+                        'name': model_config['name'],
+                        'sinr_steps': results['sinr_steps']
+                    }
+                else:
+                    beam_data_dual = {
+                        'theta': results['theta_list'][:,np.newaxis, :],
+                        'v': results['v_list'][:,np.newaxis, :],
+                        'location': [[test_angle, test_distance]],
+                        'name': model_config['name'],
+                        'theta_star': results['theta_star'],
+                        'v_star': results['v_star'],
+                        'sinr_steps': results['sinr_steps']
+                    }
             else:
-                plot_beam_patterns(
-                    results['theta_list'][:,np.newaxis, :], 
-                    [[test_angle, test_distance]], 
-                    results['v_list'][:,np.newaxis, :], 
-                    save_path=None
-                )
+                # Store dual beam data
+                beam_data_dual = {
+                    'theta': results['theta_list'][:,np.newaxis, :],
+                    'v': results['v_list'][:,np.newaxis, :],
+                    'location': [[test_angle, test_distance]],
+                    'name': model_config['name'],
+                    'theta_star': results['theta_star'],
+                    'v_star': results['v_star'],
+                    'sinr_steps': results['sinr_steps']
+                }
     
+    # Plot both beam patterns on the same figure after testing both models
+    if len(results_all) == 2:
+        print(f"\n{'='*40}")
+        print("PLOTTING BEAM PATTERN COMPARISON")
+        print(f"{'='*40}")
+        
+        # Create the comparison plot
+        tau_steps = min(len(beam_data_single['theta']), len(beam_data_dual['theta']))
+        
+        # Angle range for beam pattern visualization  
+        angles = np.linspace(-np.pi/2, np.pi/2, 360)
+        angles_deg = angles * 180 / np.pi
+        
+        # number of plot
+        num_plot = min(5, tau_steps)
+        # Create subplots for comparison
+        fig, axes = plt.subplots(1, num_plot, figsize=(22, 4))
+        axes = axes.flatten()
+        
+        # Calculate true UE angle
+        true_angle_deg = test_angle * 180 / np.pi
+        
+        # Plot first 8 time steps (or fewer if available)
+        for t in range(num_plot):
+            ax = axes[t]
+            
+            # Plot BD_beamInit (single beam)
+            theta_t_single = beam_data_single['theta'][t, :]
+            beam_pattern_single = calculate_beam_pattern(theta_t_single, angles)
+            beam_dB_single = 10 * np.log10(beam_pattern_single / np.max(beam_pattern_single))
+            ax.plot(angles_deg, beam_dB_single, color = '#2077b4', linestyle='--', linewidth=2, label=r'$\mathbf{w} = \mathbf{v}$')
+            
+            # Plot BD_2beamsInit (dual beam)
+            theta_t_dual = beam_data_dual['theta'][t, :, :]
+            v_t_dual = beam_data_dual['v'][t, :, :]
+            beam_pattern_dual = calc_beam_pattern(theta_t_dual, angles, v_t_dual)
+            beam_dB_dual = 10 * np.log10(beam_pattern_dual / np.max(beam_pattern_dual))
+            ax.plot(angles_deg, beam_dB_dual, color = '#d62728', linestyle='-', linewidth=2, label=r'$\mathbf{w} \neq \mathbf{v}$')
+            
+            # Mark true UE angle
+            ax.axvline(true_angle_deg, color="#036221", linestyle='--', linewidth=2,  label='True UE')
+            if t == num_plot - 1:
+                beam_pattern_star = calc_beam_pattern(beam_data_dual['theta_star'][np.newaxis,:], angles, beam_data_dual['v_star'][np.newaxis,:])
+                beam_dB_star = 10 * np.log10(beam_pattern_star / np.max(beam_pattern_star))
+                ax.plot(angles_deg, beam_dB_star, color = "#0E8E36", linestyle='-.', linewidth=1.8, label='IterOpti')
+
+
+            ax.set_xlabel('Angle [degrees]', fontsize=12)
+            ax.set_ylabel('Normalized Beam Gain [dB]', fontsize=12)
+            ax.set_title(f'Preamble {t+1}', fontsize=12)
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim([-60, 0])
+            ax.set_xlim([-90, 90])
+            
+            if t == 0:
+                from matplotlib.lines import Line2D
+                legend_elements = [
+                    Line2D([0], [0], color='#2077b4', linestyle='--', \
+                             linewidth=2, label=r'$\mathbf{w} = \mathbf{v}$'),
+                    Line2D([0], [0], color='#d62728', linestyle='-',\
+                            linewidth=2, label=r'$\mathbf{w} \neq \mathbf{v}$'),
+                    Line2D([0], [0], color="#036221", linestyle='--', \
+                            linewidth=2, label='True UE'),
+                    Line2D([0], [0], color='#0E8E36', linestyle='-.', \
+                           linewidth=1.8, label='IterOpti')
+                ]
+                ax.legend(handles=legend_elements, fontsize=12)
+        
+        plt.tight_layout()
+        # plt.savefig('beam_pattern.pdf', format = 'pdf', bbox_inches = 'tight')
+        plt.show()
+    
+    # print(10*np.log10(beam_data_single['sinr_steps']))
+    # print(10*np.log10(beam_data_dual['sinr_steps']))
+
     # Compare results
     print(f"\\n{'='*60}")
     print("COMPARISON RESULTS")

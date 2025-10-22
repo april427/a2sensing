@@ -1,3 +1,6 @@
+"""This is to train the simplified AP"""
+"""Only one beamformer v=w"""
+
 # %%
 import os
 try:
