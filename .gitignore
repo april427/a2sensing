@@ -8,8 +8,9 @@ BD_beamInit/
 
 BD_2beamsInit/
 
+BD_2bDNN/
+
 *.ipynb
-parse_args.py
 plots.py 
 
 debug_*
