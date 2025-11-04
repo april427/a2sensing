@@ -14,12 +14,13 @@ def str2bool(v):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--N_ris', type=int, default=16, help='Number of BS antennas')
+    parser.add_argument('--N_ris', type=int, default=16, help='Number of receiver antennas')
+    parser.add_argument('--N_bs', type=int, default=1, help='Number of BS antennas')
     parser.add_argument('--tau', type=int, default=10, help='Number of pilots')
     parser.add_argument('--snr', type=float, default=10.0, help='Signal-to-noise ratio (dB)')
     parser.add_argument('--n_epochs', type=int, default=2, help='Number of training epochs')
     parser.add_argument('--num_users', type=int, default=1, help='Number of users')
-    parser.add_argument('--rician_factor', type=float, default=10.0, help='Rician factor')
+    parser.add_argument('--rician_factor', type=float, default=5.0, help='Rician factor')
 
     args, unknown = parser.parse_known_args()
     return args

@@ -3,6 +3,7 @@ from parse_args import parse_args
 import matplotlib.pyplot as plt
 
 args = parse_args()
+N_bs = args.N_bs
 N_ris = args.N_ris
 num_users = args.num_users
 fc = 10e9
@@ -11,10 +12,14 @@ tau = args.tau
 location_ris_1 = np.array([0, 0, -20])       # This RIS is our BS
 Rician_factor = args.rician_factor
 
-def path_loss_r(d, wavelength):   # return |beta|^2 in dB
+def path_loss_r(d1, wavelength, d2 = None,  type = 'backscatter'):   # return |beta|^2 in dB
     """Keyhole channel: pathloss of backscatter signal for Rician fading in dB. (4 pi d / wavelength)^4 ! """
-    # wavelength = 3e8/fc
-    loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d + 1e-8)  
+    if d2 is None and type == 'backscatter':
+        loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d1 + 1e-8)
+    elif d2 is not None and type == 'backscatter':
+        loss = 40*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8) + 20.0 * np.log10(d2 + 1e-8)  
+    elif type == 'direct':
+        loss = 20*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8)
     return loss
 
 def generate_location(num_users):
@@ -38,13 +43,15 @@ def generate_location(num_users):
     return location_user
 
 
-def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Rician_factor=10, scale_factor=0, irs_Nh=16, x_BD = 1):
+def generate_irs_user_channel(user_locations, location_irs, num_samples=1, \
+                              Rician_factor=10, scale_factor=0, irs_Nh=16, x_BD = 1):
 
-    num_elements_irs = N_ris
+    # num_elements_irs = N_ris
     if user_locations is None:
-        num_user = num_users  # 使用全局变量
+        num_user = num_users  
     else:
-        num_user = num_users#user_locations.shape[0] if user_locations.ndim == 2 else user_locations.shape[1]
+        num_user = num_users
+        #user_locations.shape[0] if user_locations.ndim == 2 else user_locations.shape[1]
     
     channel_irs_user = []
     set_location_user = []
@@ -82,7 +89,7 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
         for k in range(num_user):
             d_k = np.linalg.norm(location_user[k] - location_irs) # user-IRS distance
             d_k_xy = np.linalg.norm(location_user[k][0:2] - location_irs[0:2])  # horizontal distance
-            pathloss_irs_user.append(path_loss_r(d_k,wavelength))
+            pathloss_irs_user.append(path_loss_r(d_k,wavelength, type='backscatter'))
             aoa_irs_y_k = (location_user[k][1] - location_irs[1]) / (d_k_xy +1e-8)     # Sine of azimuth angle
             aoa_irs_z_cos_k = d_k_xy / (d_k + 1e-8)  # Cosine of Elevation angle
             aoa_irs_z_k = (location_user[k][2] - location_irs[2]) / (d_k +1e-8)     # Sine of Elevation angle
@@ -104,13 +111,13 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
         set_location_user.append(np.array([np.arcsin(aoa_irs_y_k), d_k])[:, np.newaxis])
         
         # Xiyu: This is considered when the RIS is a rectangular array
-        i1 = np.mod(np.arange(num_elements_irs), irs_Nh)
-        i2 = np.floor(np.arange(num_elements_irs) / irs_Nh)
+        i1 = np.mod(np.arange(N_ris), irs_Nh)
+        i2 = np.floor(np.arange(N_ris) / irs_Nh)
 
         Rician_factor = 10**(Rician_factor/10)
 
-        tmp = np.random.normal(loc=0, scale=np.sqrt(0.5), size=[num_elements_irs, num_elements_irs, num_user]) \
-              + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[ num_elements_irs, num_elements_irs, num_user])
+        tmp = np.random.normal(loc=0, scale=np.sqrt(0.5), size=[N_ris, N_ris, num_user]) \
+              + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[N_ris, N_ris, num_user])
 
         for k in range(num_user):
             a_irs_user = np.exp(1j * np.pi * (i1 * aoa_irs_y[k] * aoa_irs_cos_z[k] + i2 * aoa_irs_z[k])) # steering vector norm is N_ris
@@ -126,28 +133,171 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, Ricia
     # Channel typle: self-interference, IRS-user, backscattered
     return channels, set_location_user
 
+def generate_bistatic_channels(user_locations, location_bs, location_irs, num_samples=1, \
+                              Rician_factor=10, irs_Nh=16, x_BD = [0,1]):
+
+    if user_locations is None:
+        num_user = num_users  
+    else:
+        num_user = num_users
+        #user_locations.shape[0] if user_locations.ndim == 2 else user_locations.shape[1]
+
+    g1 = [] 
+    g2 = []
+    set_location_user = []
+    H_b = []
+
+    wavelength = Wavelength
+
+    Rician_factor = 10**(Rician_factor/10)
+
+    # direct path channel
+    d_bs_irs = np.linalg.norm(location_bs - location_irs)
+    pathloss_direct = path_loss_r(d_bs_irs, wavelength, type='direct')
+
+    bs_array = np.column_stack((
+        np.full(N_bs, location_bs[0]),
+        location_bs[1] + np.arange(0, N_bs) * (wavelength / 2)
+    ))
+    irs_array = np.column_stack((
+        np.full(N_ris, location_irs[0]), 
+        np.arange(0, N_ris, 1) * (wavelength/2) + location_irs[1]))
+
+    H_d = np.zeros((N_ris, N_bs), dtype=complex)
+    for i in range(N_ris):
+        for j in range(N_bs):
+            H_d[i, j] = np.exp(- 1j * 2 * np.pi * (np.linalg.norm(irs_array[i,:] - bs_array[j,:])) / wavelength)
+
+    pathloss_direct = np.sqrt(10 ** ((-pathloss_direct) / 10))
+    H_d = pathloss_direct *   H_d 
+    normalize_factor = np.linalg.norm(H_d,'fro')
+    H_d = H_d * np.sqrt(N_ris) * np.sqrt(N_bs)/ normalize_factor   # Normalization
+
+    for ii in range(num_samples):
+        # 获取用户位置
+        if user_locations is None:
+            location_user = generate_location(num_user)
+        elif user_locations.ndim >= 3:  # For multiple samples
+            location_user = user_locations[ii, :, :]
+        else:
+            location_user = user_locations
+            
+        # set_location_user.append(location_user)
+        
+        # Pathloss and AoA calculation
+        # BD-RX
+        pathloss_bs_bd_rx = []
+        aoa_irs_y = []
+        aoa_irs_z = []
+        aoa_irs_cos_z = []
+        # BS-BD
+        aoa_bs_y = []
+        aoa_bs_z = []
+        aoa_bs_cos_z = []
+        
+        for k in range(num_user):
+            d_k1 = np.linalg.norm(location_user[k] - location_irs) # BD-IRS distance
+            d_k2 = np.linalg.norm(location_user[k] - location_bs)  # BD-BS distance
+            d_k_xy = np.linalg.norm(location_user[k][0:2] - location_irs[0:2])  # horizontal distance
+            pathloss_bs_bd_rx.append(path_loss_r(d_k1, wavelength, d_k2, type='backscatter'))
+
+            aoa_irs_y_k = (location_user[k][1] - location_irs[1]) / (d_k_xy +1e-8)     # Sine of azimuth angle
+            aoa_irs_z_cos_k = d_k_xy / (d_k1 + 1e-8)  # Cosine of Elevation angle
+            aoa_irs_z_k = (location_user[k][2] - location_irs[2]) / (d_k1 +1e-8)     # Sine of Elevation angle
+            aoa_irs_y.append(aoa_irs_y_k)
+            aoa_irs_z.append(aoa_irs_z_k)
+            aoa_irs_cos_z.append(aoa_irs_z_cos_k)
+
+            aoa_bs_y_k = (location_user[k][1] - location_bs[1]) / (np.linalg.norm(location_user[k][0:2] - location_bs[0:2]) +1e-8)     # Sine of azimuth angle
+            aoa_bs_z_cos_k = np.linalg.norm(location_user[k][0:2] - location_bs[0:2]) / (d_k2 + 1e-8)  # Cosine of Elevation angle
+            aoa_bs_z_k = (location_user[k][2] - location_bs[2]) / (d_k2 +1e-8)     # Sine of Elevation angle
+            aoa_bs_y.append(aoa_bs_y_k)
+            aoa_bs_z.append(aoa_bs_z_k)
+            aoa_bs_cos_z.append(aoa_bs_z_cos_k)
+
+            set_location_user.append(np.array([np.arcsin(aoa_irs_y_k), d_k1, d_k2])[:, np.newaxis])
+        
+        aoa_irs_y = np.array(aoa_irs_y)
+        aoa_irs_z = np.array(aoa_irs_z)
+        aoa_irs_cos_z = np.array(aoa_irs_cos_z)
+
+        
+        # Xiyu: This is considered when the arrays are rectangular
+        i1 = np.mod(np.arange(N_ris), irs_Nh)
+        i2 = np.floor(np.arange(N_ris) / irs_Nh)
+
+        j1 = np.mod(np.arange(N_bs), N_bs)
+        j2 = np.floor(np.arange(N_bs) / N_bs)
+
+        tmp = np.zeros([ N_ris, N_bs, num_user], dtype = complex)
+
+        for k in range(num_user):
+            pathloss_bs_bd_rx = np.sqrt( 10 ** ((-pathloss_bs_bd_rx[k]) / 10) )
+            a_bd_rx = np.exp(1j * np.pi * (i1 * aoa_irs_y[k] * aoa_irs_cos_z[k] + i2 * aoa_irs_z[k])) # steering vector norm is N_ris
+            a_bd_rx = a_bd_rx[:, np.newaxis]
+
+            a_bs_bd = np.exp(1j * np.pi * (j1 * aoa_bs_y[k] * aoa_bs_cos_z[k] + j2 * aoa_bs_z[k])) # steering vector norm is N_ris
+            a_bs_bd = a_bs_bd[:, np.newaxis]
+
+            tmp[ :,:, k] = (a_bd_rx @ np.transpose(np.conj(a_bs_bd))) 
+            tmp[:,:,k] = tmp[:,:, k] * pathloss_bs_bd_rx/normalize_factor  # Backscattered channel
+
+        g1.append( x_BD[0] * tmp )#+ H_d[:,:,np.newaxis])
+        g2.append( x_BD[1] * tmp )#+ H_d[:,:,np.newaxis])
+        H_b.append( tmp[:,:,k])
+
+    channels = (H_d, np.array(g1), np.array(g2), np.array(H_b))
+    # Channel typle: self-interference, IRS-user, backscattered
+    return channels, set_location_user
+
 def channel_complex2real(channels):
     """complex = [real, imagnary]"""
     H_SI, channel_irs_user, channel_backscattered = channels
-    (num_sample, num_elements_irs, _, num_user) = channel_irs_user.shape
-    num_antenna_bs = N_ris
+    (num_sample, num_elements_irs, num_antenna_bs, num_user) = channel_irs_user.shape
     
-    A_T_real = np.zeros([num_sample, 2 * num_elements_irs, 2 * num_antenna_bs, num_user])
+    A_T_real = np.zeros([num_sample, 2 * num_antenna_bs, 2 * num_elements_irs,  num_user])
     set_channel_combine_irs = np.zeros([num_sample, num_antenna_bs, num_elements_irs, num_user], dtype=complex)
     
     for kk in range(num_user):
         channel_irs_user_k = channel_irs_user[:, :, :, kk]
-        # (num_sample, num_elements_irs, num_elements_irs)  
-        channel_combine_irs = channel_irs_user_k.reshape(num_sample, num_elements_irs, num_elements_irs)
+        # (num_sample, num_elements_irs, num_elements_irs)
+        channel_combine_irs = channel_irs_user_k.reshape(num_sample, num_antenna_bs, num_elements_irs)
         set_channel_combine_irs[:, :, :, kk] = channel_combine_irs
         
-        A_tmp_tran = channel_combine_irs # Xiyu: No need to transpose np.transpose(channel_combine_irs, (0, 2, 1))
+        A_tmp_tran = channel_combine_irs 
         A_tmp_real1 = np.concatenate([A_tmp_tran.real, - A_tmp_tran.imag], axis=2)
         A_tmp_real2 = np.concatenate([A_tmp_tran.imag, A_tmp_tran.real], axis=2)
         A_tmp_real = np.concatenate([A_tmp_real1, A_tmp_real2], axis=1)
         A_T_real[:, :, :, kk] = A_tmp_real
-    
     return A_T_real, set_channel_combine_irs
+    
+def channel_bistatic_complex2real(channels):
+
+    H_d, channel_g1, channel_g2, channel_backscattered = channels
+    (num_sample, num_elements_irs, num_antenna_bs, num_user) = channel_g1.shape
+    
+    A_T1_real = np.zeros([num_sample, 2 * num_elements_irs, 2 * num_antenna_bs,  num_user])
+    A_T2_real = A_T1_real.copy()
+    
+    for kk in range(num_user):
+        channel_g1_k = channel_g1[:, :, :, kk]
+        channel_g2_k = channel_g2[:, :, :, kk]
+        # (num_sample, num_elements_irs, num_elements_irs)
+
+        A_tmp_real1 = np.concatenate([channel_g1_k.real, - channel_g1_k.imag], axis=2)
+        A_tmp_imag1 = np.concatenate([channel_g1_k.imag, channel_g1_k.real], axis=2)
+        A_tmp1 = np.concatenate([A_tmp_real1, A_tmp_imag1], axis=1)
+
+        A_tmp_real2 = np.concatenate([channel_g2_k.real, - channel_g2_k.imag], axis=2)
+        A_tmp_imag2 = np.concatenate([channel_g2_k.imag, channel_g2_k.real], axis=2)
+        A_tmp2 = np.concatenate([A_tmp_real2, A_tmp_imag2], axis=1)
+
+        A_T1_real[:, :, :, kk] = A_tmp1
+        A_T2_real[:, :, :, kk] = A_tmp2
+
+    return A_T1_real, A_T2_real
+
+
 
 def generate_RSS_adaptive(A_T_real, the_theta, P_temp):
     """generate current position signal strength"""
@@ -164,30 +314,6 @@ def generate_RSS_adaptive(A_T_real, the_theta, P_temp):
         RSS_list[tau_i] = RSS_i.item()
     return RSS_list
 
-# def generate_radio_map(theta_test):
-#     """generate radio map"""
-#     x_lowerlimit, x_upperlimit = -35, -15
-#     y_lowerlimit, y_upperlimit = 25, 55.5
-#     z_fixed = -20
-    
-#     x_range = int((x_upperlimit - x_lowerlimit) / 0.5) + 1
-#     y_range = int((y_upperlimit - y_lowerlimit) / 0.5) + 1
-#     radio_map = np.zeros([x_range, y_range, tau])
-
-#     for x_i in range(x_range):
-#         for y_i in range(y_range):
-#             coordinate_k = np.array([x_lowerlimit + x_i * 0.5, y_lowerlimit + y_i * 0.5, z_fixed])
-#             location_user = np.empty([num_users, 3])
-#             location_user[0, :] = coordinate_k
-            
-#             # 这里改用简化的信道生成函数
-#             channel_true, set_location_user_train = generate_irs_user_channel(
-#                 location_user, location_ris_1, num_samples=1, Rician_factor=Rician_factor)
-#             A_T_real, _ = channel_complex2real(channel_true)
-#             RSS_offline = generate_RSS_adaptive(A_T_real, theta_test, Pvec[0])
-#             radio_map[x_i, y_i, :] = RSS_offline
-            
-#     return radio_map, theta_test
 
 def calculate_beam_pattern(theta_vector, angles):
     """Calculate beam pattern for given beamforming vector and angles"""
