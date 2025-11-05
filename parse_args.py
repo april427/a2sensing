@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 
 def str2bool(v):
@@ -13,6 +14,10 @@ def str2bool(v):
 
 
 def parse_args():
+    # Filter out Jupyter kernel arguments
+    filtered_argv = [arg for arg in sys.argv if 'kernel' not in arg.lower() and not arg.endswith('.json')]
+
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--N_ris', type=int, default=16, help='Number of receiver antennas')
     parser.add_argument('--N_bs', type=int, default=1, help='Number of BS antennas')
@@ -21,6 +26,7 @@ def parse_args():
     parser.add_argument('--n_epochs', type=int, default=2, help='Number of training epochs')
     parser.add_argument('--num_users', type=int, default=1, help='Number of users')
     parser.add_argument('--rician_factor', type=float, default=5.0, help='Rician factor')
+    parser.add_argument('--fc', type=float, default=2400000000.0, help='Carrier frequency in Hz')
 
-    args, unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args(filtered_argv[1:])
     return args

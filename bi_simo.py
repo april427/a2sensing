@@ -110,7 +110,7 @@ S = np.log2(delta_inv)
 OS_rate = 20 
 delta_inv_OS = OS_rate*delta_inv 
 delta_OS = 1/delta_inv_OS 
-fc = 2.4e9
+fc = args.fc
 Wavelength = 3e8 / fc # Wavelength for 2.4 GHz
 
 BD_modulation = np.array([-1,1] )  # BPSK modulation for BD
@@ -136,11 +136,11 @@ Rician_factor = args.rician_factor  # Rician factor
 location_user = None
 
 # Sensing parameters
-tau = 10#args.tau  # Pilot length
-snr_const = 10#args.snr
+tau = 20#args.tau  # Pilot length
+snr_const = 25#args.snr
 snr_const = np.array([snr_const]) 
 ref_dis = 5
-Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**2
+Pvec = 10**(snr_const/10) #/ (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_ris)**2
             # BD at ref_dis has received SNR of snr_const. ||v||^2 = N_ris 
 
 'Learning Parameters'
@@ -185,7 +185,7 @@ with tf.name_scope("channel_sensing"):
     RNN1 = RNN(hidden_size, name='RNN_g1')
     RNN2 = RNN(hidden_size, name='RNN_g2')
 
-    MLP_receiver = MLPBlock(3, [hidden_size, hidden_size, 2 * N_ris], name='MLP_receiver')
+    MLP_receiver = MLPBlock(3, [hidden_size*2, hidden_size*2, 2 * N_ris], name='MLP_receiver')
 
     snr = lay['P'] * tf.ones(shape=[tf.shape(loc_input)[0], 1], dtype=tf.float32)
     snr_dB = 10* tf.log(snr) / np.log(10)
@@ -202,16 +202,18 @@ with tf.name_scope("channel_sensing"):
         if t == 0: # Initialization
             y_real = tf.ones([tf.shape(loc_input)[0], 32])
             z_real_imag = tf.ones([tf.shape(loc_input)[0], 2])
-            h_old = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # hidden state
-            c_old = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # cell state
-            h_old, c_old = RNN1((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old, c_old))
+            h_old1 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # hidden state
+            c_old1 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # cell state
+            h_old2 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # hidden state
+            c_old2 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # cell state
+            h_old1, c_old1 = RNN1((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old1, c_old1))
         elif t % 2 == 0:
-            h_old, c_old = RNN1((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old, c_old))
+            h_old1, c_old1 = RNN1((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old1, c_old1))
         else:
-            h_old, c_old = RNN2((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old, c_old))
+            h_old2, c_old2 = RNN2((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old2, c_old2))
 
         # BS beamforming 
-        ris_her_unnorm = MLP_receiver(h_old)
+        ris_her_unnorm = MLP_receiver(tf.concat([h_old1, h_old2], axis=1))
         ris_her_r = ris_her_unnorm[:, 0:N_ris]  # real part
         ris_her_i = ris_her_unnorm[:, N_ris:2*N_ris] # imaginary part
         v_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i), axis=1, keepdims=True)) # normalization per sample
@@ -249,12 +251,12 @@ with tf.name_scope("channel_sensing"):
             Y2.append(y_real)
             z2.append(z_real_imag)
 
-    h_old, c_old = RNN2((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old, c_old))
-    c_old = Dense(units=200, activation='linear')(c_old)
+    h_old2, c_old2 = RNN2((tf.concat([y_real, z_real_imag, x_BD[t], snr_normal], axis=1), h_old2, c_old2))
+    c_old2 = Dense(units=200, activation='linear')(c_old2)
     
     # Ouput RIS weights
-    MLP_bf1 = MLPBlock(3, [hidden_size, hidden_size, 2 * N_ris], name='MLP_bf1')
-    ris_her_unnorm = MLP_bf1(c_old)
+    MLP_bf1 = MLPBlock(3, [2*hidden_size, 2*hidden_size, 2 * N_ris], name='MLP_bf1')
+    ris_her_unnorm = MLP_bf1(tf.concat([c_old1, c_old2], axis=1))
     ris_her_r = ris_her_unnorm[:, 0:N_ris]  # real part
     ris_her_i = ris_her_unnorm[:, N_ris:2*N_ris] # imaginary part
     v_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i), axis=1, keepdims=True)) # normalization per sample
@@ -262,47 +264,83 @@ with tf.name_scope("channel_sensing"):
     v_imag = ris_her_i / v_tmp
 
     ## output two dimension: angle and distance of the BD
-    loc_hat = Dense(units=2, activation='relu')(c_old)  
+    loc_hat = Dense(units=2, activation='relu')(c_old2)  
      
     ###### Loss function -- maximize the ratio of v^H g0 g0^H v / v^H g1 g1^H v  ######
     v_complex = tf.complex(v_real, v_imag)  # (batch, N_ris)
     v_complex = tf.reshape(v_complex, [-1, N_ris, 1])  # (batch, N_ris, 1)
 
-    # known channels
+    ########################## known channels ##########################
     g1 = tf.complex(channel_g1[:,  0:N_ris, 0, :], channel_g1[:,  N_ris : 2*N_ris, 0, : ])
     g2 = tf.complex(channel_g2[:, 0:N_ris, 0, :], channel_g2[:,  N_ris : 2*N_ris, 0, :]) # ((batch_size,  N_BS, 2 * N_ris))
     
     sigma1_sq = tf.abs(tf.matmul(tf.linalg.adjoint(v_complex), g1))**2  # (batch, 1, 1)
     sigma2_sq = tf.abs(tf.matmul(tf.linalg.adjoint(v_complex), g2))**2  # (batch, 1, 1)
-    sigma1_sq = tf.squeeze(sigma1_sq)  # (batch,)
-    sigma2_sq = tf.squeeze(sigma2_sq)  # (batch,)
+    sigma1_sq = tf.squeeze(sigma1_sq) * lay['P'] + 1  # (batch,)
+    sigma2_sq = tf.squeeze(sigma2_sq) * lay['P'] + 1  # (batch,)
 
     ratio_1_over_2 = sigma1_sq / (sigma2_sq + 1e-8)
     ratio_2_over_1 = sigma2_sq / (sigma1_sq + 1e-8)
     max_ratio = tf.maximum(ratio_1_over_2, ratio_2_over_1)
 
-    Th = sigma1_sq*sigma2_sq / tf.abs(sigma1_sq - sigma2_sq + 1e-8) * tf.log(sigma1_sq/sigma2_sq + 1e-8) 
-    pe = 0.5 + tf.exp(-Th/sigma2_sq)/2 - tf.exp(-Th/sigma1_sq)/2
+    Th = sigma1_sq*sigma2_sq / tf.abs(sigma1_sq - sigma2_sq + 1e-8) * tf.log(max_ratio) 
+    
+    pe = tf.where(
+        sigma1_sq > sigma2_sq,
+        0.5 + tf.exp(-Th/sigma2_sq)/2 - tf.exp(-Th/sigma1_sq)/2,
+        0.5 + tf.exp(-Th/sigma1_sq)/2 - tf.exp(-Th/sigma2_sq)/2
+    )
 
-    # estimated loss functions -- iteration 1 we assume known channels
-    z1_stacked = tf.stack(z1, axis=1)  # (batch, tau/2, 2)
-    z2_stacked = tf.stack(z2, axis=1)  # (batch, tau/2, 2)
+    # Simplified receiver: project g2 onto orthogonal complement of g1
+    # Shapes: g1,g2 are (batch, N_ris, 1) (num_users==1) -- ensure column shape
+    g1_col = tf.reshape(g1, [-1, N_ris, 1])
+    g2_col = tf.reshape(g2, [-1, N_ris, 1])
+    batch_size = tf.shape(g1_col)[0]
 
-    z1_complex = tf.complex(z1_stacked[:, :, 0], z1_stacked[:, :, 1])  # (batch, tau/2)
-    z2_complex = tf.complex(z2_stacked[:, :, 0], z2_stacked[:, :, 1])  # (batch, tau/2)
+    # projection matrix onto span{g1}: P = g1 g1^H / ||g1||^2
+    g1_energy = tf.real(tf.squeeze(tf.matmul(tf.linalg.adjoint(g1_col), g1_col), axis=[1, 2]))  # (batch,)
+    g1_energy_safe = tf.maximum(g1_energy, 1e-12)
+    proj = tf.matmul(g1_col, tf.linalg.adjoint(g1_col)) / tf.cast(tf.reshape(g1_energy_safe, [-1, 1, 1]), tf.complex64)
 
-    sigma1_sq_est = tf.reduce_sum(tf.abs(z1_complex)**2, axis=1)  # (batch,)
-    sigma2_sq_est = tf.reduce_sum(tf.abs(z2_complex)**2, axis=1)  # (batch,)
+    # Identity per-batch
+    I_batch = tf.tile(tf.expand_dims(tf.eye(N_ris, dtype=tf.complex64), axis=0), [batch_size, 1, 1])
 
-    ratio_1_over_2_est = sigma1_sq_est / (sigma2_sq_est + 1e-8)
-    ratio_2_over_1_est = sigma2_sq_est / (sigma1_sq_est + 1e-8)
-    max_ratio_est = tf.maximum(ratio_1_over_2_est, ratio_2_over_1_est)  # (batch,)
+    # Orthogonal projector (I - P)
+    orth_proj = I_batch - proj
 
-    Th = sigma1_sq_est*sigma2_sq_est / tf.abs(sigma1_sq_est - sigma2_sq_est + 1e-8) * tf.log(sigma1_sq_est/sigma2_sq_est + 1e-8) 
-    pe_est = 0.5 + tf.exp(-Th/sigma2_sq_est)/2 - tf.exp(-Th/sigma1_sq_est)/2
+    # Apply to g2 and normalize
+    v_simp_col = tf.matmul(orth_proj, g2_col)  # (batch, N_ris, 1)
+    v_simp_norm_sq = tf.maximum(tf.reduce_sum(tf.abs(v_simp_col)**2, axis=[1,2], keepdims=True), 1e-12)
+    v_simp = v_simp_col / tf.cast(tf.sqrt(v_simp_norm_sq), tf.complex64)  # (batch, N_ris, 1) normalized complex beamformer
+
+    # squeeze to (batch,)
+    v_simp_norm_sq = tf.squeeze(v_simp_norm_sq, axis=[1,2])     
+
+    # Threshold: (1 + P * v_simp_norm^2) / (P * v_simp_norm^2) * log(1 + P * v_simp_norm^2)
+    Th_simp = (1.0 + lay['P'] * v_simp_norm_sq) / (lay['P'] * v_simp_norm_sq + 1e-12) \
+                * tf.log(1.0 + lay['P'] * v_simp_norm_sq)
+    pe_simp = tf.exp(-Th_simp / (1.0)) / 2 + 0.5 -  tf.exp(-Th_simp / (1.0 + lay['P'] * v_simp_norm_sq)) / 2
 
 
-loss = -tf.log(tf.reduce_mean(max_ratio) + 1e-8)  # maximize the average ratio
+    ################### estimated loss functions  ##########################
+    # z1_stacked = tf.stack(z1, axis=1)  # (batch, tau/2, 2)
+    # z2_stacked = tf.stack(z2, axis=1)  # (batch, tau/2, 2)
+
+    # z1_complex = tf.complex(z1_stacked[:, :, 0], z1_stacked[:, :, 1])  # (batch, tau/2)
+    # z2_complex = tf.complex(z2_stacked[:, :, 0], z2_stacked[:, :, 1])  # (batch, tau/2)
+
+    # sigma1_sq_est = tf.reduce_sum(tf.abs(z1_complex)**2, axis=1)  # (batch,)
+    # sigma2_sq_est = tf.reduce_sum(tf.abs(z2_complex)**2, axis=1)  # (batch,)
+
+    # ratio_1_over_2_est = sigma1_sq_est / (sigma2_sq_est + 1e-8)
+    # ratio_2_over_1_est = sigma2_sq_est / (sigma1_sq_est + 1e-8)
+    # max_ratio_est = tf.maximum(ratio_1_over_2_est, ratio_2_over_1_est)  # (batch,)
+
+    # Th_est = sigma1_sq_est*sigma2_sq_est / tf.abs(sigma1_sq_est - sigma2_sq_est + 1e-8) * tf.log(sigma1_sq_est/sigma2_sq_est + 1e-8) 
+    # pe_est = 0.5 + tf.exp(-Th_est/sigma2_sq_est)/2 - tf.exp(-Th_est/sigma1_sq_est)/2
+
+
+loss = -tf.exp(tf.reduce_mean(max_ratio)) #-tf.log(tf.reduce_mean(max_ratio) + 1e-8)  # maximize the average ratio
 
 # xy_pred = loc_hat[:, ]
 # xy_true = loc_input[:, 0,]
@@ -376,8 +414,12 @@ with tf.Session() as sess:
                 s_placeholder: s_signal
             }
 
-            _, train_loss_val, error_probability = sess.run(
+            _, train_loss_val,  error_probability = sess.run(
                                     [training_op, loss, pe], feed_dict=feed_dict_batch
+            )
+
+            threshold, error_probability, ch_g1, ch_g2, vec_v, pe_simplified = sess.run(
+                                    [Th, pe, g1, g2, v_complex, pe_simp], feed_dict=feed_dict_batch
             )
             
             epoch_train_losses.append(train_loss_val)
@@ -390,9 +432,13 @@ with tf.Session() as sess:
               '  train_loss:%2.7f' % avg_train_loss,
               '  val_loss:%2.7f' % loss_val,
               '  best_val:%2.7f' % best_val)
-        
-        if epoch % 3 == 0:
+        print('threshold:', np.mean(threshold))
+        print('|v^H g1|^2:', np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g1)**2), axis = 0))
+        print('|v^H g2|^2:', np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g2)**2), axis = 0))
+
+        if epoch % 1 == 0:
             print('error_probability:', np.mean(error_probability))
+            print('pe_simplified:', np.mean(pe_simplified))
 
         # Early Stop
         if loss_val < best_val - 1e-9:

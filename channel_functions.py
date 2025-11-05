@@ -6,7 +6,7 @@ args = parse_args()
 N_bs = args.N_bs
 N_ris = args.N_ris
 num_users = args.num_users
-fc = 10e9
+fc = args.fc
 Wavelength = 3e8 / fc # Wavelength for 10 GHz
 tau = args.tau
 location_ris_1 = np.array([0, 0, -20])       # This RIS is our BS
@@ -30,7 +30,7 @@ def generate_location(num_users):
     location_user = np.empty([num_users, 3])
 
     angle = np.random.uniform(-np.pi, np.pi)
-    dis = 5
+    dis = 1
     x1 = dis * np.cos(angle)
     y1 = dis * np.sin(angle)
 
@@ -153,7 +153,7 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
 
     # direct path channel
     d_bs_irs = np.linalg.norm(location_bs - location_irs)
-    pathloss_direct = path_loss_r(d_bs_irs, wavelength, type='direct')
+    pathloss_direct_db = path_loss_r(d_bs_irs, wavelength, type='direct')
 
     bs_array = np.column_stack((
         np.full(N_bs, location_bs[0]),
@@ -168,7 +168,7 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
         for j in range(N_bs):
             H_d[i, j] = np.exp(- 1j * 2 * np.pi * (np.linalg.norm(irs_array[i,:] - bs_array[j,:])) / wavelength)
 
-    pathloss_direct = np.sqrt(10 ** ((-pathloss_direct) / 10))
+    pathloss_direct = np.sqrt(10 ** ((-pathloss_direct_db) / 10))
     H_d = pathloss_direct *   H_d 
     normalize_factor = np.linalg.norm(H_d,'fro')
     H_d = H_d * np.sqrt(N_ris) * np.sqrt(N_bs)/ normalize_factor   # Normalization
@@ -186,7 +186,7 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
         
         # Pathloss and AoA calculation
         # BD-RX
-        pathloss_bs_bd_rx = []
+        pathloss_bs_bd_rx_db = []
         aoa_irs_y = []
         aoa_irs_z = []
         aoa_irs_cos_z = []
@@ -199,7 +199,7 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
             d_k1 = np.linalg.norm(location_user[k] - location_irs) # BD-IRS distance
             d_k2 = np.linalg.norm(location_user[k] - location_bs)  # BD-BS distance
             d_k_xy = np.linalg.norm(location_user[k][0:2] - location_irs[0:2])  # horizontal distance
-            pathloss_bs_bd_rx.append(path_loss_r(d_k1, wavelength, d_k2, type='backscatter'))
+            pathloss_bs_bd_rx_db.append(path_loss_r(d_k1, wavelength, d_k2, type='backscatter')-20)
 
             aoa_irs_y_k = (location_user[k][1] - location_irs[1]) / (d_k_xy +1e-8)     # Sine of azimuth angle
             aoa_irs_z_cos_k = d_k_xy / (d_k1 + 1e-8)  # Cosine of Elevation angle
@@ -226,13 +226,17 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
         i1 = np.mod(np.arange(N_ris), irs_Nh)
         i2 = np.floor(np.arange(N_ris) / irs_Nh)
 
-        j1 = np.mod(np.arange(N_bs), N_bs)
-        j2 = np.floor(np.arange(N_bs) / N_bs)
+        if N_bs == 0:
+            j1 = np.array([1])
+            j2 = np.array([1])
+        else:
+            j1 = np.mod(np.arange(N_bs), N_bs)
+            j2 = np.floor(np.arange(N_bs) / N_bs)
 
         tmp = np.zeros([ N_ris, N_bs, num_user], dtype = complex)
 
         for k in range(num_user):
-            pathloss_bs_bd_rx = np.sqrt( 10 ** ((-pathloss_bs_bd_rx[k]) / 10) )
+            pathloss_bs_bd_rx = np.sqrt( 10 ** ((-pathloss_bs_bd_rx_db[k]) / 10) )
             a_bd_rx = np.exp(1j * np.pi * (i1 * aoa_irs_y[k] * aoa_irs_cos_z[k] + i2 * aoa_irs_z[k])) # steering vector norm is N_ris
             a_bd_rx = a_bd_rx[:, np.newaxis]
 
@@ -242,8 +246,8 @@ def generate_bistatic_channels(user_locations, location_bs, location_irs, num_sa
             tmp[ :,:, k] = (a_bd_rx @ np.transpose(np.conj(a_bs_bd))) 
             tmp[:,:,k] = tmp[:,:, k] * pathloss_bs_bd_rx/normalize_factor  # Backscattered channel
 
-        g1.append( x_BD[0] * tmp )#+ H_d[:,:,np.newaxis])
-        g2.append( x_BD[1] * tmp )#+ H_d[:,:,np.newaxis])
+        g1.append( x_BD[0] * tmp + H_d[:,:,np.newaxis])
+        g2.append( x_BD[1] * tmp + H_d[:,:,np.newaxis])
         H_b.append( tmp[:,:,k])
 
     channels = (H_d, np.array(g1), np.array(g2), np.array(H_b))
