@@ -9,7 +9,7 @@ num_users = args.num_users
 fc = args.fc
 Wavelength = 3e8 / fc # Wavelength for 10 GHz
 tau = args.tau
-location_ris_1 = np.array([0, 0, -20])       # This RIS is our BS
+location_ris_1 = np.array([0, 0, -20])      
 Rician_factor = args.rician_factor
 
 def path_loss_r(d1, wavelength, d2 = None,  type = 'backscatter'):   # return |beta|^2 in dB
@@ -30,7 +30,7 @@ def generate_location(num_users):
     location_user = np.empty([num_users, 3])
 
     angle = np.random.uniform(-np.pi, np.pi)
-    dis = 1
+    dis = Wavelength*12
     x1 = dis * np.cos(angle)
     y1 = dis * np.sin(angle)
 

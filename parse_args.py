@@ -19,7 +19,7 @@ def parse_args():
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--N_ris', type=int, default=16, help='Number of receiver antennas')
+    parser.add_argument('--N_ris', type=int, default=32, help='Number of receiver antennas')
     parser.add_argument('--N_bs', type=int, default=1, help='Number of BS antennas')
     parser.add_argument('--tau', type=int, default=10, help='Number of pilots')
     parser.add_argument('--snr', type=float, default=10.0, help='Signal-to-noise ratio (dB)')

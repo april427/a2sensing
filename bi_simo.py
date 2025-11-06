@@ -121,7 +121,7 @@ phi_max = 60*(np.pi/180)
 num_SNR = 1
 
 # Positions
-location_bs = np.array([10, 0, -20])        # BS location -- Tx
+location_bs = np.array([Wavelength*100, 0, -20])        # BS location -- Tx
 location_ris = np.array([0, 0, -20])       # This RIS is Rx 
 num_ris = 1
 
@@ -136,7 +136,7 @@ Rician_factor = args.rician_factor  # Rician factor
 location_user = None
 
 # Sensing parameters
-tau = 20#args.tau  # Pilot length
+tau = 2*args.N_ris #args.tau  # Pilot length
 snr_const = 25#args.snr
 snr_const = np.array([snr_const]) 
 ref_dis = 5
@@ -148,7 +148,7 @@ initial_run = 1   # 0: Continue training; 1: Starts from scratch
 n_epochs = 200#args.n_epochs
 learning_rate = 1e-3
 batch_per_epoch = 128
-batch_size_order = 14
+batch_size_order = 4
 val_size_order = 10
 scale_factor = 1
 test_size = 2000
@@ -181,7 +181,7 @@ with tf.name_scope("array_response_construction"):
 
 
 with tf.name_scope("channel_sensing"):
-    hidden_size = 256
+    hidden_size = 128
     RNN1 = RNN(hidden_size, name='RNN_g1')
     RNN2 = RNN(hidden_size, name='RNN_g2')
 
@@ -200,7 +200,7 @@ with tf.name_scope("channel_sensing"):
 
     for t in range(tau): # training pilot length
         if t == 0: # Initialization
-            y_real = tf.ones([tf.shape(loc_input)[0], 32])
+            y_real = tf.ones([tf.shape(loc_input)[0], N_ris*2])
             z_real_imag = tf.ones([tf.shape(loc_input)[0], 2])
             h_old1 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # hidden state
             c_old1 = tf.zeros([tf.shape(loc_input)[0], hidden_size]) # cell state
@@ -238,10 +238,10 @@ with tf.name_scope("channel_sensing"):
         y_complex = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.complex(g_real, g_imag) * s_placeholder + noise   # y = gs + n
         z = tf.matmul(tf.complex(v_real[:,tf.newaxis,:], -v_imag[:,tf.newaxis,:]), y_complex[:,:,tf.newaxis])  # v^H y
         z_real_imag = tf.concat([tf.real(z), tf.imag(z)], axis=1) 
-        z_real_imag = tf.reshape(z_real_imag[:,:,0], [-1, 2])  # Reshape to match the input size of RNN
+        z_real_imag = tf.cast(tf.reshape(z_real_imag[:,:,0], [-1, 2]), tf.float32)  # Ensure float32 dtype
 
         y_real = tf.concat([tf.real(y_complex), tf.imag(y_complex)], axis=1) 
-        y_real = tf.reshape(y_real, [-1, 32])  # Reshape to match the input size of RNN
+        y_real = tf.cast(tf.reshape(y_real, [-1, 2 * N_ris]), tf.float32)  # Ensure float32 dtype
 
         # store y 
         if t % 2 == 0:
@@ -256,7 +256,7 @@ with tf.name_scope("channel_sensing"):
     
     # Ouput RIS weights
     MLP_bf1 = MLPBlock(3, [2*hidden_size, 2*hidden_size, 2 * N_ris], name='MLP_bf1')
-    ris_her_unnorm = MLP_bf1(tf.concat([c_old1, c_old2], axis=1))
+    ris_her_unnorm = MLP_bf1(tf.concat([h_old1, h_old2], axis=1))
     ris_her_r = ris_her_unnorm[:, 0:N_ris]  # real part
     ris_her_i = ris_her_unnorm[:, N_ris:2*N_ris] # imaginary part
     v_tmp = tf.sqrt(tf.reduce_sum(tf.square(ris_her_r) + tf.square(ris_her_i), axis=1, keepdims=True)) # normalization per sample
@@ -264,43 +264,42 @@ with tf.name_scope("channel_sensing"):
     v_imag = ris_her_i / v_tmp
 
     ## output two dimension: angle and distance of the BD
-    loc_hat = Dense(units=2, activation='relu')(c_old2)  
+    # loc_hat = Dense(units=2, activation='relu')(c_old2)  
      
     ###### Loss function -- maximize the ratio of v^H g0 g0^H v / v^H g1 g1^H v  ######
     v_complex = tf.complex(v_real, v_imag)  # (batch, N_ris)
     v_complex = tf.reshape(v_complex, [-1, N_ris, 1])  # (batch, N_ris, 1)
 
     ########################## known channels ##########################
-    g1 = tf.complex(channel_g1[:,  0:N_ris, 0, :], channel_g1[:,  N_ris : 2*N_ris, 0, : ])
-    g2 = tf.complex(channel_g2[:, 0:N_ris, 0, :], channel_g2[:,  N_ris : 2*N_ris, 0, :]) # ((batch_size,  N_BS, 2 * N_ris))
+    g1 = tf.complex(channel_g1[:,  0:N_ris, 0, :], -channel_g1[:,  N_ris : 2*N_ris, 0, : ])
+    g2 = tf.complex(channel_g2[:, 0:N_ris, 0, :], -channel_g2[:,  N_ris : 2*N_ris, 0, :]) # ((batch_size,  N_BS, 2 * N_ris))
     
     sigma1_sq = tf.abs(tf.matmul(tf.linalg.adjoint(v_complex), g1))**2  # (batch, 1, 1)
     sigma2_sq = tf.abs(tf.matmul(tf.linalg.adjoint(v_complex), g2))**2  # (batch, 1, 1)
     sigma1_sq = tf.squeeze(sigma1_sq) * lay['P'] + 1  # (batch,)
     sigma2_sq = tf.squeeze(sigma2_sq) * lay['P'] + 1  # (batch,)
 
-    ratio_1_over_2 = sigma1_sq / (sigma2_sq + 1e-8)
-    ratio_2_over_1 = sigma2_sq / (sigma1_sq + 1e-8)
+    ratio_1_over_2 = sigma1_sq / (sigma2_sq + 1e-10)
+    ratio_2_over_1 = sigma2_sq / (sigma1_sq + 1e-10)
     max_ratio = tf.maximum(ratio_1_over_2, ratio_2_over_1)
 
-    Th = sigma1_sq*sigma2_sq / tf.abs(sigma1_sq - sigma2_sq + 1e-8) * tf.log(max_ratio) 
+    Th = sigma1_sq*sigma2_sq / (sigma1_sq - sigma2_sq + 1e-10) * tf.log(sigma1_sq / sigma2_sq) 
     
     pe = tf.where(
         sigma1_sq > sigma2_sq,
-        0.5 + tf.exp(-Th/sigma2_sq)/2 - tf.exp(-Th/sigma1_sq)/2,
-        0.5 + tf.exp(-Th/sigma1_sq)/2 - tf.exp(-Th/sigma2_sq)/2
+        0.5 + 0.5 * tf.exp(-Th/sigma2_sq) - 0.5 * tf.exp(-Th/sigma1_sq),
+        0.5 + 0.5 * tf.exp(-Th/sigma1_sq) - 0.5 * tf.exp(-Th/sigma2_sq)
     )
 
-    # Simplified receiver: project g2 onto orthogonal complement of g1
-    # Shapes: g1,g2 are (batch, N_ris, 1) (num_users==1) -- ensure column shape
+    #### Simplified receiver: project g2 onto orthogonal complement of g1
     g1_col = tf.reshape(g1, [-1, N_ris, 1])
     g2_col = tf.reshape(g2, [-1, N_ris, 1])
     batch_size = tf.shape(g1_col)[0]
 
     # projection matrix onto span{g1}: P = g1 g1^H / ||g1||^2
     g1_energy = tf.real(tf.squeeze(tf.matmul(tf.linalg.adjoint(g1_col), g1_col), axis=[1, 2]))  # (batch,)
-    g1_energy_safe = tf.maximum(g1_energy, 1e-12)
-    proj = tf.matmul(g1_col, tf.linalg.adjoint(g1_col)) / tf.cast(tf.reshape(g1_energy_safe, [-1, 1, 1]), tf.complex64)
+    g1_energy = tf.maximum(g1_energy, 1e-12)
+    proj = tf.matmul(g1_col, tf.linalg.adjoint(g1_col)) / tf.cast(tf.reshape(g1_energy, [-1, 1, 1]), tf.complex64)
 
     # Identity per-batch
     I_batch = tf.tile(tf.expand_dims(tf.eye(N_ris, dtype=tf.complex64), axis=0), [batch_size, 1, 1])
@@ -321,6 +320,54 @@ with tf.name_scope("channel_sensing"):
                 * tf.log(1.0 + lay['P'] * v_simp_norm_sq)
     pe_simp = tf.exp(-Th_simp / (1.0)) / 2 + 0.5 -  tf.exp(-Th_simp / (1.0 + lay['P'] * v_simp_norm_sq)) / 2
 
+    #### Optimum receiver
+    g2_energy = tf.real(tf.squeeze(tf.matmul(tf.linalg.adjoint(g2_col), g2_col), axis=[1, 2]))  # (batch,)
+    g2_energy = tf.maximum(g2_energy, 1e-12)
+    
+    # Coefficients for optimal detector (batch,) -> reshape for broadcasting
+    c1 = lay['P'] * g1_energy / (lay['P'] * g1_energy + 1)  # (batch,)
+    c2 = lay['P'] * g2_energy / (lay['P'] * g2_energy + 1)  # (batch,)
+    c1_batch = tf.cast(tf.reshape(c1, [-1, 1, 1]), tf.complex64)  # (batch, 1, 1)
+    c2_batch = tf.cast(tf.reshape(c2, [-1, 1, 1]), tf.complex64)  # (batch, 1, 1)
+    
+    # Beamforming matrix: Mg = c1 * g1*g1^H - c2 * g2*g2^H
+    Mg = c1_batch * tf.matmul(g1_col, tf.linalg.adjoint(g1_col)) \
+         - c2_batch * tf.matmul(g2_col, tf.linalg.adjoint(g2_col))  # (batch, N_ris, N_ris)
+    
+    # Covariance matrices under H0 and H1
+    S1 = tf.cast(lay['P'], tf.complex64) * tf.matmul(g1_col, tf.linalg.adjoint(g1_col)) + I_batch  # (batch, N_ris, N_ris)
+    S2 = tf.cast(lay['P'], tf.complex64) * tf.matmul(g2_col, tf.linalg.adjoint(g2_col)) + I_batch  # (batch, N_ris, N_ris)
+    
+    # Cholesky decomposition: S = L * L^H (lower triangular)
+    L1 = tf.linalg.cholesky(S1)  # (batch, N_ris, N_ris)
+    L2 = tf.linalg.cholesky(S2)  # (batch, N_ris, N_ris)
+    
+    # Compute L1 * Mg * L1^H (this is Hermitian)
+    Mg_transformed1 = tf.matmul(tf.matmul(L1, Mg), tf.linalg.adjoint(L1))  # (batch, N_ris, N_ris)
+    eigvals1, _ = tf.linalg.eigh(Mg_transformed1)  # (batch, N_ris) ascending order
+    
+    # Compute L2 * Mg * L2^H (this is Hermitian)
+    Mg_transformed2 = tf.matmul(tf.matmul(L2, Mg), tf.linalg.adjoint(L2))  # (batch, N_ris, N_ris)
+    eigvals2, _ = tf.linalg.eigh(Mg_transformed2)  # (batch, N_ris) ascending order
+    
+    # Optimal threshold (log-likelihood ratio threshold at equal priors)
+    Th_opt = tf.log(lay['P'] * g1_energy + 1) - tf.log(lay['P'] * g2_energy + 1)  # (batch,) float32
+    
+    # Error probability using Chernoff bound with largest eigenvalues
+    # Extract eigenvalues and ensure they are real (eigh returns real eigenvalues but as float32)
+    lambda1_max = tf.real(eigvals1[:, -1])  # (batch,) largest eigenvalue under H1
+    lambda1_2nd = tf.real(eigvals1[:, 0])  # (batch,) 2nd largest eigenvalue under H1
+    lambda2_max = tf.real(eigvals2[:, 0])  # (batch,) largest eigenvalue under H2
+    lambda2_2nd = tf.real(eigvals2[:, -1])  # (batch,) 2nd largest eigenvalue under H2
+    
+    # Compute error probability components with numerical stability
+    pe_opt = tf.where(
+        Th_opt < 0,
+        0.5 - 0.5 * (lambda1_max / (lambda1_2nd - lambda1_max + 1e-10)) * tf.exp(-Th_opt / (lambda1_max + 1e-10)) \
+            + 0.5 * (lambda2_max / (lambda2_2nd - lambda2_max + 1e-10)) * tf.exp(-Th_opt / (lambda2_max + 1e-10)),
+        0.5 - 0.5 * (lambda1_2nd / (lambda1_2nd - lambda1_max + 1e-10)) * tf.exp(-Th_opt / (lambda1_2nd + 1e-10)) \
+            + 0.5 * (lambda2_2nd / (lambda2_2nd - lambda2_max + 1e-10)) * tf.exp(-Th_opt / (lambda2_2nd + 1e-10))
+    )
 
     ################### estimated loss functions  ##########################
     # z1_stacked = tf.stack(z1, axis=1)  # (batch, tau/2, 2)
@@ -332,22 +379,22 @@ with tf.name_scope("channel_sensing"):
     # sigma1_sq_est = tf.reduce_sum(tf.abs(z1_complex)**2, axis=1)  # (batch,)
     # sigma2_sq_est = tf.reduce_sum(tf.abs(z2_complex)**2, axis=1)  # (batch,)
 
-    # ratio_1_over_2_est = sigma1_sq_est / (sigma2_sq_est + 1e-8)
-    # ratio_2_over_1_est = sigma2_sq_est / (sigma1_sq_est + 1e-8)
+    # ratio_1_over_2_est = sigma1_sq_est / (sigma2_sq_est + 1e-10)
+    # ratio_2_over_1_est = sigma2_sq_est / (sigma1_sq_est + 1e-10)
     # max_ratio_est = tf.maximum(ratio_1_over_2_est, ratio_2_over_1_est)  # (batch,)
 
-    # Th_est = sigma1_sq_est*sigma2_sq_est / tf.abs(sigma1_sq_est - sigma2_sq_est + 1e-8) * tf.log(sigma1_sq_est/sigma2_sq_est + 1e-8) 
+    # Th_est = sigma1_sq_est*sigma2_sq_est / tf.abs(sigma1_sq_est - sigma2_sq_est + 1e-10) * tf.log(sigma1_sq_est/sigma2_sq_est + 1e-10) 
     # pe_est = 0.5 + tf.exp(-Th_est/sigma2_sq_est)/2 - tf.exp(-Th_est/sigma1_sq_est)/2
 
 
-loss = -tf.exp(tf.reduce_mean(max_ratio)) #-tf.log(tf.reduce_mean(max_ratio) + 1e-8)  # maximize the average ratio
-
+loss =  -tf.reduce_mean(tf.log(max_ratio + 1e-10))  # maximize the average ratio
+# loss = tf.cast(tf.reduce_mean(tf.linalg.norm(v_complex - v_simp, axis=1)**2), dtype=tf.float32)  # minimize the difference between learned and simplified beamformer
 # xy_pred = loc_hat[:, ]
 # xy_true = loc_input[:, 0,]
 # loss = tf.reduce_mean(tf.square(xy_pred - xy_true))
 user_loss = tf.stack(loss, name='ratio')
 
-# 优化器
+# optimizer
 global_step = tf.train.get_or_create_global_step()
 l2 = 1e-4
 reg_term = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
@@ -418,9 +465,11 @@ with tf.Session() as sess:
                                     [training_op, loss, pe], feed_dict=feed_dict_batch
             )
 
-            threshold, error_probability, ch_g1, ch_g2, vec_v, pe_simplified = sess.run(
-                                    [Th, pe, g1, g2, v_complex, pe_simp], feed_dict=feed_dict_batch
+            threshold, error_probability, ch_g1, ch_g2, vec_v, pe_simplified, pe_optimum = sess.run(
+                                    [Th, pe, g1, g2, v_complex, pe_simp, pe_opt], feed_dict=feed_dict_batch
             )
+
+            eigvalue1, eigvalue2 = sess.run( [eigvals1, eigvals2], feed_dict=feed_dict_batch)
             
             epoch_train_losses.append(train_loss_val)
             batch_iter += 1
@@ -433,12 +482,13 @@ with tf.Session() as sess:
               '  val_loss:%2.7f' % loss_val,
               '  best_val:%2.7f' % best_val)
         print('threshold:', np.mean(threshold))
-        print('|v^H g1|^2:', np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g1)**2), axis = 0))
-        print('|v^H g2|^2:', np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g2)**2), axis = 0))
+        print('|v^H g1|^2:', Pvec[0] * np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g1)**2), axis = 0) + 1 )
+        print('|v^H g2|^2:', Pvec[0] * np.mean(np.abs(np.matmul(np.conj(vec_v).transpose(0, 2, 1), ch_g2)**2), axis = 0) + 1 ) 
 
         if epoch % 1 == 0:
-            print('error_probability:', np.mean(error_probability))
+            print('pe_activesensing:', np.mean(error_probability))
             print('pe_simplified:', np.mean(pe_simplified))
+            print('pe_optimum:', np.mean(pe_optimum))
 
         # Early Stop
         if loss_val < best_val - 1e-9:
