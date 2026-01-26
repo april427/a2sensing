@@ -15,9 +15,9 @@ Rician_factor = args.rician_factor
 def path_loss_r(d1, wavelength, d2 = None,  type = 'backscatter'):   # return |beta|^2 in dB
     """Keyhole channel: pathloss of backscatter signal for Rician fading in dB. (4 pi d / wavelength)^4 ! """
     if d2 is None and type == 'backscatter':
-        loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d1 + 1e-8)
+        loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d1 + 1e-8)-20
     elif d2 is not None and type == 'backscatter':
-        loss = 40*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8) + 20.0 * np.log10(d2 + 1e-8)  
+        loss = 40*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8) + 20.0 * np.log10(d2 + 1e-8) - 20 
     elif type == 'direct':
         loss = 20*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8)
     return loss
@@ -452,11 +452,11 @@ def generate_location_mimo(num_users):
     dis = Wavelength*15
 
     azimuch_angle = np.random.uniform(-np.pi, np.pi)
-    elevation_angle = np.random.uniform(np.pi/18, np.pi/2)
+    elevation_angle = np.random.uniform(-np.pi*7/8, -np.pi/8)
 
     x1 = dis * np.cos(elevation_angle) * np.cos(azimuch_angle)
     y1 = dis * np.cos(elevation_angle) * np.sin(azimuch_angle)
-    z1 = dis * np.sin(elevation_angle)
+    z1 = dis * np.sin(elevation_angle) + 80*Wavelength
 
     location_user[0, :] = np.array([x1, y1, z1])
 

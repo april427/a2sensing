@@ -141,7 +141,7 @@ Rician_factor = args.rician_factor
 location_bd = None
 
 # Sensing parameters
-tau = 64  # Pilot length (also number of BD interactions)
+tau = 32  # Pilot length (also number of BD interactions)
 K = 1  # Number of OFDM symbols per BD state
 snr_const = 25
 snr_const = np.array([snr_const])
@@ -182,20 +182,12 @@ tx_signal = nr_signal_with_cp.flatten()
 
 ####  Learning parameters
 initial_run = 1
-n_epochs = 10
+n_epochs = 20
 learning_rate = 1e-3
-batch_per_epoch = 4
-batch_size_order = 4
+batch_per_epoch = 8
+batch_size_order = 5
 val_size_order = 10
 test_size = 200
-
-# Feature options
-USE_MIXED_Z_FEATURE = True
-USE_LOG_POWER = True
-Z_FIXED_W = 1.0
-Z_LEARN_W = 1.0
-Z_LEARN_DROPOUT = 0.0
-
 
 #####################################################
 # Build Computation Graph
@@ -220,7 +212,7 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size = 128
+    hidden_size = 256
     
     # Two LSTM cells for alternating BD states
     LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')  
@@ -258,24 +250,24 @@ with tf.name_scope("active_sensing_agent"):
         'Initialization at t=0'
         if t == 0:
             # Initialize LSTM states
-            h_old1 = tf.zeros([batch_size, hidden_size])  # Tx (User 1) state
+            h_old1 = tf.zeros([batch_size, hidden_size])  # RIS state
             c_old1 = tf.zeros([batch_size, hidden_size])
-            h_old2 = tf.zeros([batch_size, hidden_size])  # Rx (User 2) state
+            h_old2 = tf.zeros([batch_size, hidden_size])  # Rx state
             c_old2 = tf.zeros([batch_size, hidden_size])
             
-            # Initialize first Tx beamformer w (trainable)
+            # Initialize first RIS transmit beamformer w 
             w_init_real = tf.get_variable("w_init_real", shape=(1, N_tx, 1), trainable=True)
             w_init_imag = tf.get_variable("w_init_imag", shape=(1, N_tx, 1), trainable=True)
             w_complex_init = tf.complex(w_init_real, w_init_imag)
             w1 = w_complex_init / tf.cast(tf.norm(w_complex_init, axis=1, keepdims=True), tf.complex64)
             
-            # Initialize first Rx beamformer v (trainable)
+            # Initialize first Rx receive beamformer v
             v_init_real = tf.get_variable("v_init_real", shape=(1, N_rx, 1), trainable=True)
             v_init_imag = tf.get_variable("v_init_imag", shape=(1, N_rx, 1), trainable=True)
             v_complex_init = tf.complex(v_init_real, v_init_imag)
             v1 = v_complex_init / tf.cast(tf.norm(v_complex_init, axis=1, keepdims=True), tf.complex64)
 
-            w2 = w1  # Placeholder for reverse link
+            w2 = w1  # Initialize RIS receive beamformer
             
             # Store for random initialization comparison
             bf_gain_init_w = w1
@@ -333,10 +325,10 @@ with tf.name_scope("active_sensing_agent"):
         v2 = tf.complex(v_tx_her[:, 0:N_rx], v_tx_her[:, N_rx:2 * N_rx])  # Tx dim for reverse
         v2 = tf.reshape(v2, [-1, N_rx, 1])
         
-        'Tx observes reverse link: y = sqrt(P) * w^H * H^H * v2 * s + noise'
-        # Reverse channel: H^H (transposed conjugate)
-        H_eff_H = tf.transpose(tf.conj(H_eff), perm=[0, 2, 1])  # (batch, N_tx, N_rx)
-        g_eff_rev = tf.matmul(tf.transpose(tf.conj(w2), perm=[0, 2, 1]), tf.matmul(H_eff_H, v2))  # Using v2 as Rx transmit
+        'Tx observes reverse link: y = sqrt(P) * w^H * H^T * v2 * s + noise'
+        # Reverse channel: H^T (transposed channel)
+        H_eff_T = tf.transpose(H_eff, perm=[0, 2, 1])  # (batch, N_tx, N_rx)
+        g_eff_rev = tf.matmul(tf.transpose(tf.conj(w2), perm=[0, 2, 1]), tf.matmul(H_eff_T, v2))  # Using v2 as Rx transmit
         g_eff_rev = tf.reshape(g_eff_rev, [-1, 1])
         
         y_noiseless_rev = tf.complex(tf.sqrt(lay['P']), 0.0) * g_eff_rev
@@ -385,14 +377,14 @@ with tf.name_scope("active_sensing_agent"):
     MLP_bf_w = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_tx], name='MLP_bf_w')
     MLP_bf_v = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_rx], name='MLP_bf_v')
     
-    # Final Tx beamformer w from User 1 state
+    # Final RIS transmit beamformer w 
     w_tmp = MLP_bf_w(c_old1)
     w_norm = tf.reshape(tf.norm(w_tmp, axis=1), (-1, 1))
     w_tmp = tf.divide(w_tmp, w_norm + 1e-8)
     w_complex = tf.complex(w_tmp[:, 0:N_tx], w_tmp[:, N_tx:2 * N_tx])
     w_complex = tf.reshape(w_complex, [-1, N_tx, 1])
     
-    # Final Rx beamformer v from User 2 state
+    # Final Rx receive beamformer v 
     v_tmp = MLP_bf_v(c_old2)
     v_norm = tf.reshape(tf.norm(v_tmp, axis=1), (-1, 1))
     v_tmp = tf.divide(v_tmp, v_norm + 1e-8)
@@ -420,8 +412,10 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
     # BD SINR = P * |v^H H_b w|^2 / (P * |v^H (H_d + H_r) w|^2 + noise_var)
-    sinr_BD = sig_BD / (sig_int + noise_var + 1e-10)
-    log_sinr_BD = tf.log(sinr_BD + 1e-9)
+    sinr_BD = tf.clip_by_value(sig_BD / (sig_int + noise_var + 1e-10), 
+                            1e-4,
+                            1e4)
+    log_sinr_BD = tf.log(1 + sinr_BD + 1e-9)
     
     # For backward compatibility, define sig_ref as interference
     sig_ref = sig_int
@@ -472,7 +466,7 @@ with tf.name_scope("optimal_beamformer"):
             B = np.sqrt(P_val) * H_int_i
             
             try:
-                w_opt_i, v_opt_i, _ = solve_with_random_restarts(A, B, c=noise_var_val, restarts=3)
+                w_opt_i, v_opt_i, _ = solve_with_random_restarts(A, B, c=noise_var_val, restarts=10)
                 v_opt_batch[i, :, 0] = v_opt_i
                 w_opt_batch[i, :, 0] = w_opt_i
             except Exception as e:
@@ -518,13 +512,28 @@ loss = -tf.reduce_mean(log_sinr_BD)
 
 # Regularization
 global_step = tf.train.get_or_create_global_step()
-l2 = 1e-4
+l2 = 1e-5
 reg_term = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 loss_reg = loss + l2 * reg_term
 
+
+# Add warmup and slower decay
+warmup_steps = 300
+global_step_float = tf.cast(global_step, tf.float32)
+warmup_lr = learning_rate * tf.minimum(1.0, global_step_float / warmup_steps)
+
+decayed_lr = tf.train.exponential_decay(
+    learning_rate, 
+    global_step, 
+    decay_steps=2000,  # Slower decay
+    decay_rate=0.96,    # Gentler decay
+    staircase=True
+)
+
+lr = tf.where(global_step < warmup_steps, warmup_lr, decayed_lr)
 # Learning rate schedule
-lr = tf.train.exponential_decay(learning_rate, global_step, decay_steps=500, decay_rate=0.9)
-optimizer = tf.train.AdamOptimizer(lr)
+# lr = tf.train.exponential_decay(learning_rate, global_step, decay_steps=1000, decay_rate=0.95, staircase=True)
+optimizer = tf.train.AdamOptimizer(lr, beta1=0.9, beta2=0.999, epsilon=1e-8)
 
 # Gradient computation with safety checks
 grads_vars = optimizer.compute_gradients(loss_reg)
@@ -702,8 +711,8 @@ with tf.Session() as sess:
                 s_placeholder: s_signal
             }
             
-            _, train_loss, sinr_values, sinr_opt_values, pe_values = sess.run(
-                [training_op, loss, sinr_BD, sinr_BD_opt, pe], feed_dict=feed_dict_batch
+            _, train_loss, sinr_values, pe_values = sess.run(
+                [training_op, loss, sinr_BD, pe], feed_dict=feed_dict_batch
             )
             
             epoch_train_losses.append(train_loss)
@@ -832,7 +841,10 @@ with tf.Session() as sess:
         w_optimal=w_optimal
     ))
     print(f"\nResults saved to {model_filename}")
-    
+
+
+
+
 # %%    
     #####################################################
     # 3D Beam Pattern Visualization
