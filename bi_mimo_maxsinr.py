@@ -182,10 +182,10 @@ tx_signal = nr_signal_with_cp.flatten()
 
 ####  Learning parameters
 initial_run = 1
-n_epochs = 20
-learning_rate = 1e-3
-batch_per_epoch = 8
-batch_size_order = 5
+n_epochs = 50
+learning_rate = 5e-4
+batch_per_epoch = 4
+batch_size_order = 8
 val_size_order = 10
 test_size = 200
 
@@ -212,15 +212,16 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size = 256
+    hidden_size1 = 256
+    hidden_size2 = 512
     
     # Two LSTM cells for alternating BD states
-    LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')  
-    LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2') 
-    mlp_ris_tx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_tx], name='RIS_transmitter')
-    mlp_ris_rx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_tx], name='RIS_receiver')
-    mlp_re_tx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_rx], name='Receiver_transmitter')
-    mlp_re_rx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_rx], name='Receiver_receiver')
+    LSTM1 = LSTM_Cell(hidden_size1, name='LSTM_1')  
+    LSTM2 = LSTM_Cell(hidden_size2, name='LSTM_2') 
+    mlp_ris_tx = MLPBlock(3, [hidden_size1 * 2, hidden_size1 * 2, 2 * N_tx], name='RIS_transmitter')
+    mlp_ris_rx = MLPBlock(3, [hidden_size1 * 2, hidden_size2 * 2, 2 * N_tx], name='RIS_receiver')
+    mlp_re_tx = MLPBlock(3, [hidden_size2 * 2, hidden_size2 * 2, 2 * N_rx], name='Receiver_transmitter')
+    mlp_re_rx = MLPBlock(3, [hidden_size2 * 2, hidden_size2 * 2, 2 * N_rx], name='Receiver_receiver')
     
     # SNR feature
     snr = lay['P'] * tf.ones(shape=[tf.shape(loc_input)[0], 1], dtype=tf.float32)
@@ -250,10 +251,10 @@ with tf.name_scope("active_sensing_agent"):
         'Initialization at t=0'
         if t == 0:
             # Initialize LSTM states
-            h_old1 = tf.zeros([batch_size, hidden_size])  # RIS state
-            c_old1 = tf.zeros([batch_size, hidden_size])
-            h_old2 = tf.zeros([batch_size, hidden_size])  # Rx state
-            c_old2 = tf.zeros([batch_size, hidden_size])
+            h_old1 = tf.zeros([batch_size, hidden_size1])  # RIS state
+            c_old1 = tf.zeros([batch_size, hidden_size1])
+            h_old2 = tf.zeros([batch_size, hidden_size2])  # Rx state
+            c_old2 = tf.zeros([batch_size, hidden_size2])
             
             # Initialize first RIS transmit beamformer w 
             w_init_real = tf.get_variable("w_init_real", shape=(1, N_tx, 1), trainable=True)
@@ -374,8 +375,8 @@ with tf.name_scope("active_sensing_agent"):
     #####################################################
     # Output Final Beamformers after tau interactions
     #####################################################
-    MLP_bf_w = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_tx], name='MLP_bf_w')
-    MLP_bf_v = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_rx], name='MLP_bf_v')
+    MLP_bf_w = MLPBlock(3, [2 * hidden_size1, 2 * hidden_size1, 2 * N_tx], name='MLP_bf_w')
+    MLP_bf_v = MLPBlock(3, [2 * hidden_size2, 2 * hidden_size2, 2 * N_rx], name='MLP_bf_v')
     
     # Final RIS transmit beamformer w 
     w_tmp = MLP_bf_w(c_old1)
@@ -412,10 +413,12 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
     # BD SINR = P * |v^H H_b w|^2 / (P * |v^H (H_d + H_r) w|^2 + noise_var)
-    sinr_BD = tf.clip_by_value(sig_BD / (sig_int + noise_var + 1e-10), 
-                            1e-4,
-                            1e4)
-    log_sinr_BD = tf.log(1 + sinr_BD + 1e-9)
+    sinr_BD = sig_BD / (sig_int + noise_var + 1e-10)
+    sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-4, 1e4)
+    
+    # Log SINR with per-sample clipping to prevent outliers from dominating
+    log_sinr_BD_raw = tf.log(sinr_BD_clipped + 1e-9)
+    log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -8.0, 8.0)  # ~±35 dB range
     
     # For backward compatibility, define sig_ref as interference
     sig_ref = sig_int
@@ -548,7 +551,7 @@ for g, v in grads_vars:
         safe_grads.append(g)
         vars_list.append(v)
 
-clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 5.0)
+clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 1.0)
 
 final_grads = []
 clip_index = 0
@@ -591,7 +594,7 @@ set_location_user_val = []
 for ii in range(num_val_samples):
     # Generate random locations
     bd_loc = generate_location_mimo(1)[0]
-    scatter_loc = None#generate_location_mimo(1)[0]
+    scatter_loc = generate_location_mimo(1)[0]
     
     # Generate MIMO channels using generate_mimo_channel
     # Returns: H_total, H_direct, H_scatter, H_bd
@@ -613,16 +616,16 @@ for ii in range(num_val_samples):
     set_location_user_val.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
 
 H_b_val = np.array(H_b_val_list)
-H_d_val = H_d_val_list[0]  # Direct channel is same for all (same tx/rx locations)
-H_r_val = H_r_val_list[0]  # Scatter channel varies but use first for simplicity
+H_d_val = np.array(H_d_val_list)  # Use ALL per-sample direct channels
+H_r_val = np.array(H_r_val_list)  # Use ALL per-sample scatter channels
 
 # QPSK ambient signal
 qpsk_symbols = np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j]) / np.sqrt(2)
 s_signal_val = qpsk_symbols[np.random.randint(0, 4, size=(val_size_order * 32, 1, num_subcarriers))]
 
 # Prepare batch-sized channel matrices
-H_d_val_batch = np.tile(H_d_val[np.newaxis, :, :], (num_val_samples, 1, 1))
-H_r_val_batch = np.tile(H_r_val[np.newaxis, :, :], (num_val_samples, 1, 1))
+H_d_val_batch = H_d_val  # Already (num_val_samples, N_rx, N_tx)
+H_r_val_batch = H_r_val  # Already (num_val_samples, N_rx, N_tx)
 
 feed_dict_val = {
     loc_input: np.array(set_location_user_val),
@@ -675,7 +678,7 @@ with tf.Session() as sess:
             for ii in range(num_train_samples):
                 # Generate random locations
                 bd_loc = generate_location_mimo(1)[0]
-                scatter_loc = None#generate_location_mimo(1)[0]
+                scatter_loc = generate_location_mimo(1)[0]
                 
                 # Generate MIMO channels
                 _, H_d, H_r, H_b = generate_mimo_channel(
@@ -696,12 +699,12 @@ with tf.Session() as sess:
                 set_location_user_train.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
             
             H_b_train = np.array(H_b_train_list)
-            H_d_train = H_d_train_list[0]
-            H_r_train = H_r_train_list[0]
-            
-            H_d_train_batch = np.tile(H_d_train[np.newaxis, :, :], (num_train_samples, 1, 1))
-            H_r_train_batch = np.tile(H_r_train[np.newaxis, :, :], (num_train_samples, 1, 1))
-            
+            H_d_train = np.array(H_d_train_list)  # Per-sample
+            H_r_train = np.array(H_r_train_list)  # Per-sample
+
+            H_d_train_batch = H_d_train  # Already correct shape
+            H_r_train_batch = H_r_train  # Already correct shape
+
             feed_dict_batch = {
                 loc_input: np.array(set_location_user_train),
                 lay['P']: Pvec[0],
@@ -723,8 +726,10 @@ with tf.Session() as sess:
         avg_train_loss = np.mean(epoch_train_losses)
         avg_train_sinr = np.mean(epoch_sinr_values)
         
-        loss_val, sinr_val, sinr_opt_val, pe_val, sig_bd_val, sig_ref_val = sess.run(
-            [loss, sinr_BD, sinr_BD_opt, pe, sig_BD, sig_ref], feed_dict=feed_dict_val
+        loss_val, sinr_val, sinr_opt_val, pe_val, \
+            sig_bd_val, sig_ref_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
+            [loss, sinr_BD, sinr_BD_opt, pe, \
+             sig_BD, sig_ref, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
         )
         
         print(f'Epoch {epoch:3d} | '
@@ -737,6 +742,8 @@ with tf.Session() as sess:
         print(f'         | '
               f'Sig_BD: {np.mean(sig_bd_val):8.4f} | '
               f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
+              f'Sig_BD_opt: {np.mean(sig_bd_opt_val):8.4f} | '
+              f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | '
               f'PE: {np.mean(pe_val):6.4f}')
         print()
         
@@ -771,7 +778,7 @@ with tf.Session() as sess:
     for ii in range(test_size):
         # Generate random locations
         bd_loc = generate_location_mimo(1)[0]
-        scatter_loc = None#generate_location_mimo(1)[0]
+        scatter_loc = generate_location_mimo(1)[0]
 
         BD_loc.append(bd_loc)
         Scatter_loc.append(scatter_loc)
@@ -795,12 +802,11 @@ with tf.Session() as sess:
         set_location_user_test.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
     
     H_b_test = np.array(H_b_test_list)
-    H_d_test = H_d_test_list[0]
-    H_r_test = H_r_test_list[0]
-    
-    num_test_samples = len(set_location_user_test)
-    H_d_test_batch = np.tile(H_d_test[np.newaxis, :, :], (num_test_samples, 1, 1))
-    H_r_test_batch = np.tile(H_r_test[np.newaxis, :, :], (num_test_samples, 1, 1))
+    H_d_test = np.array(H_d_test_list)  # Per-sample
+    H_r_test = np.array(H_r_test_list)  # Per-sample
+
+    H_d_test_batch = H_d_test
+    H_r_test_batch = H_r_test
     
     s_signal_test = qpsk_symbols[np.random.randint(0, 4, size=(test_size, 1, num_subcarriers))]
     
