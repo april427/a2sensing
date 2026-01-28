@@ -9,7 +9,7 @@ num_users = args.num_users
 fc = args.fc
 Wavelength = 3e8 / fc # Wavelength for 10 GHz
 tau = args.tau
-location_ris_1 = np.array([0, 0, -20])      
+location_ris_1 = np.array([0, 0, 0])      
 Rician_factor = args.rician_factor
 
 def path_loss_r(d1, wavelength, d2 = None,  type = 'backscatter'):   # return |beta|^2 in dB
@@ -565,29 +565,51 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     Rician_factor_linear = 10**(Rician_factor/10)
     
     # --- Direct Path Channel: TX to RX ---
-    d_tx_rx = np.linalg.norm(rx_location - tx_location)
-    d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])
-    
-    # Calculate angles for direct path
-    azimuth_tx_rx = np.arctan2(rx_location[1] - tx_location[1], 
-                                rx_location[0] - tx_location[0])
-    elevation_tx_rx = np.arcsin((rx_location[2] - tx_location[2]) / (d_tx_rx + 1e-8))
-    
-    azimuth_rx_tx = np.arctan2(tx_location[1] - rx_location[1],
-                                tx_location[0] - rx_location[0])
-    elevation_rx_tx = np.arcsin((tx_location[2] - rx_location[2]) / (d_tx_rx + 1e-8))
-    
-    # Steering vectors for direct path
-    a_tx_direct = generate_upa_steering_vector(N_tx_h, N_tx_v, azimuth_tx_rx, 
-                                                elevation_tx_rx, wavelength)[:, np.newaxis]
-    a_rx_direct = generate_upa_steering_vector(N_rx_h, N_rx_v, azimuth_rx_tx, 
-                                                elevation_rx_tx, wavelength)[:, np.newaxis]
-    
-    # Direct path channel with pathloss
-    pathloss_direct_db = path_loss_r(d_tx_rx, wavelength, type='direct')
-    pathloss_direct = np.sqrt(10 ** ((-pathloss_direct_db) / 10))
-    
-    H_direct = pathloss_direct * (a_rx_direct @ a_tx_direct.T.conj())
+    if np.array_equal(tx_location , rx_location):
+        # Self-interference channel for UPA
+        N_total = N_tx_h * N_tx_v
+        
+        # Generate 2D antenna positions for UPA
+        i_h = np.mod(np.arange(N_total), N_tx_h)  # Horizontal indices
+        i_v = np.floor(np.arange(N_total) / N_tx_h)  # Vertical indices
+        
+        # Antenna positions for TX and RX
+        tx_pos_x = i_h * (wavelength / 2)
+        tx_pos_y = i_v * (wavelength / 2)
+        rx_pos_x = (i_h + N_tx_h) * (wavelength / 2)  # Offset RX array
+        rx_pos_y = i_v * (wavelength / 2)
+        
+        H_SI = np.zeros((N_total, N_total), dtype=complex)
+        for i in range(N_total):
+            for j in range(N_total):
+                # Calculate 2D distance between TX and RX elements
+                dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
+                H_SI[i, j] = (1/100) * (wavelength/(dist + 1e-8)/4/np.pi) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
+        H_direct = H_SI 
+    else:
+        d_tx_rx = np.linalg.norm(rx_location - tx_location)
+        d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])
+        
+        # Calculate angles for direct path
+        azimuth_tx_rx = np.arctan2(rx_location[1] - tx_location[1], 
+                                    rx_location[0] - tx_location[0])
+        elevation_tx_rx = np.arcsin((rx_location[2] - tx_location[2]) / (d_tx_rx + 1e-8))
+        
+        azimuth_rx_tx = np.arctan2(tx_location[1] - rx_location[1],
+                                    tx_location[0] - rx_location[0])
+        elevation_rx_tx = np.arcsin((tx_location[2] - rx_location[2]) / (d_tx_rx + 1e-8))
+        
+        # Steering vectors for direct path
+        a_tx_direct = generate_upa_steering_vector(N_tx_h, N_tx_v, azimuth_tx_rx, 
+                                                    elevation_tx_rx, wavelength)[:, np.newaxis]
+        a_rx_direct = generate_upa_steering_vector(N_rx_h, N_rx_v, azimuth_rx_tx, 
+                                                    elevation_rx_tx, wavelength)[:, np.newaxis]
+        
+        # Direct path channel with pathloss
+        pathloss_direct_db = path_loss_r(d_tx_rx, wavelength, type='direct')
+        pathloss_direct = np.sqrt(10 ** ((-pathloss_direct_db) / 10))
+        
+        H_direct = pathloss_direct * (a_rx_direct @ a_tx_direct.T.conj())
     
     # --- Scattered Path Channel: TX to Scatterer to RX ---
     if scatter_location is not None:

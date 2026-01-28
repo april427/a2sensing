@@ -6,6 +6,12 @@ BD alters its states to distinguish itself from other reflectors.
 
 Objective: max_v SINR_BD = P|w^H H_b v|^2 / (P|w^H (H_d+H_r) v|^2 + noise_var)
 
+Architecture: RIS and Rx are separate nodes but share observations via a single LSTM.
+- RIS only trains transmit beamformer w
+- Rx only trains receive beamformer v
+- Both nodes can see each other's results through shared hidden state
+  (similar to 2b.py where a single node trains both beamformers)
+
 """
 
 import os
@@ -130,11 +136,11 @@ noise_var = 2 * noiseSTD_per_dim**2  # Total noise variance
     # Positions
 d0 = 80*Wavelength  # Distance between Tx and Rx
 location_tx = np.array([0, 0, 0])                     # Tx center location 
-location_rx = np.array([0, 0, d0])                    # Rx center location
+location_rx = np.array([0, 0, 0])                    # Tx and Rx are co-located
     # Antenna array, square array 
-N_tx = 4 
+N_tx = args.N_ris 
 N_rx = args.N_ris
-N_ris = N_rx  # Alias for backward compatibility
+N_ris = N_rx       # Numbers of antennas are all the same
 num_users = 1
 num_scatters = 1  # excluding BD
 Rician_factor = args.rician_factor
@@ -180,7 +186,11 @@ for t in range(num_ofdm_symbols):
 
 tx_signal = nr_signal_with_cp.flatten()
 
-####  Learning parameters
+
+#####################################################
+# Learning parameters and Computation Graph
+#####################################################
+#  
 initial_run = 1
 n_epochs = 50
 learning_rate = 5e-4
@@ -188,10 +198,6 @@ batch_per_epoch = 4
 batch_size_order = 8
 val_size_order = 10
 test_size = 200
-
-#####################################################
-# Build Computation Graph
-#####################################################
 
 tf.reset_default_graph()
 he_init = tf.variance_scaling_initializer()
@@ -212,16 +218,16 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size1 = 256
-    hidden_size2 = 512
+    hidden_size = 256  # Shared hidden size for both nodes
     
-    # Two LSTM cells for alternating BD states
-    LSTM1 = LSTM_Cell(hidden_size1, name='LSTM_1')  
-    LSTM2 = LSTM_Cell(hidden_size2, name='LSTM_2') 
-    mlp_ris_tx = MLPBlock(3, [hidden_size1 * 2, hidden_size1 * 2, 2 * N_tx], name='RIS_transmitter')
-    mlp_ris_rx = MLPBlock(3, [hidden_size1 * 2, hidden_size2 * 2, 2 * N_tx], name='RIS_receiver')
-    mlp_re_tx = MLPBlock(3, [hidden_size2 * 2, hidden_size2 * 2, 2 * N_rx], name='Receiver_transmitter')
-    mlp_re_rx = MLPBlock(3, [hidden_size2 * 2, hidden_size2 * 2, 2 * N_rx], name='Receiver_receiver')
+    # Single shared LSTM cell - both RIS and Rx can see the results
+    # Similar to 2b.py where a single node trains both beamformers
+    LSTM_shared = LSTM_Cell(hidden_size, name='LSTM_shared')
+    
+    # RIS only trains transmit beamformer w
+    mlp_ris_tx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_tx], name='RIS_transmitter')
+    # Rx only trains receive beamformer v  
+    mlp_rx_rx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_rx], name='Receiver_receiver')
     
     # SNR feature
     snr = lay['P'] * tf.ones(shape=[tf.shape(loc_input)[0], 1], dtype=tf.float32)
@@ -237,24 +243,16 @@ with tf.name_scope("active_sensing_agent"):
     Y2_list = []
     z1_list = []
     z2_list = []
-    
-    #####################################################
-    # Active Sensing Loop (Ping-Pong Style):
-    # User 1 (Tx) transmits with w, User 2 (Rx) receives with v
-    # Channel: H = x_BD[t] * H_b + H_d + H_r
-    # Received signal: y = sqrt(P) * v^H * H * w * s + noise
-    #####################################################
-    
+
+
     batch_size = tf.shape(loc_input)[0]
     
     for t in range(tau):
         'Initialization at t=0'
         if t == 0:
-            # Initialize LSTM states
-            h_old1 = tf.zeros([batch_size, hidden_size1])  # RIS state
-            c_old1 = tf.zeros([batch_size, hidden_size1])
-            h_old2 = tf.zeros([batch_size, hidden_size2])  # Rx state
-            c_old2 = tf.zeros([batch_size, hidden_size2])
+            # Initialize shared LSTM states (both nodes see the same state)
+            h_old = tf.zeros([batch_size, hidden_size])
+            c_old = tf.zeros([batch_size, hidden_size])
             
             # Initialize first RIS transmit beamformer w 
             w_init_real = tf.get_variable("w_init_real", shape=(1, N_tx, 1), trainable=True)
@@ -267,12 +265,6 @@ with tf.name_scope("active_sensing_agent"):
             v_init_imag = tf.get_variable("v_init_imag", shape=(1, N_rx, 1), trainable=True)
             v_complex_init = tf.complex(v_init_real, v_init_imag)
             v1 = v_complex_init / tf.cast(tf.norm(v_complex_init, axis=1, keepdims=True), tf.complex64)
-
-            w2 = w1  # Initialize RIS receive beamformer
-            
-            # Store for random initialization comparison
-            bf_gain_init_w = w1
-            bf_gain_init_v = v1
         
         'Construct effective channel H(t) = x_BD[t] * H_b + H_d + H_r'
         # H_d, H_r: (batch, N_rx, N_tx), H_b: (batch, N_rx, N_tx)
@@ -280,115 +272,64 @@ with tf.name_scope("active_sensing_agent"):
         x_bd_t = tf.reshape(tf.cast(x_BD[t], tf.complex64), [-1, 1, 1])  # (batch, 1, 1)
         H_eff = x_bd_t * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
         
-        'Rx observes K samples: y = sqrt(P) * v^H * H * w * s + noise'
-        # Generate K samples with noise
-        y_noiseless_before_rx = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.matmul(H_eff, w1)  # (batch, N_rx, 1)
-        y_complex_nobf = []
-        for k in range(K):
-            noise_k = tf.complex(
-                tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim),
-                tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim)
-            )
-            y_k = y_noiseless_before_rx + noise_k
-            y_complex_nobf.append(y_k)
+        'Observe received signal: y = sqrt(P) * v^H * H * w + noise'
+        y_noiseless1 = tf.complex(tf.sqrt(lay['P']), 0.0) *  tf.matmul(H_eff, w1)  # (batch, N_rx, 1)
+        # Add noise
+        noise = tf.complex(
+            tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim)
+        )
+        y_complex1 = y_noiseless1 + noise  # (batch, N_rx, 1) Before beamforming
 
-        y_complex_rx_bf = tf.matmul(tf.transpose(tf.conj(v1), perm=[0, 2, 1]), y_complex_nobf)  # (batch, K, 1)
-        y_complex_rx_bf = tf.reshape(y_complex_rx_bf, [-1, 1])  # (batch, K)
+        y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, 1)
+        y_complex2 = tf.reshape(y_complex2, [batch_size, 1])  # (batch, 1)
         
-        # Stack and compute sufficient statistics (mean and power)
-        y_mean = tf.reduce_mean(y_complex_rx_bf, axis=1)[:,tf.newaxis]  # (batch, 1)
-        y_power = tf.reduce_mean(tf.abs(y_complex_rx_bf) ** 2, axis=1)[:,tf.newaxis]  # (batch, 1)
-        y_samples_flat = tf.reshape(y_complex_nobf, [batch_size, N_rx])  # (batch, N_rx)
-
-        # Feature for Rx LSTM: [Re(y_mean), Im(y_mean), y_power, x_BD[t], snr]
-        y_real2 = tf.concat([
-            tf.cast(tf.real(y_samples_flat), tf.float32),
-            tf.cast(tf.imag(y_samples_flat), tf.float32),
-            tf.cast(tf.real(y_mean), tf.float32),
-            tf.cast(tf.imag(y_mean), tf.float32),
-            tf.cast(y_power, tf.float32)
-        ], axis=1) #/ tf.sqrt(lay['P'])  # (batch, 2*N_rx + 3)
+        y_complex1_flat = tf.reshape(y_complex1, [batch_size, N_rx])  # (batch, N_rx)
+        'Prepare features for shared LSTM'
+        # Combine features: [Re(y1), Im(y1), Re(y2), Im(y2),x_BD[t], snr]
+        y_real = tf.concat([
+            tf.cast(tf.real(y_complex1_flat), tf.float32),
+            tf.cast(tf.imag(y_complex1_flat), tf.float32),
+            tf.cast(tf.real(y_complex2), tf.float32),
+            tf.cast(tf.imag(y_complex2), tf.float32)
+        ], axis=1)  # (batch, 2*N_rx + 2)
         
-        'Rx updates LSTM state and designs beamformers'
-        h_old2, c_old2 = LSTM2((tf.concat([y_real2, x_BD[t], snr_normal], axis=1), h_old2, c_old2))
+        'Update shared LSTM state - both RIS and Rx can see the result'
+        h_old, c_old = LSTM_shared((tf.concat([y_real, x_BD[t], snr_normal], axis=1), h_old, c_old))
         
-        # Rx designs receive beamformer v
-        v_her = mlp_re_rx(h_old2)
-        v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
-        v_her = tf.divide(v_her, v_norm + 1e-8)
-        v1 = tf.complex(v_her[:, 0:N_rx], v_her[:, N_rx:2 * N_rx])
-        v1 = tf.reshape(v1, [-1, N_rx, 1])
-        
-        # Rx designs transmit beamformer for reverse link (used by Tx to observe)
-        v_tx_her = mlp_re_tx(h_old2)  # Reusing mlp_tx for Rx->Tx transmission design
-        v_tx_norm = tf.reshape(tf.norm(v_tx_her, axis=1), (-1, 1))
-        v_tx_her = tf.divide(v_tx_her, v_tx_norm + 1e-8)
-        v2 = tf.complex(v_tx_her[:, 0:N_rx], v_tx_her[:, N_rx:2 * N_rx])  # Tx dim for reverse
-        v2 = tf.reshape(v2, [-1, N_rx, 1])
-        
-        'Tx observes reverse link: y = sqrt(P) * w^H * H^T * v2 * s + noise'
-        # Reverse channel: H^T (transposed channel)
-        H_eff_T = tf.transpose(H_eff, perm=[0, 2, 1])  # (batch, N_tx, N_rx)
-        y_noiseless_before_tx = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.matmul(H_eff_T, v2)  # (batch, N_tx, 1)
-        ytx_complex_nobf = []
-        for k in range(K):
-            noise_k_rev = tf.complex(
-                tf.random_normal([batch_size, N_tx, 1], mean=0.0, stddev=noiseSTD_per_dim),
-                tf.random_normal([batch_size, N_tx, 1], mean=0.0, stddev=noiseSTD_per_dim)
-            )
-            y_k_rev = y_noiseless_before_tx + noise_k_rev
-            ytx_complex_nobf.append(y_k_rev)
-        ytx_sample_flat = tf.reshape(ytx_complex_nobf, [batch_size, N_tx])  # (batch, N_tx)
-        
-        y_complex_tx_bf = tf.matmul(tf.transpose(tf.conj(w2), perm=[0, 2, 1]), ytx_complex_nobf)  # Using v2 as Rx transmit
-        y_complex_tx_bf = tf.reshape(y_complex_tx_bf, [-1, K])
-        
-        y_mean_rev = tf.reduce_mean(y_complex_tx_bf, axis=1)[:,tf.newaxis]
-        y_power_rev = tf.reduce_mean(tf.abs(y_complex_tx_bf) ** 2, axis=1)[:,tf.newaxis]
-        
-        y_real1 = tf.concat([
-            tf.cast(tf.real(ytx_sample_flat), tf.float32),
-            tf.cast(tf.imag(ytx_sample_flat), tf.float32),
-            tf.cast(tf.real(y_mean_rev), tf.float32),
-            tf.cast(tf.imag(y_mean_rev), tf.float32),
-            tf.cast(y_power_rev, tf.float32)
-        ], axis=1) #/ tf.sqrt(lay['P'])
-        
-        'Tx updates LSTM state and designs beamformers'
-        h_old1, c_old1 = LSTM1((tf.concat([y_real1, x_BD[t], snr_normal], axis=1), h_old1, c_old1))
-
-        # Tx designs receive beamformer for next round
-        w2_her = mlp_ris_rx(h_old1)
-        w2_norm = tf.reshape(tf.norm(w2_her, axis=1), (-1, 1))
-        w2_her = tf.divide(w2_her, w2_norm + 1e-8)
-        w2 = tf.complex(w2_her[:, 0:N_tx], w2_her[:, N_tx:2 * N_tx])
-        w2 = tf.reshape(w2, [-1, N_tx, 1])
-
-        # Tx designs transmit beamformer w for next round
-        w_her = mlp_ris_tx(h_old1)
+        'RIS designs transmit beamformer w based on shared hidden state'
+        w_her = mlp_ris_tx(h_old)
         w_norm = tf.reshape(tf.norm(w_her, axis=1), (-1, 1))
         w_her = tf.divide(w_her, w_norm + 1e-8)
         w1 = tf.complex(w_her[:, 0:N_tx], w_her[:, N_tx:2 * N_tx])
         w1 = tf.reshape(w1, [-1, N_tx, 1])
         
-        # Store beamformers
+        'Rx designs receive beamformer v based on shared hidden state'
+        v_her = mlp_rx_rx(h_old)
+        v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
+        v_her = tf.divide(v_her, v_norm + 1e-8)
+        v1 = tf.complex(v_her[:, 0:N_rx], v_her[:, N_rx:2 * N_rx])
+        v1 = tf.reshape(v1, [-1, N_rx, 1])
+        
+        # Store beamformers for analysis
         v_list.append(tf.concat([tf.real(tf.squeeze(v1, axis=2)), tf.imag(tf.squeeze(v1, axis=2))], axis=1))
     
     #####################################################
     # Output Final Beamformers after tau interactions
+    # Both RIS and Rx use the shared LSTM state c_old
     #####################################################
-    MLP_bf_w = MLPBlock(3, [2 * hidden_size1, 2 * hidden_size1, 2 * N_tx], name='MLP_bf_w')
-    MLP_bf_v = MLPBlock(3, [2 * hidden_size2, 2 * hidden_size2, 2 * N_rx], name='MLP_bf_v')
+    MLP_bf_w = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_tx], name='MLP_bf_w')
+    MLP_bf_v = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_rx], name='MLP_bf_v')
     
-    # Final RIS transmit beamformer w 
-    w_tmp = MLP_bf_w(c_old1)
+    # Final RIS transmit beamformer w (from shared state)
+    w_tmp = MLP_bf_w(c_old)
     w_norm = tf.reshape(tf.norm(w_tmp, axis=1), (-1, 1))
     w_tmp = tf.divide(w_tmp, w_norm + 1e-8)
     w_complex = tf.complex(w_tmp[:, 0:N_tx], w_tmp[:, N_tx:2 * N_tx])
     w_complex = tf.reshape(w_complex, [-1, N_tx, 1])
     
-    # Final Rx receive beamformer v 
-    v_tmp = MLP_bf_v(c_old2)
+    # Final Rx receive beamformer v (from shared state)
+    v_tmp = MLP_bf_v(c_old)
     v_norm = tf.reshape(tf.norm(v_tmp, axis=1), (-1, 1))
     v_tmp = tf.divide(v_tmp, v_norm + 1e-8)
     v_complex = tf.complex(v_tmp[:, 0:N_rx], v_tmp[:, N_rx:2 * N_rx])
@@ -501,11 +442,6 @@ with tf.name_scope("optimal_beamformer"):
     
     sinr_BD_opt = sig_BD_opt / (sig_int_opt + noise_var + 1e-10)
     
-    # Random beamformer baseline
-    bf_gain_rnd = tf.reduce_mean(tf.abs(tf.matmul(
-        tf.linalg.adjoint(bf_gain_init_v), 
-        tf.matmul(H_b_placeholder, bf_gain_init_w)
-    )) ** 2)
 
 
 #####################################################
