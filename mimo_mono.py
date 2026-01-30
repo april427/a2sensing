@@ -239,10 +239,8 @@ with tf.name_scope("active_sensing_agent"):
     
     # Storage
     v_list = []
-    Y1_list = []
-    Y2_list = []
-    z1_list = []
-    z2_list = []
+    Y1 = tf.zeros([tf.shape(loc_input)[0], N_rx], dtype=tf.complex64) 
+    Y2 = tf.zeros([tf.shape(loc_input)[0], N_rx], dtype=tf.complex64)
 
 
     batch_size = tf.shape(loc_input)[0]
@@ -284,18 +282,33 @@ with tf.name_scope("active_sensing_agent"):
 
         y_complex1 = tf.add(y_noiseless1, noise)  # (batch, N_rx, K) Before beamforming
 
-        y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, K)
-        y_complex2 = tf.reduce_mean(tf.reshape(y_complex2, [batch_size, K]), axis=1, keepdims=True)  # (batch, 1)
+        # y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, K)
+        # y_complex2 = tf.reduce_mean(tf.reshape(y_complex2, [batch_size, K]), axis=1, keepdims=True)  # (batch, 1)
         
-        y_complex1_flat = tf.reshape(tf.reduce_mean(y_complex1, axis=2), [batch_size, N_rx])  # (batch, N_rx)
-        'Prepare features for shared LSTM'
-        # Combine features: [Re(y1), Im(y1), Re(y2), Im(y2),x_BD[t], snr]
+        # y_complex1_flat = tf.reshape(tf.reduce_mean(y_complex1, axis=2), [batch_size, N_rx])  # (batch, N_rx)
+        # 'Prepare features for shared LSTM'
+        # # Combine features: [Re(y1), Im(y1), Re(y2), Im(y2),x_BD[t], snr]
+        # y_real = tf.concat([
+        #     tf.cast(tf.real(y_complex1_flat), tf.float32),
+        #     tf.cast(tf.imag(y_complex1_flat), tf.float32),
+        #     tf.cast(tf.real(y_complex2), tf.float32),
+        #     tf.cast(tf.imag(y_complex2), tf.float32)
+        # ], axis=1)  # (batch, 2*N_rx + 2)
+
+        Y1 = Y1 + tf.reduce_mean(x_bd_t * y_complex1, axis=2, keepdims=False)
+        Y2 = Y2 + tf.reduce_mean(y_complex1, axis=2, keepdims=False)  # Accumulate over time steps
+        Y1_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y1, [-1, N_rx, 1])), axis=2, keepdims=False)
+        Y2_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y2, [-1, N_rx, 1])), axis=2, keepdims=False)
         y_real = tf.concat([
-            tf.cast(tf.real(y_complex1_flat), tf.float32),
-            tf.cast(tf.imag(y_complex1_flat), tf.float32),
-            tf.cast(tf.real(y_complex2), tf.float32),
-            tf.cast(tf.imag(y_complex2), tf.float32)
-        ], axis=1)  # (batch, 2*N_rx + 2)
+            tf.cast(tf.real(Y1), tf.float32),
+            tf.cast(tf.imag(Y1), tf.float32),
+            tf.cast(tf.real(Y2), tf.float32),
+            tf.cast(tf.imag(Y2), tf.float32),
+            tf.cast(tf.real(Y1_after), tf.float32),
+            tf.cast(tf.imag(Y1_after), tf.float32),
+            tf.cast(tf.real(Y2_after), tf.float32),
+            tf.cast(tf.imag(Y2_after), tf.float32)
+        ], axis=1)  # (batch, 4*N_rx + 4)
         
         'Update shared LSTM state - both RIS and Rx can see the result'
         h_old, c_old = LSTM_shared((tf.concat([y_real, x_BD[t], snr_normal], axis=1), h_old, c_old))
