@@ -222,7 +222,10 @@ with tf.name_scope("active_sensing_agent"):
     
     # Single shared LSTM cell - both RIS and Rx can see the results
     # Similar to 2b.py where a single node trains both beamformers
-    LSTM_shared = LSTM_Cell(hidden_size, name='LSTM_shared')
+    # LSTM_shared = LSTM_Cell(hidden_size, name='LSTM_shared')
+    LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')
+    LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
+    
     
     # RIS only trains transmit beamformer w
     mlp_ris_tx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_tx], name='RIS_transmitter')
@@ -251,6 +254,8 @@ with tf.name_scope("active_sensing_agent"):
             # Initialize shared LSTM states (both nodes see the same state)
             h_old = tf.zeros([batch_size, hidden_size])
             c_old = tf.zeros([batch_size, hidden_size])
+            h_old2 = tf.zeros([batch_size, hidden_size])
+            c_old2 = tf.zeros([batch_size, hidden_size])
             
             # Initialize first RIS transmit beamformer w 
             w_init_real = tf.get_variable("w_init_real", shape=(1, N_tx, 1), trainable=True)
@@ -302,26 +307,30 @@ with tf.name_scope("active_sensing_agent"):
         y_real = tf.concat([
             tf.cast(tf.real(Y1), tf.float32),
             tf.cast(tf.imag(Y1), tf.float32),
-            tf.cast(tf.real(Y2), tf.float32),
-            tf.cast(tf.imag(Y2), tf.float32),
             tf.cast(tf.real(Y1_after), tf.float32),
             tf.cast(tf.imag(Y1_after), tf.float32),
-            tf.cast(tf.real(Y2_after), tf.float32),
-            tf.cast(tf.imag(Y2_after), tf.float32)
         ], axis=1)  # (batch, 4*N_rx + 4)
+
+        y_real2 = tf.concat([
+            tf.cast(tf.real(Y2), tf.float32),
+            tf.cast(tf.imag(Y2), tf.float32),
+            tf.cast(tf.real(Y2_after), tf.float32),
+            tf.cast(tf.imag(Y2_after), tf.float32),
+        ], axis=1)
         
         'Update shared LSTM state - both RIS and Rx can see the result'
-        h_old, c_old = LSTM_shared((tf.concat([y_real, x_BD[t], snr_normal], axis=1), h_old, c_old))
+        h_old, c_old = LSTM1((tf.concat([y_real,  snr_normal], axis=1), h_old, c_old))
+        h_old2, c_old2 = LSTM2((tf.concat([y_real2,  snr_normal], axis=1), h_old2, c_old2))
         
         'RIS designs transmit beamformer w based on shared hidden state'
-        w_her = mlp_ris_tx(h_old)
+        w_her = mlp_ris_tx(tf.concat([h_old, h_old2], axis=1))
         w_norm = tf.reshape(tf.norm(w_her, axis=1), (-1, 1))
         w_her = tf.divide(w_her, w_norm + 1e-8)
         w1 = tf.complex(w_her[:, 0:N_tx], w_her[:, N_tx:2 * N_tx])
         w1 = tf.reshape(w1, [-1, N_tx, 1])
         
         'Rx designs receive beamformer v based on shared hidden state'
-        v_her = mlp_rx_rx(h_old)
+        v_her = mlp_rx_rx(tf.concat([h_old, h_old2], axis=1))
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm + 1e-8)
         v1 = tf.complex(v_her[:, 0:N_rx], v_her[:, N_rx:2 * N_rx])
@@ -338,14 +347,14 @@ with tf.name_scope("active_sensing_agent"):
     MLP_bf_v = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_rx], name='MLP_bf_v')
     
     # Final RIS transmit beamformer w (from shared state)
-    w_tmp = MLP_bf_w(c_old)
+    w_tmp = MLP_bf_w(tf.concat([c_old, c_old2], axis=1))
     w_norm = tf.reshape(tf.norm(w_tmp, axis=1), (-1, 1))
     w_tmp = tf.divide(w_tmp, w_norm + 1e-8)
     w_complex = tf.complex(w_tmp[:, 0:N_tx], w_tmp[:, N_tx:2 * N_tx])
     w_complex = tf.reshape(w_complex, [-1, N_tx, 1])
     
     # Final Rx receive beamformer v (from shared state)
-    v_tmp = MLP_bf_v(c_old)
+    v_tmp = MLP_bf_v(tf.concat([c_old, c_old2], axis=1))
     v_norm = tf.reshape(tf.norm(v_tmp, axis=1), (-1, 1))
     v_tmp = tf.divide(v_tmp, v_norm + 1e-8)
     v_complex = tf.complex(v_tmp[:, 0:N_rx], v_tmp[:, N_rx:2 * N_rx])
@@ -828,7 +837,13 @@ N_rx_v = int(np.sqrt(N_rx))
 
 # Function to compute beam pattern for UPA
 def compute_beam_pattern(beamformer, N_h, N_v, wavelength, num_points=100):
-    """Compute 3D beam pattern for a UPA beamformer"""
+    """Compute 3D beam pattern for a UPA beamformer
+    
+    The steering vector convention must match generate_upa_steering_vector in channel_functions.py:
+    - i1 = index % N_h (horizontal indices)
+    - i2 = index // N_h (vertical indices)
+    - steering_vector = exp(1j * pi * (i1 * sin(az) * cos(el) + i2 * sin(el)))
+    """
     azimuth = np.linspace(-np.pi, np.pi, num_points)
     elevation = np.linspace(-np.pi/2, np.pi/2, num_points)
     AZ, EL = np.meshgrid(azimuth, elevation)
@@ -836,15 +851,22 @@ def compute_beam_pattern(beamformer, N_h, N_v, wavelength, num_points=100):
     pattern = np.zeros_like(AZ, dtype=np.float64)  # Use float, not complex
     bf = beamformer.flatten()
     
+    N_total = N_h * N_v
+    # Match the indexing convention from channel_functions.py
+    i1 = np.mod(np.arange(N_total), N_h)  # Horizontal indices
+    i2 = np.floor(np.arange(N_total) / N_h)  # Vertical indices
+    
     for i_el in range(num_points):
         for i_az in range(num_points):
             az = azimuth[i_az]
             el = elevation[i_el]
-            # Steering vector for UPA
-            a = np.zeros(N_h * N_v, dtype=complex)
-            for m in range(N_h):
-                for n in range(N_v):
-                    a[m * N_v + n] = np.exp(1j * np.pi * (m * np.sin(az) * np.cos(el) + n * np.sin(el)))
+            
+            sin_azimuth = np.sin(az)
+            cos_elevation = np.cos(el)
+            sin_elevation = np.sin(el)
+            
+            # Steering vector matching channel_functions.py convention
+            a = np.exp(1j * np.pi * (i1 * sin_azimuth * cos_elevation + i2 * sin_elevation))
             pattern[i_el, i_az] = np.abs(np.dot(np.conj(bf), a)) ** 2
     
     # Normalize
@@ -858,8 +880,8 @@ def spherical_to_cartesian(az, el, r):
     z = r * np.sin(el)
     return x, y, z
 
-# Create figure with 2 rows, 2 columns
-fig = plt.figure(figsize=(18, 12))
+# Create figure with 2 rows, 3 columns (3D scene, azimuth cut, elevation cut)
+fig = plt.figure(figsize=(24, 12))
 
 # Get learned and optimal beamformers for this instance
 w_learned_vis = w_learned[idx]  # (N_tx, 1)
@@ -877,7 +899,7 @@ AZ_rx_optimal, EL_rx_optimal, pattern_rx_optimal = compute_beam_pattern(v_optima
 
 # ===== ROW 1: LEARNED BEAMFORMERS =====
 # ===== Row 1, Col 1: 3D Scene with Learned Beam Patterns =====
-ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+ax1 = fig.add_subplot(2, 3, 1, projection='3d')
 
 # Plot Tx array (as a small grid of points)
 tx_antenna_pos = []
@@ -968,8 +990,8 @@ ax1.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold
 # Set better viewing angle
 ax1.view_init(elev=20, azim=45)
 
-# ===== Row 1, Col 2: 2D Beam Pattern for Learned Beamformers =====
-ax2 = fig.add_subplot(2, 2, 2)
+# ===== Row 1, Col 2: 2D Beam Pattern for Learned Beamformers (Azimuth Cut) =====
+ax2 = fig.add_subplot(2, 3, 2)
 
 # Take a horizontal cut (elevation = 0)
 el_idx = pattern_tx_learned.shape[0] // 2
@@ -990,7 +1012,7 @@ ax2.axvline(bd_azimuth_rx, color='darkgreen', linestyle='--', linewidth=2, alpha
 
 # Mark scatter direction
 sc_azimuth_tx = np.arctan2(scatter_loc_vis[1] - location_tx[1], scatter_loc_vis[0] - location_tx[0]) * 180/np.pi
-sc_azimuth_rx = np.arctan2(scatter_loc_vis[1] - location_rx[1], scatter_loc_vis[0] - location_rx[0]) * 180/np.pi
+# sc_azimuth_rx = np.arctan2(scatter_loc_vis[1] - location_rx[1], scatter_loc_vis[0] - location_rx[0]) * 180/np.pi
 ax2.axvline(sc_azimuth_tx, color='orange', linestyle=':', linewidth=2, alpha=0.7, 
             label=f'Scatter from Tx: {sc_azimuth_tx:.1f}°')
 
@@ -1007,9 +1029,49 @@ ax2.text(0.02, 0.98, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_cons
          transform=ax2.transAxes, fontsize=8, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
+# ===== Row 1, Col 3: 2D Beam Pattern for Learned Beamformers (Elevation Cut) =====
+ax2b = fig.add_subplot(2, 3, 3)
+
+# Take a vertical cut at the BD azimuth direction
+# Find the azimuth index closest to BD direction
+bd_az_idx = int((bd_azimuth_tx + 180) / 360 * pattern_tx_learned.shape[1])
+bd_az_idx = np.clip(bd_az_idx, 0, pattern_tx_learned.shape[1] - 1)
+
+elevation_deg = np.linspace(-90, 90, pattern_tx_learned.shape[0])
+
+ax2b.plot(elevation_deg, 10*np.log10(pattern_tx_learned[:, bd_az_idx] + 1e-10), 'b-', 
+            linewidth=2.5, label='Tx Beam', alpha=0.8)
+ax2b.plot(elevation_deg, 10*np.log10(pattern_rx_learned[:, bd_az_idx] + 1e-10), 'g-', 
+            linewidth=2.5, label='Rx Beam', alpha=0.8)
+
+# Mark BD elevation direction
+bd_dist_xy_tx = np.sqrt((bd_loc_vis[0] - location_tx[0])**2 + (bd_loc_vis[1] - location_tx[1])**2)
+bd_elevation_tx = np.arctan2(bd_loc_vis[2] - location_tx[2], bd_dist_xy_tx) * 180/np.pi
+bd_dist_xy_rx = np.sqrt((bd_loc_vis[0] - location_rx[0])**2 + (bd_loc_vis[1] - location_rx[1])**2)
+bd_elevation_rx = np.arctan2(bd_loc_vis[2] - location_rx[2], bd_dist_xy_rx) * 180/np.pi
+
+ax2b.axvline(bd_elevation_tx, color='darkblue', linestyle='--', linewidth=2, alpha=0.7, 
+            label=f'BD from Tx: {bd_elevation_tx:.1f}°')
+ax2b.axvline(bd_elevation_rx, color='darkgreen', linestyle='--', linewidth=2, alpha=0.7, 
+            label=f'BD from Rx: {bd_elevation_rx:.1f}°')
+
+# Mark scatter elevation direction
+sc_dist_xy_tx = np.sqrt((scatter_loc_vis[0] - location_tx[0])**2 + (scatter_loc_vis[1] - location_tx[1])**2)
+sc_elevation_tx = np.arctan2(scatter_loc_vis[2] - location_tx[2], sc_dist_xy_tx) * 180/np.pi
+ax2b.axvline(sc_elevation_tx, color='orange', linestyle=':', linewidth=2, alpha=0.7, 
+            label=f'Scatter from Tx: {sc_elevation_tx:.1f}°')
+
+ax2b.set_xlabel('Elevation Angle (degrees)', fontsize=10, fontweight='bold')
+ax2b.set_ylabel('Normalized Gain (dB)', fontsize=10, fontweight='bold')
+ax2b.set_title(f'Learned Beamformers - Elevation Cut (Az = {bd_azimuth_tx:.1f}°)', fontsize=11, fontweight='bold')
+ax2b.set_xlim([-90, 90])
+ax2b.set_ylim([-30, 5])
+ax2b.grid(True, alpha=0.3, linestyle='--')
+ax2b.legend(loc='upper right', fontsize=8, framealpha=0.9)
+
 # ===== ROW 2: OPTIMAL BEAMFORMERS =====
 # ===== Row 2, Col 1: 3D Scene with Optimal Beam Patterns =====
-ax3 = fig.add_subplot(2, 2, 3, projection='3d')
+ax3 = fig.add_subplot(2, 3, 4, projection='3d')
 
 # Plot Tx array (as a small grid of points)
 tx_antenna_pos = []
@@ -1099,8 +1161,8 @@ ax3.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold
 # Set better viewing angle
 ax3.view_init(elev=20, azim=45)
 
-# ===== Row 2, Col 2: 2D Beam Pattern for Optimal Beamformers =====
-ax4 = fig.add_subplot(2, 2, 4)
+# ===== Row 2, Col 2: 2D Beam Pattern for Optimal Beamformers (Azimuth Cut) =====
+ax4 = fig.add_subplot(2, 3, 5)
 
 # Take a horizontal cut (elevation = 0)
 el_idx = pattern_tx_optimal.shape[0] // 2
@@ -1121,7 +1183,7 @@ ax4.axvline(bd_azimuth_rx, color='darkgreen', linestyle='--', linewidth=2, alpha
 
 # Mark scatter direction
 sc_azimuth_tx = np.arctan2(scatter_loc_vis[1] - location_tx[1], scatter_loc_vis[0] - location_tx[0]) * 180/np.pi
-sc_azimuth_rx = np.arctan2(scatter_loc_vis[1] - location_rx[1], scatter_loc_vis[0] - location_rx[0]) * 180/np.pi
+# sc_azimuth_rx = np.arctan2(scatter_loc_vis[1] - location_rx[1], scatter_loc_vis[0] - location_rx[0]) * 180/np.pi
 ax4.axvline(sc_azimuth_tx, color='orange', linestyle=':', linewidth=2, alpha=0.7, 
             label=f'Scatter from Tx: {sc_azimuth_tx:.1f}°')
 
@@ -1137,6 +1199,38 @@ ax4.legend(loc='upper right', fontsize=8, framealpha=0.9)
 ax4.text(0.02, 0.98, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_const[0]} dB', 
          transform=ax4.transAxes, fontsize=8, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+# ===== Row 2, Col 3: 2D Beam Pattern for Optimal Beamformers (Elevation Cut) =====
+ax4b = fig.add_subplot(2, 3, 6)
+
+# Take a vertical cut at the BD azimuth direction
+bd_az_idx_opt = int((bd_azimuth_tx + 180) / 360 * pattern_tx_optimal.shape[1])
+bd_az_idx_opt = np.clip(bd_az_idx_opt, 0, pattern_tx_optimal.shape[1] - 1)
+
+elevation_deg = np.linspace(-90, 90, pattern_tx_optimal.shape[0])
+
+ax4b.plot(elevation_deg, 10*np.log10(pattern_tx_optimal[:, bd_az_idx_opt] + 1e-10), 'b-', 
+            linewidth=2.5, label='Tx Beam', alpha=0.8)
+ax4b.plot(elevation_deg, 10*np.log10(pattern_rx_optimal[:, bd_az_idx_opt] + 1e-10), 'g-', 
+            linewidth=2.5, label='Rx Beam', alpha=0.8)
+
+# Mark BD elevation direction
+ax4b.axvline(bd_elevation_tx, color='darkblue', linestyle='--', linewidth=2, alpha=0.7, 
+            label=f'BD from Tx: {bd_elevation_tx:.1f}°')
+ax4b.axvline(bd_elevation_rx, color='darkgreen', linestyle='--', linewidth=2, alpha=0.7, 
+            label=f'BD from Rx: {bd_elevation_rx:.1f}°')
+
+# Mark scatter elevation direction
+ax4b.axvline(sc_elevation_tx, color='orange', linestyle=':', linewidth=2, alpha=0.7, 
+            label=f'Scatter from Tx: {sc_elevation_tx:.1f}°')
+
+ax4b.set_xlabel('Elevation Angle (degrees)', fontsize=10, fontweight='bold')
+ax4b.set_ylabel('Normalized Gain (dB)', fontsize=10, fontweight='bold')
+ax4b.set_title(f'Optimal Beamformers - Elevation Cut (Az = {bd_azimuth_tx:.1f}°)', fontsize=11, fontweight='bold')
+ax4b.set_xlim([-90, 90])
+ax4b.set_ylim([-30, 5])
+ax4b.grid(True, alpha=0.3, linestyle='--')
+ax4b.legend(loc='upper right', fontsize=8, framealpha=0.9)
 
 plt.tight_layout()
 
