@@ -148,7 +148,7 @@ location_bd = None
 
 # Sensing parameters
 tau = 32  # Pilot length (also number of BD interactions)
-K = 1  # Number of OFDM symbols per BD state
+K = 5  # Number of OFDM symbols per BD state
 snr_const = 25
 snr_const = np.array([snr_const])
 ref_dis = 5
@@ -194,9 +194,9 @@ tx_signal = nr_signal_with_cp.flatten()
 initial_run = 1
 n_epochs = 50
 learning_rate = 5e-4
-batch_per_epoch = 4
+batch_per_epoch = 5
 batch_size_order = 8
-val_size_order = 10
+val_size_order = 20
 test_size = 200
 
 tf.reset_default_graph()
@@ -274,17 +274,20 @@ with tf.name_scope("active_sensing_agent"):
         
         'Observe received signal: y = sqrt(P) * v^H * H * w + noise'
         y_noiseless1 = tf.complex(tf.sqrt(lay['P']), 0.0) *  tf.matmul(H_eff, w1)  # (batch, N_rx, 1)
+        # Broadcast to K samples
+        y_noiseless1 = tf.tile(y_noiseless1, [1, 1, K])  # (batch, N_rx, K)
         # Add noise
         noise = tf.complex(
-            tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim),
-            tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim)
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
         )
-        y_complex1 = y_noiseless1 + noise  # (batch, N_rx, 1) Before beamforming
 
-        y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, 1)
-        y_complex2 = tf.reshape(y_complex2, [batch_size, 1])  # (batch, 1)
+        y_complex1 = tf.add(y_noiseless1, noise)  # (batch, N_rx, K) Before beamforming
+
+        y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, K)
+        y_complex2 = tf.reduce_mean(tf.reshape(y_complex2, [batch_size, K]), axis=1, keepdims=True)  # (batch, 1)
         
-        y_complex1_flat = tf.reshape(y_complex1, [batch_size, N_rx])  # (batch, N_rx)
+        y_complex1_flat = tf.reshape(tf.reduce_mean(y_complex1, axis=2), [batch_size, N_rx])  # (batch, N_rx)
         'Prepare features for shared LSTM'
         # Combine features: [Re(y1), Im(y1), Re(y2), Im(y2),x_BD[t], snr]
         y_real = tf.concat([
