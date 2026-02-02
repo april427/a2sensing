@@ -380,7 +380,6 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_interference, w_complex))  # (batch, 1, 1)
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
-    # BD SINR = P * |v^H H_b w|^2 / (P * |v^H (H_d + H_r) w|^2 + noise_var)
     sinr_BD = sig_BD / (sig_int + noise_var + 1e-10)
     sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-4, 1e4)
     
@@ -390,24 +389,31 @@ with tf.name_scope("sinr_computation"):
     
     # For backward compatibility, define sig_ref as interference
     sig_ref = sig_int
+
+    # Calculate the SINR towards the scatters
+    sig_scatter = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_r_placeholder, w_complex))  # (batch, 1, 1)
+    int_scatter = tf.matmul(tf.linalg.adjoint(v_complex), \
+                            tf.matmul(H_d_placeholder+H_b_placeholder, w_complex))  # (batch, 1, 1)
+    sinr_scatter = tf.squeeze(tf.abs(sig_scatter) ** 2) * lay['P'] / \
+                    (tf.squeeze(tf.abs(int_scatter) ** 2) * lay['P'] + noise_var + 1e-10)
     
     # Compute sigma1_sq and sigma2_sq for BD state detection metrics
     # g1 = -H_b + H_d + H_r (BD = -1), g2 = H_b + H_d + H_r (BD = +1)
-    H_g1 = -H_b_placeholder + H_d_placeholder + H_r_placeholder
-    H_g2 = H_b_placeholder + H_d_placeholder + H_r_placeholder
+    # H_g1 = -H_b_placeholder + H_d_placeholder + H_r_placeholder
+    # H_g2 = H_b_placeholder + H_d_placeholder + H_r_placeholder
     
-    sigma1_sq = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_g1, w_complex))
-    sigma2_sq = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_g2, w_complex))
-    sigma1_sq = tf.squeeze(tf.abs(sigma1_sq) ** 2) * lay['P'] + noise_var
-    sigma2_sq = tf.squeeze(tf.abs(sigma2_sq) ** 2) * lay['P'] + noise_var
+    # sigma1_sq = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_g1, w_complex))
+    # sigma2_sq = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_g2, w_complex))
+    # sigma1_sq = tf.squeeze(tf.abs(sigma1_sq) ** 2) * lay['P'] + noise_var
+    # sigma2_sq = tf.squeeze(tf.abs(sigma2_sq) ** 2) * lay['P'] + noise_var
     
-    # Threshold and error probability (for evaluation)
-    Th = sigma1_sq * sigma2_sq / (sigma1_sq - sigma2_sq + 1e-10) * tf.log(sigma1_sq / (sigma2_sq + 1e-10) + 1e-10)
-    pe = tf.where(
-        sigma1_sq > sigma2_sq,
-        0.5 + 0.5 * tf.exp(-Th / (sigma2_sq + 1e-10)) - 0.5 * tf.exp(-Th / (sigma1_sq + 1e-10)),
-        0.5 + 0.5 * tf.exp(-Th / (sigma1_sq + 1e-10)) - 0.5 * tf.exp(-Th / (sigma2_sq + 1e-10))
-    )
+    # # Threshold and error probability (for evaluation)
+    # Th = sigma1_sq * sigma2_sq / (sigma1_sq - sigma2_sq + 1e-10) * tf.log(sigma1_sq / (sigma2_sq + 1e-10) + 1e-10)
+    # pe = tf.where(
+    #     sigma1_sq > sigma2_sq,
+    #     0.5 + 0.5 * tf.exp(-Th / (sigma2_sq + 1e-10)) - 0.5 * tf.exp(-Th / (sigma1_sq + 1e-10)),
+    #     0.5 + 0.5 * tf.exp(-Th / (sigma1_sq + 1e-10)) - 0.5 * tf.exp(-Th / (sigma2_sq + 1e-10))
+    # )
 
 
 #####################################################
@@ -677,8 +683,8 @@ with tf.Session() as sess:
                 s_placeholder: s_signal
             }
             
-            _, train_loss, sinr_values, pe_values = sess.run(
-                [training_op, loss, sinr_BD, pe], feed_dict=feed_dict_batch
+            _, train_loss, sinr_values, sinr_scatter_values = sess.run(
+                [training_op, loss, sinr_BD, sinr_scatter], feed_dict=feed_dict_batch
             )
             
             epoch_train_losses.append(train_loss)
@@ -689,9 +695,9 @@ with tf.Session() as sess:
         avg_train_loss = np.mean(epoch_train_losses)
         avg_train_sinr = np.mean(epoch_sinr_values)
         
-        loss_val, sinr_val, sinr_opt_val, pe_val, \
+        loss_val, sinr_val, sinr_opt_val, sinr_scatter_val, \
             sig_bd_val, sig_ref_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [loss, sinr_BD, sinr_BD_opt, pe, \
+            [loss, sinr_BD, sinr_BD_opt, sinr_scatter, \
              sig_BD, sig_ref, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
         )
         
@@ -707,7 +713,7 @@ with tf.Session() as sess:
               f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
               f'Sig_BD_opt: {np.mean(sig_bd_opt_val):8.4f} | '
               f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | '
-              f'PE: {np.mean(pe_val):6.4f}')
+              f'SINR_scatter: {10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB')
         print()
         
         # Early stopping
@@ -782,13 +788,13 @@ with tf.Session() as sess:
         s_placeholder: s_signal_test
     }
     
-    sinr_test, sinr_opt_test, pe_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(
-        [sinr_BD, sinr_BD_opt, pe, v_complex, w_complex, v_opt, w_opt], feed_dict=feed_dict_test
+    sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(
+        [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex, w_complex, v_opt, w_opt], feed_dict=feed_dict_test
     )
     
     print(f"Test SINR_BD (learned):  {10 * np.log10(np.mean(sinr_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_BD (optimal):  {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
-    print(f"Test PE (learned):       {np.mean(pe_test):6.4f}")
+    print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
     print(f"Gap to optimal:          {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
     
     # Save results
@@ -803,7 +809,7 @@ with tf.Session() as sess:
         Scatter_location=Scatter_loc if Scatter_loc[0] is not None else [],
         sinr_learned=sinr_test,
         sinr_optimal=sinr_opt_test,
-        pe_learned=pe_test,
+        sinr_scatter_learned=sinr_scatter_test,
         v_learned=v_learned,
         w_learned=w_learned,
         v_optimal=v_optimal,
@@ -880,8 +886,8 @@ def spherical_to_cartesian(az, el, r):
     z = r * np.sin(el)
     return x, y, z
 
-# Create figure with 2 rows, 3 columns (3D scene, azimuth cut, elevation cut)
-fig = plt.figure(figsize=(24, 12))
+# Create figure with 2 rows, 4 columns (3D Tx beam, 3D Rx beam, azimuth cut, elevation cut)
+fig = plt.figure(figsize=(32, 12))
 
 # Get learned and optimal beamformers for this instance
 w_learned_vis = w_learned[idx]  # (N_tx, 1)
@@ -898,8 +904,8 @@ AZ_tx_optimal, EL_tx_optimal, pattern_tx_optimal = compute_beam_pattern(w_optima
 AZ_rx_optimal, EL_rx_optimal, pattern_rx_optimal = compute_beam_pattern(v_optimal_vis, N_rx_h, N_rx_v, Wavelength, num_points=50)
 
 # ===== ROW 1: LEARNED BEAMFORMERS =====
-# ===== Row 1, Col 1: 3D Scene with Learned Beam Patterns =====
-ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+# ===== Row 1, Col 1: 3D Scene with Learned Tx Beam Pattern =====
+ax1 = fig.add_subplot(2, 4, 1, projection='3d')
 
 # Plot Tx array (as a small grid of points)
 tx_antenna_pos = []
@@ -929,16 +935,6 @@ ax1.scatter(bd_loc_vis[0], bd_loc_vis[1], bd_loc_vis[2],
 ax1.scatter(scatter_loc_vis[0], scatter_loc_vis[1], scatter_loc_vis[2], 
             c='orange', marker='o', s=250, label='Scatterer', edgecolors='black', linewidth=1.5, zorder=10)
 
-# Draw lines showing signal paths
-# ax1.plot([location_tx[0], bd_loc_vis[0]], [location_tx[1], bd_loc_vis[1]], 
-#             [location_tx[2], bd_loc_vis[2]], 'r--', alpha=0.6, linewidth=2, label='Tx-BD path', zorder=5)
-# ax1.plot([bd_loc_vis[0], location_rx[0]], [bd_loc_vis[1], location_rx[1]], 
-#             [bd_loc_vis[2], location_rx[2]], 'r--', alpha=0.6, linewidth=2, zorder=5)
-# ax1.plot([location_tx[0], scatter_loc_vis[0]], [location_tx[1], scatter_loc_vis[1]], 
-#             [location_tx[2], scatter_loc_vis[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
-# ax1.plot([scatter_loc_vis[0], location_rx[0]], [scatter_loc_vis[1], location_rx[1]], 
-#             [scatter_loc_vis[2], location_rx[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
-
 # ===== Add Learned Tx Beam Pattern to Scene =====
 beam_scale = 5  # Scale factor for beam visualization
 X_tx_learned, Y_tx_learned, Z_tx_learned = spherical_to_cartesian(AZ_tx_learned, EL_tx_learned, pattern_tx_learned * beam_scale)
@@ -950,32 +946,16 @@ Z_tx_learned += location_tx[2]
 surf_tx = ax1.plot_surface(X_tx_learned, Y_tx_learned, Z_tx_learned, cmap='Blues', alpha=0.4, 
                             rstride=2, cstride=2, linewidth=0, zorder=1)
 
-# ===== Add Learned Rx Beam Pattern to Scene =====
-X_rx_learned, Y_rx_learned, Z_rx_learned = spherical_to_cartesian(AZ_rx_learned, EL_rx_learned, pattern_rx_learned * beam_scale)
-X_rx_learned += location_rx[0]
-Y_rx_learned += location_rx[1]
-Z_rx_learned += location_rx[2]
-
-# Plot Rx beam pattern with semi-transparent surface
-surf_rx = ax1.plot_surface(X_rx_learned, Y_rx_learned, Z_rx_learned, cmap='Greens', alpha=0.4,
-                            rstride=2, cstride=2, linewidth=0, zorder=1)
-
 # Mark direction to BD from Tx
 dir_to_bd = (bd_loc_vis - location_tx) / np.linalg.norm(bd_loc_vis - location_tx)
 ax1.quiver(location_tx[0], location_tx[1], location_tx[2], 
             dir_to_bd[0]*4, dir_to_bd[1]*4, dir_to_bd[2]*4, 
             color='darkblue', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
 
-# Mark direction to BD from Rx
-dir_to_bd_rx = (bd_loc_vis - location_rx) / np.linalg.norm(bd_loc_vis - location_rx)
-ax1.quiver(location_rx[0], location_rx[1], location_rx[2], 
-            dir_to_bd_rx[0]*4, dir_to_bd_rx[1]*4, dir_to_bd_rx[2]*4, 
-            color='darkgreen', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
-
 ax1.set_xlabel('X (m)', fontsize=10, fontweight='bold')
 ax1.set_ylabel('Y (m)', fontsize=10, fontweight='bold')
 ax1.set_zlabel('Z (m)', fontsize=10, fontweight='bold')
-ax1.set_title('Learned Beamformers - 3D Scene\n(Blue: Tx Beam, Green: Rx Beam)', fontsize=11, fontweight='bold')
+ax1.set_title('Learned Tx Beamformer - 3D Beam Pattern', fontsize=11, fontweight='bold')
 ax1.legend(loc='upper left', fontsize=8, framealpha=0.9)
 
 # Add coordinate axis arrows at origin for reference
@@ -990,8 +970,60 @@ ax1.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold
 # Set better viewing angle
 ax1.view_init(elev=20, azim=45)
 
-# ===== Row 1, Col 2: 2D Beam Pattern for Learned Beamformers (Azimuth Cut) =====
-ax2 = fig.add_subplot(2, 3, 2)
+# ===== Row 1, Col 2: 3D Scene with Learned Rx Beam Pattern =====
+ax1b = fig.add_subplot(2, 4, 2, projection='3d')
+
+# Plot Tx array
+ax1b.scatter(tx_antenna_pos[:, 0], tx_antenna_pos[:, 1], tx_antenna_pos[:, 2], 
+            c='blue', marker='s', s=100, label='Tx Array', alpha=0.8, zorder=10)
+
+# Plot Rx array
+ax1b.scatter(rx_antenna_pos[:, 0], rx_antenna_pos[:, 1], rx_antenna_pos[:, 2], 
+            c='green', marker='^', s=100, label='Rx Array', alpha=0.8, zorder=10)
+
+# Plot BD location
+ax1b.scatter(bd_loc_vis[0], bd_loc_vis[1], bd_loc_vis[2], 
+            c='red', marker='*', s=400, label='BD', edgecolors='black', linewidth=2, zorder=10)
+
+# Plot Scatter location
+ax1b.scatter(scatter_loc_vis[0], scatter_loc_vis[1], scatter_loc_vis[2], 
+            c='orange', marker='o', s=250, label='Scatterer', edgecolors='black', linewidth=1.5, zorder=10)
+
+# ===== Add Learned Rx Beam Pattern to Scene =====
+X_rx_learned, Y_rx_learned, Z_rx_learned = spherical_to_cartesian(AZ_rx_learned, EL_rx_learned, pattern_rx_learned * beam_scale)
+X_rx_learned += location_rx[0]
+Y_rx_learned += location_rx[1]
+Z_rx_learned += location_rx[2]
+
+# Plot Rx beam pattern with semi-transparent surface
+surf_rx = ax1b.plot_surface(X_rx_learned, Y_rx_learned, Z_rx_learned, cmap='Greens', alpha=0.4,
+                            rstride=2, cstride=2, linewidth=0, zorder=1)
+
+# Mark direction to BD from Rx
+dir_to_bd_rx = (bd_loc_vis - location_rx) / np.linalg.norm(bd_loc_vis - location_rx)
+ax1b.quiver(location_rx[0], location_rx[1], location_rx[2], 
+            dir_to_bd_rx[0]*4, dir_to_bd_rx[1]*4, dir_to_bd_rx[2]*4, 
+            color='darkgreen', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
+
+ax1b.set_xlabel('X (m)', fontsize=10, fontweight='bold')
+ax1b.set_ylabel('Y (m)', fontsize=10, fontweight='bold')
+ax1b.set_zlabel('Z (m)', fontsize=10, fontweight='bold')
+ax1b.set_title('Learned Rx Beamformer - 3D Beam Pattern', fontsize=11, fontweight='bold')
+ax1b.legend(loc='upper left', fontsize=8, framealpha=0.9)
+
+# Add coordinate axis arrows at origin for reference
+ax1b.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax1b.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax1b.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax1b.text(axis_length*1.1, 0, 0, 'X', color='red', fontsize=10, fontweight='bold')
+ax1b.text(0, axis_length*1.1, 0, 'Y', color='green', fontsize=10, fontweight='bold')
+ax1b.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold')
+
+# Set better viewing angle
+ax1b.view_init(elev=20, azim=45)
+
+# ===== Row 1, Col 3: 2D Beam Pattern for Learned Beamformers (Azimuth Cut) =====
+ax2 = fig.add_subplot(2, 4, 3)
 
 # Take a horizontal cut (elevation = 0)
 el_idx = pattern_tx_learned.shape[0] // 2
@@ -1029,8 +1061,8 @@ ax2.text(0.02, 0.98, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_cons
          transform=ax2.transAxes, fontsize=8, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-# ===== Row 1, Col 3: 2D Beam Pattern for Learned Beamformers (Elevation Cut) =====
-ax2b = fig.add_subplot(2, 3, 3)
+# ===== Row 1, Col 4: 2D Beam Pattern for Learned Beamformers (Elevation Cut) =====
+ax2b = fig.add_subplot(2, 4, 4)
 
 # Take a vertical cut at the BD azimuth direction
 # Find the azimuth index closest to BD direction
@@ -1070,8 +1102,8 @@ ax2b.grid(True, alpha=0.3, linestyle='--')
 ax2b.legend(loc='upper right', fontsize=8, framealpha=0.9)
 
 # ===== ROW 2: OPTIMAL BEAMFORMERS =====
-# ===== Row 2, Col 1: 3D Scene with Optimal Beam Patterns =====
-ax3 = fig.add_subplot(2, 3, 4, projection='3d')
+# ===== Row 2, Col 1: 3D Scene with Optimal Tx Beam Pattern =====
+ax3 = fig.add_subplot(2, 4, 5, projection='3d')
 
 # Plot Tx array (as a small grid of points)
 tx_antenna_pos = []
@@ -1101,16 +1133,6 @@ ax3.scatter(bd_loc_vis[0], bd_loc_vis[1], bd_loc_vis[2],
 ax3.scatter(scatter_loc_vis[0], scatter_loc_vis[1], scatter_loc_vis[2], 
             c='orange', marker='o', s=250, label='Scatterer', edgecolors='black', linewidth=1.5, zorder=10)
 
-# Draw lines showing signal paths
-ax3.plot([location_tx[0], bd_loc_vis[0]], [location_tx[1], bd_loc_vis[1]], 
-            [location_tx[2], bd_loc_vis[2]], 'r--', alpha=0.6, linewidth=2, label='Tx-BD path', zorder=5)
-ax3.plot([bd_loc_vis[0], location_rx[0]], [bd_loc_vis[1], location_rx[1]], 
-            [bd_loc_vis[2], location_rx[2]], 'r--', alpha=0.6, linewidth=2, zorder=5)
-ax3.plot([location_tx[0], scatter_loc_vis[0]], [location_tx[1], scatter_loc_vis[1]], 
-            [location_tx[2], scatter_loc_vis[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
-ax3.plot([scatter_loc_vis[0], location_rx[0]], [scatter_loc_vis[1], location_rx[1]], 
-            [scatter_loc_vis[2], location_rx[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
-
 # ===== Add Optimal Tx Beam Pattern to Scene =====
 X_tx_optimal, Y_tx_optimal, Z_tx_optimal = spherical_to_cartesian(AZ_tx_optimal, EL_tx_optimal, pattern_tx_optimal * beam_scale)
 X_tx_optimal += location_tx[0]
@@ -1121,32 +1143,16 @@ Z_tx_optimal += location_tx[2]
 surf_tx_opt = ax3.plot_surface(X_tx_optimal, Y_tx_optimal, Z_tx_optimal, cmap='Blues', alpha=0.4, 
                             rstride=2, cstride=2, linewidth=0, zorder=1)
 
-# ===== Add Optimal Rx Beam Pattern to Scene =====
-X_rx_optimal, Y_rx_optimal, Z_rx_optimal = spherical_to_cartesian(AZ_rx_optimal, EL_rx_optimal, pattern_rx_optimal * beam_scale)
-X_rx_optimal += location_rx[0]
-Y_rx_optimal += location_rx[1]
-Z_rx_optimal += location_rx[2]
-
-# Plot Rx beam pattern with semi-transparent surface
-surf_rx_opt = ax3.plot_surface(X_rx_optimal, Y_rx_optimal, Z_rx_optimal, cmap='Greens', alpha=0.4,
-                            rstride=2, cstride=2, linewidth=0, zorder=1)
-
 # Mark direction to BD from Tx
 dir_to_bd = (bd_loc_vis - location_tx) / np.linalg.norm(bd_loc_vis - location_tx)
 ax3.quiver(location_tx[0], location_tx[1], location_tx[2], 
             dir_to_bd[0]*4, dir_to_bd[1]*4, dir_to_bd[2]*4, 
             color='darkblue', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
 
-# Mark direction to BD from Rx
-dir_to_bd_rx = (bd_loc_vis - location_rx) / np.linalg.norm(bd_loc_vis - location_rx)
-ax3.quiver(location_rx[0], location_rx[1], location_rx[2], 
-            dir_to_bd_rx[0]*4, dir_to_bd_rx[1]*4, dir_to_bd_rx[2]*4, 
-            color='darkgreen', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
-
 ax3.set_xlabel('X (m)', fontsize=10, fontweight='bold')
 ax3.set_ylabel('Y (m)', fontsize=10, fontweight='bold')
 ax3.set_zlabel('Z (m)', fontsize=10, fontweight='bold')
-ax3.set_title('Optimal Beamformers - 3D Scene\n(Blue: Tx Beam, Green: Rx Beam)', fontsize=11, fontweight='bold')
+ax3.set_title('Optimal Tx Beamformer - 3D Beam Pattern', fontsize=11, fontweight='bold')
 ax3.legend(loc='upper left', fontsize=8, framealpha=0.9)
 
 # Add coordinate axis arrows at origin for reference
@@ -1161,8 +1167,70 @@ ax3.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold
 # Set better viewing angle
 ax3.view_init(elev=20, azim=45)
 
-# ===== Row 2, Col 2: 2D Beam Pattern for Optimal Beamformers (Azimuth Cut) =====
-ax4 = fig.add_subplot(2, 3, 5)
+# ===== Row 2, Col 2: 3D Scene with Optimal Rx Beam Pattern =====
+ax3b = fig.add_subplot(2, 4, 6, projection='3d')
+
+# Plot Tx array
+ax3b.scatter(tx_antenna_pos[:, 0], tx_antenna_pos[:, 1], tx_antenna_pos[:, 2], 
+            c='blue', marker='s', s=100, label='Tx Array', alpha=0.8, zorder=10)
+
+# Plot Rx array
+ax3b.scatter(rx_antenna_pos[:, 0], rx_antenna_pos[:, 1], rx_antenna_pos[:, 2], 
+            c='green', marker='^', s=100, label='Rx Array', alpha=0.8, zorder=10)
+
+# Plot BD location
+ax3b.scatter(bd_loc_vis[0], bd_loc_vis[1], bd_loc_vis[2], 
+            c='red', marker='*', s=400, label='BD', edgecolors='black', linewidth=2, zorder=10)
+
+# Plot Scatter location
+ax3b.scatter(scatter_loc_vis[0], scatter_loc_vis[1], scatter_loc_vis[2], 
+            c='orange', marker='o', s=250, label='Scatterer', edgecolors='black', linewidth=1.5, zorder=10)
+
+# Draw lines showing signal paths
+ax3b.plot([location_tx[0], bd_loc_vis[0]], [location_tx[1], bd_loc_vis[1]], 
+            [location_tx[2], bd_loc_vis[2]], 'r--', alpha=0.6, linewidth=2, label='Tx-BD path', zorder=5)
+ax3b.plot([bd_loc_vis[0], location_rx[0]], [bd_loc_vis[1], location_rx[1]], 
+            [bd_loc_vis[2], location_rx[2]], 'r--', alpha=0.6, linewidth=2, zorder=5)
+ax3b.plot([location_tx[0], scatter_loc_vis[0]], [location_tx[1], scatter_loc_vis[1]], 
+            [location_tx[2], scatter_loc_vis[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
+ax3b.plot([scatter_loc_vis[0], location_rx[0]], [scatter_loc_vis[1], location_rx[1]], 
+            [scatter_loc_vis[2], location_rx[2]], 'orange', linestyle=':', alpha=0.5, linewidth=1.5, zorder=5)
+
+# ===== Add Optimal Rx Beam Pattern to Scene =====
+X_rx_optimal, Y_rx_optimal, Z_rx_optimal = spherical_to_cartesian(AZ_rx_optimal, EL_rx_optimal, pattern_rx_optimal * beam_scale)
+X_rx_optimal += location_rx[0]
+Y_rx_optimal += location_rx[1]
+Z_rx_optimal += location_rx[2]
+
+# Plot Rx beam pattern with semi-transparent surface
+surf_rx_opt = ax3b.plot_surface(X_rx_optimal, Y_rx_optimal, Z_rx_optimal, cmap='Greens', alpha=0.4,
+                            rstride=2, cstride=2, linewidth=0, zorder=1)
+
+# Mark direction to BD from Rx
+dir_to_bd_rx = (bd_loc_vis - location_rx) / np.linalg.norm(bd_loc_vis - location_rx)
+ax3b.quiver(location_rx[0], location_rx[1], location_rx[2], 
+            dir_to_bd_rx[0]*4, dir_to_bd_rx[1]*4, dir_to_bd_rx[2]*4, 
+            color='darkgreen', arrow_length_ratio=0.15, linewidth=3, alpha=0.8, zorder=8)
+
+ax3b.set_xlabel('X (m)', fontsize=10, fontweight='bold')
+ax3b.set_ylabel('Y (m)', fontsize=10, fontweight='bold')
+ax3b.set_zlabel('Z (m)', fontsize=10, fontweight='bold')
+ax3b.set_title('Optimal Rx Beamformer - 3D Beam Pattern', fontsize=11, fontweight='bold')
+ax3b.legend(loc='upper left', fontsize=8, framealpha=0.9)
+
+# Add coordinate axis arrows at origin for reference
+ax3b.quiver(0, 0, 0, axis_length, 0, 0, color='red', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax3b.quiver(0, 0, 0, 0, axis_length, 0, color='green', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax3b.quiver(0, 0, 0, 0, 0, axis_length, color='blue', arrow_length_ratio=0.1, linewidth=2, alpha=0.7)
+ax3b.text(axis_length*1.1, 0, 0, 'X', color='red', fontsize=10, fontweight='bold')
+ax3b.text(0, axis_length*1.1, 0, 'Y', color='green', fontsize=10, fontweight='bold')
+ax3b.text(0, 0, axis_length*1.1, 'Z', color='blue', fontsize=10, fontweight='bold')
+
+# Set better viewing angle
+ax3b.view_init(elev=20, azim=45)
+
+# ===== Row 2, Col 3: 2D Beam Pattern for Optimal Beamformers (Azimuth Cut) =====
+ax4 = fig.add_subplot(2, 4, 7)
 
 # Take a horizontal cut (elevation = 0)
 el_idx = pattern_tx_optimal.shape[0] // 2
@@ -1200,8 +1268,8 @@ ax4.text(0.02, 0.98, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_cons
          transform=ax4.transAxes, fontsize=8, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-# ===== Row 2, Col 3: 2D Beam Pattern for Optimal Beamformers (Elevation Cut) =====
-ax4b = fig.add_subplot(2, 3, 6)
+# ===== Row 2, Col 4: 2D Beam Pattern for Optimal Beamformers (Elevation Cut) =====
+ax4b = fig.add_subplot(2, 4, 8)
 
 # Take a vertical cut at the BD azimuth direction
 bd_az_idx_opt = int((bd_azimuth_tx + 180) / 360 * pattern_tx_optimal.shape[1])
