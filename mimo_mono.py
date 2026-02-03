@@ -472,6 +472,13 @@ with tf.name_scope("optimal_beamformer"):
     sig_int_opt = tf.squeeze(tf.abs(sig_int_opt) ** 2) * lay['P']
     
     sinr_BD_opt = sig_BD_opt / (sig_int_opt + noise_var + 1e-10)
+
+    scatter_sig_opt = tf.matmul(tf.linalg.adjoint(v_opt), tf.matmul(H_r_placeholder, w_opt))  # (batch, 1, 1)
+    scatter_sig_opt = tf.squeeze(tf.abs(scatter_sig_opt) ** 2) * lay['P']
+    scatter_int_opt = tf.matmul(tf.linalg.adjoint(v_opt), \
+                            tf.matmul(H_d_placeholder+H_b_placeholder, w_opt))  # (batch, 1, 1)
+    scatter_int_opt = tf.squeeze(tf.abs(scatter_int_opt) ** 2) * lay['P']
+    sinr_scatter_opt = scatter_sig_opt / (scatter_int_opt + noise_var + 1e-10)
     
 
 
@@ -695,9 +702,9 @@ with tf.Session() as sess:
         avg_train_loss = np.mean(epoch_train_losses)
         avg_train_sinr = np.mean(epoch_sinr_values)
         
-        loss_val, sinr_val, sinr_opt_val, sinr_scatter_val, \
+        loss_val, sinr_val, sinr_opt_val, sinr_scatter_val, sinr_scatter_opt_val, \
             sig_bd_val, sig_ref_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [loss, sinr_BD, sinr_BD_opt, sinr_scatter, \
+            [loss, sinr_BD, sinr_BD_opt, sinr_scatter, sinr_scatter_opt,\
              sig_BD, sig_ref, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
         )
         
@@ -713,7 +720,8 @@ with tf.Session() as sess:
               f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
               f'Sig_BD_opt: {np.mean(sig_bd_opt_val):8.4f} | '
               f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | '
-              f'SINR_scatter: {10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB')
+              f'SINR_scatter: {10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB | '
+              f'SINR_scatter_opt: {10 * np.log10(np.mean(sinr_scatter_opt_val) + 1e-10):6.2f} dB')
         print()
         
         # Early stopping
