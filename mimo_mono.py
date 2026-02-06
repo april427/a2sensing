@@ -147,7 +147,7 @@ Rician_factor = args.rician_factor
 location_bd = None
 
 # Sensing parameters
-tau = 32  # Pilot length (also number of BD interactions)
+tau = 16  # Pilot length (also number of BD interactions)
 K = 5  # Number of OFDM symbols per BD state
 snr_const = 25
 snr_const = np.array([snr_const])
@@ -274,34 +274,27 @@ with tf.name_scope("active_sensing_agent"):
         # x_BD[t] is scalar (+1 or -1)
         x_bd_t = tf.reshape(tf.cast(x_BD[t], tf.complex64), [-1, 1, 1])  # (batch, 1, 1)
         H_eff = x_bd_t * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+        H_eff2 = -x_bd_t * H_b_placeholder + H_d_placeholder + H_r_placeholder
         
-        'Observe received signal: y = sqrt(P) * v^H * H * w + noise'
         y_noiseless1 = tf.complex(tf.sqrt(lay['P']), 0.0) *  tf.matmul(H_eff, w1)  # (batch, N_rx, 1)
         # Broadcast to K samples
         y_noiseless1 = tf.tile(y_noiseless1, [1, 1, K])  # (batch, N_rx, K)
-        # Add noise
+        y_noiseless2 = tf.tile(tf.complex(tf.sqrt(lay['P']), 0.0) *  tf.matmul(H_eff2, w1), [1, 1, K])  # (batch, N_rx, K)
+        
         noise = tf.complex(
             tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
             tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
         )
 
         y_complex1 = tf.add(y_noiseless1, noise)  # (batch, N_rx, K) Before beamforming
-
-        # y_complex2 = tf.matmul(tf.conj(tf.transpose(v1, perm=[0, 2, 1])), y_complex1)  # (batch, 1, K)
-        # y_complex2 = tf.reduce_mean(tf.reshape(y_complex2, [batch_size, K]), axis=1, keepdims=True)  # (batch, 1)
+        y_complex2 = tf.add(y_noiseless2, tf.complex(
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
+        ))  # (batch, N_rx, K) Before beamforming
         
-        # y_complex1_flat = tf.reshape(tf.reduce_mean(y_complex1, axis=2), [batch_size, N_rx])  # (batch, N_rx)
-        # 'Prepare features for shared LSTM'
-        # # Combine features: [Re(y1), Im(y1), Re(y2), Im(y2),x_BD[t], snr]
-        # y_real = tf.concat([
-        #     tf.cast(tf.real(y_complex1_flat), tf.float32),
-        #     tf.cast(tf.imag(y_complex1_flat), tf.float32),
-        #     tf.cast(tf.real(y_complex2), tf.float32),
-        #     tf.cast(tf.imag(y_complex2), tf.float32)
-        # ], axis=1)  # (batch, 2*N_rx + 2)
 
-        Y1 = Y1 + tf.reduce_mean(x_bd_t * y_complex1, axis=2, keepdims=False)
-        Y2 = Y2 + tf.reduce_mean(y_complex1, axis=2, keepdims=False)  # Accumulate over time steps
+        Y1 = Y1 + tf.reduce_mean(x_bd_t * y_complex1 - x_bd_t * y_complex2, axis=2, keepdims=False)
+        Y2 = Y2 + tf.reduce_mean(y_complex1 + y_complex2, axis=2, keepdims=False)  # Accumulate over time steps
         Y1_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y1, [-1, N_rx, 1])), axis=2, keepdims=False)
         Y2_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y2, [-1, N_rx, 1])), axis=2, keepdims=False)
         y_real = tf.concat([
@@ -719,7 +712,8 @@ with tf.Session() as sess:
               f'Sig_BD: {np.mean(sig_bd_val):8.4f} | '
               f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
               f'Sig_BD_opt: {np.mean(sig_bd_opt_val):8.4f} | '
-              f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | '
+              f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | ')
+        print(f'         | '
               f'SINR_scatter: {10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB | '
               f'SINR_scatter_opt: {10 * np.log10(np.mean(sinr_scatter_opt_val) + 1e-10):6.2f} dB')
         print()
