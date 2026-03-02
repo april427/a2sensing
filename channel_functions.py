@@ -444,19 +444,22 @@ def plot_beam_patterns(theta_complex, true_location, v_vector=None, save_path=No
 
 ## MIMO, UPA
 
-def generate_location_mimo(num_users):
+def generate_location_mimo(num_users, type = 'u'):
     """
     generate user position:  
     """
     location_user = np.empty([num_users, 3])
     dis = Wavelength*15
 
-    azimuch_angle = np.random.uniform(-np.pi, np.pi)
-    elevation_angle = np.random.uniform(-np.pi*7/8, -np.pi/8)
+    elevation_angle = np.random.uniform(-np.pi, np.pi)
+    if type == 'u':
+        azimuth_angle = np.random.uniform(-np.pi*7/8, -np.pi/8)
+    else:
+        azimuth_angle = np.random.uniform(-np.pi/4, np.pi/4)
 
-    x1 = dis * np.cos(elevation_angle) * np.cos(azimuch_angle)
-    y1 = dis * np.cos(elevation_angle) * np.sin(azimuch_angle)
-    z1 = dis * np.sin(elevation_angle) + 80*Wavelength
+    x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)
+    y1 = dis * np.cos(elevation_angle) * np.sin(azimuth_angle)
+    z1 = dis * np.sin(elevation_angle) #+ 80*Wavelength
 
     location_user[0, :] = np.array([x1, y1, z1])
 
@@ -584,7 +587,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             for j in range(N_total):
                 # Calculate 2D distance between TX and RX elements
                 dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
-                H_SI[i, j] = (1/100) * (wavelength/(dist + 1e-8)/4/np.pi) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
+                H_SI[i, j] = (wavelength/(dist + 1e-8)/4/np.pi) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
         H_direct = H_SI 
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
