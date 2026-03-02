@@ -149,8 +149,8 @@ tau = 16  # Pilot length (also number of BD interactions)
 K = 5  # Number of OFDM symbols per BD state
 snr_const = 10
 snr_const = np.array([snr_const])
-ref_dis = 15
-Pvec = 10 ** (snr_const / 10)
+ref_dis = 15*Wavelength
+Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
 # BD modulation - alternating pattern
 BD_modulation = np.array([(-1) ** t for t in range(tau)])
@@ -222,7 +222,7 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size = 256  # Shared hidden size for both nodes
+    hidden_size = 128  # Shared hidden size for both nodes
     
     LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')
     LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
@@ -1055,7 +1055,7 @@ ax2.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label
 ax2.set_title('Learned Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax2.set_theta_zero_location('E')  # 0° at East (positive X)
-ax2.set_theta_direction(-1)  # Clockwise
+ax2.set_theta_direction(1)  # Counter-clockwise
 ax2.set_ylim([0, 1])
 
 # ===== Row 1, Col 3: Polar Plot - Learned Rx Beam =====
@@ -1070,7 +1070,7 @@ ax3.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label
 ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax3.set_theta_zero_location('E')
-ax3.set_theta_direction(-1)
+ax3.set_theta_direction(1)
 ax3.set_ylim([0, 1])
 
 # ===== ROW 2: OPTIMAL BEAMFORMERS =====
@@ -1114,7 +1114,7 @@ ax5.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label
 ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax5.set_theta_zero_location('E')
-ax5.set_theta_direction(-1)
+ax5.set_theta_direction(1)
 ax5.set_ylim([0, 1])
 
 # ===== Row 2, Col 3: Polar Plot - Optimal Rx Beam =====
@@ -1129,7 +1129,7 @@ ax6.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label
 ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax6.set_theta_zero_location('E')
-ax6.set_theta_direction(-1)
+ax6.set_theta_direction(1)
 ax6.set_ylim([0, 1])
 
 plt.tight_layout()

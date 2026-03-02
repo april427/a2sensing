@@ -15,9 +15,9 @@ Rician_factor = args.rician_factor
 def path_loss_r(d1, wavelength, d2 = None,  type = 'backscatter'):   # return |beta|^2 in dB
     """Keyhole channel: pathloss of backscatter signal for Rician fading in dB. (4 pi d / wavelength)^4 ! """
     if d2 is None and type == 'backscatter':
-        loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d1 + 1e-8)-20
+        loss = 40*np.log10(4*np.pi/wavelength) + 40.0 * np.log10(d1 + 1e-8)
     elif d2 is not None and type == 'backscatter':
-        loss = 40*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8) + 20.0 * np.log10(d2 + 1e-8) - 20 
+        loss = 40*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8) + 20.0 * np.log10(d2 + 1e-8) 
     elif type == 'direct':
         loss = 20*np.log10(4*np.pi/wavelength) + 20.0 * np.log10(d1 + 1e-8)
     return loss
@@ -452,11 +452,11 @@ def generate_location_mimo(num_users, type = 'u'):
 
     elevation_angle = 0#np.random.uniform(-np.pi, np.pi)
     if type == 'u':
-        azimuth_angle = np.random.uniform(-np.pi*5/8, -np.pi/8)
+        azimuth_angle = np.random.uniform(0, 1.87*np.pi)
         dis = Wavelength*15 
     else:
-        azimuth_angle = np.random.uniform(-np.pi/2, np.pi/2)
-        dis = Wavelength*15 + Wavelength*10*np.random.rand()
+        azimuth_angle = np.random.uniform(1/9*np.pi, np.pi*15/8)
+        dis = Wavelength*10 + Wavelength*10*np.random.rand()
 
     x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)
     y1 = dis * np.cos(elevation_angle) * np.sin(azimuth_angle)
@@ -588,8 +588,8 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             for j in range(N_total):
                 # Calculate 2D distance between TX and RX elements
                 dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
-                H_SI[i, j] = (wavelength/(dist + 1e-8)/4/np.pi) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
-        H_direct = 5e-5 * H_SI 
+                H_SI[i, j] = (1/(dist + 1e-8)) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
+        H_direct =  5e-2 * H_SI / np.linalg.norm(H_SI, 'fro') 
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
         d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])
@@ -684,10 +684,10 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     
     # Normalize
 
-    H_total = H_total * np.sqrt(N_rx * N_tx) / (normalize_factor + 1e-8)
-    H_direct = H_direct * np.sqrt(N_rx * N_tx) / (normalize_factor + 1e-8)
-    H_scatter = H_scatter * np.sqrt(N_rx * N_tx) / (normalize_factor + 1e-8)
-    H_bd = H_bd * np.sqrt(N_rx * N_tx) / (normalize_factor + 1e-8)
+    H_total = H_total 
+    H_direct = H_direct 
+    H_scatter = H_scatter 
+    H_bd = H_bd  
     
     return H_total, H_direct, H_scatter, H_bd
 
