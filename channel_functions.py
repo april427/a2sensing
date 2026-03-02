@@ -449,13 +449,14 @@ def generate_location_mimo(num_users, type = 'u'):
     generate user position:  
     """
     location_user = np.empty([num_users, 3])
-    dis = Wavelength*15
 
-    elevation_angle = np.random.uniform(-np.pi, np.pi)
+    elevation_angle = 0#np.random.uniform(-np.pi, np.pi)
     if type == 'u':
-        azimuth_angle = np.random.uniform(-np.pi*7/8, -np.pi/8)
+        azimuth_angle = np.random.uniform(-np.pi*5/8, -np.pi/8)
+        dis = Wavelength*15 
     else:
-        azimuth_angle = np.random.uniform(-np.pi/4, np.pi/4)
+        azimuth_angle = np.random.uniform(-np.pi/2, np.pi/2)
+        dis = Wavelength*15 + Wavelength*10*np.random.rand()
 
     x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)
     y1 = dis * np.cos(elevation_angle) * np.sin(azimuth_angle)
@@ -588,7 +589,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
                 # Calculate 2D distance between TX and RX elements
                 dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
                 H_SI[i, j] = (wavelength/(dist + 1e-8)/4/np.pi) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
-        H_direct = H_SI 
+        H_direct = 5e-5 * H_SI 
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
         d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])

@@ -147,9 +147,9 @@ location_bd = None
 # Sensing parameters
 tau = 16  # Pilot length (also number of BD interactions)
 K = 5  # Number of OFDM symbols per BD state
-snr_const = 25
+snr_const = 10
 snr_const = np.array([snr_const])
-ref_dis = 5
+ref_dis = 15
 Pvec = 10 ** (snr_const / 10)
 
 # BD modulation - alternating pattern
@@ -184,13 +184,19 @@ for t in range(num_ofdm_symbols):
 
 tx_signal = nr_signal_with_cp.flatten()
 
-
+# For LS_based channel estimation
+# Beam Sweeping
+s_pilot = np.ones((N_tx, tau), dtype=np.complex64) * complex(1, 0) 
+for i in range(tau):
+    s_pilot[:,i] = 1/np.sqrt(N_tx) * np.array([np.exp(-1j * np.pi * j *(2 * i + 1 - tau)/tau) \
+                                               for j in range(N_tx)])
+    
 #####################################################
 # Learning parameters and Computation Graph
 #####################################################
 #  
 initial_run = 1
-n_epochs = 10
+n_epochs = 1
 learning_rate = 5e-4
 batch_per_epoch = 128
 batch_size_order = 4
@@ -446,30 +452,50 @@ with tf.name_scope("optimal_beamformer"):
     
 with tf.name_scope("sp_beamformer"):
     # In the frequency domain filter out the BD signal since it induces a frequency shift, then calculate beamformer
-    H_eff_list = []
-    for t in range(tau):
-        H_eff_t = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-        noise_complex = tf.complex(
-            tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
-            tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
-        )
-        H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
-        H_eff_list.append(H_eff_t)
-        H_eff_t = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-        noise_complex = tf.complex(
-            tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
-            tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
-        )
-        H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
-        H_eff_list.append(H_eff_t)
-    H_stacked = tf.stack(H_eff_list, axis=1)
-    H_transposed = tf.transpose(H_stacked, perm=[0, 2, 3, 1])  # (batch, N_rx, N_tx, tau*2)
-    H_fft = tf.signal.fft(tf.cast(H_transposed, tf.complex64))
-    H_dc = H_fft[:, :, :, 0]
+    # H_eff_list = []
+    # for t in range(tau):
+    #     H_eff_t = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+    #     noise_complex = tf.complex(
+    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
+    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
+    #     )
+    #     H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
+    #     H_eff_list.append(H_eff_t)
+    #     H_eff_t = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+    #     noise_complex = tf.complex(
+    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
+    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
+    #     )
+    #     H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
+    #     H_eff_list.append(H_eff_t)
+    # H_stacked = tf.stack(H_eff_list, axis=1)
+    # H_transposed = tf.transpose(H_stacked, perm=[0, 2, 3, 1])  # (batch, N_rx, N_tx, tau*2)
+    # H_fft = tf.signal.fft(tf.cast(H_transposed, tf.complex64))
+    # H_dc = H_fft[:, :, :, 0]
 
-    H_bd_freq = H_fft[:, :, :, tau]
-    H_int_estimated = H_dc / tf.cast(2*tau, tf.complex64)
-    H_bd_estimated = 2*H_bd_freq / tf.cast(2*tau, tf.complex64)
+    # H_bd_freq = H_fft[:, :, :, tau]
+    # H_int_estimated = H_dc / tf.cast(2*tau, tf.complex64)
+    # H_bd_estimated = 2*H_bd_freq / tf.cast(2*tau, tf.complex64)
+
+    #### Signal Processing Approach
+    H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+    Y_0 = tf.matmul(H_eff0, s_pilot)  # (batch, N_rx, tau)
+    noise_complex = tf.complex(
+        tf.random_normal(tf.shape(H_eff0), mean=0.0, stddev=noiseSTD_per_dim),
+        tf.random_normal(tf.shape(H_eff0), mean=0.0, stddev=noiseSTD_per_dim)
+    )
+    H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff0 + noise_complex
+    H_eff_hat = tf.matmul(Y_0, tf.linalg.adjoint(s_pilot))  # (batch, N_rx, N_tx)
+    H_eff1 = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+    Y_1 = tf.matmul(H_eff1, s_pilot)  # (batch, N_rx, tau)
+    noise_complex = tf.complex(
+        tf.random_normal(tf.shape(H_eff1), mean=0.0, stddev=noiseSTD_per_dim),
+        tf.random_normal(tf.shape(H_eff1), mean=0.0, stddev=noiseSTD_per_dim)
+    )
+    H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff1 + noise_complex
+    H_eff_hat1 = tf.matmul(Y_1, tf.linalg.adjoint(s_pilot))  # (batch, N_rx, N_tx)
+    H_int_estimated = (H_eff_hat + H_eff_hat1) / tf.cast(2, tf.complex64)
+    H_bd_estimated = (H_eff_hat1 - H_eff_hat) / tf.cast(2, tf.complex64)
 
     v_sp, w_sp = tf.py_func(
         lambda H_b, H_int: compute_optimal_beamformers_np(H_b, H_int, noise_var, Pvec[0]),
@@ -489,6 +515,45 @@ with tf.name_scope("sp_beamformer"):
     sig_int_sp = tf.squeeze(tf.abs(sig_int_sp) ** 2) * lay['P']
     
     sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
+
+    #### Beam Sweeping Approach
+    tiled_s_pilot = tf.tile(tf.reshape(s_pilot, [1, N_tx, tau]), [tf.shape(H_b_placeholder)[0], 1, 1])  # (batch, N_tx, tau)
+    nomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_b_placeholder), tiled_s_pilot)        # (batch, tau, tau)
+    denomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_interference), tiled_s_pilot)       # (batch, tau, tau)
+    sinr_ratio = tf.abs(nomi) ** 2 / (tf.abs(denomi) ** 2 + noise_var + 1e-10)                            # (batch, tau, tau)
+
+    # argmax over each tau x tau matrix
+    batch_size_sweep = tf.shape(sinr_ratio)[0]
+    sinr_ratio_flat = tf.reshape(sinr_ratio, [batch_size_sweep, tau * tau])  # (batch, tau*tau)
+    best_beam_index = tf.argmax(sinr_ratio_flat, axis=1, output_type=tf.int32)  # (batch,)
+
+    best_beam_row = tf.math.floordiv(best_beam_index, tau)  # for v_sweep
+    best_beam_col = tf.math.floormod(best_beam_index, tau)  # for w_sweep
+
+    # Build codebook as (batch, tau, N), so selecting one beam returns length-N vector
+    pilot_bank_tx = tf.tile(tf.expand_dims(tf.transpose(s_pilot), axis=0), [batch_size_sweep, 1, 1])  # (batch, tau, N_tx)
+    pilot_bank_rx = pilot_bank_tx  # N_rx == N_tx in current config
+
+    batch_indices = tf.range(batch_size_sweep, dtype=tf.int32)
+
+    # w_sweep from best column index
+    w_idx = tf.stack([batch_indices, best_beam_col], axis=1)
+    w_sweep = tf.gather_nd(pilot_bank_tx, w_idx)                 # (batch, N_tx)
+    w_sweep = tf.reshape(w_sweep, [-1, N_tx, 1])
+    w_sweep = w_sweep / tf.cast(tf.norm(w_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
+
+    # v_sweep from best row index
+    v_idx = tf.stack([batch_indices, best_beam_row], axis=1)
+    v_sweep = tf.gather_nd(pilot_bank_rx, v_idx)                 # (batch, N_rx)
+    v_sweep = tf.reshape(v_sweep, [-1, N_rx, 1])
+    v_sweep = v_sweep / tf.cast(tf.norm(v_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
+
+    sig_BD_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_b_placeholder, w_sweep))
+    sig_int_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_interference, w_sweep))
+    sinr_BD_sweep = tf.squeeze(tf.abs(sig_BD_sweep) ** 2) * lay['P'] / \
+                    (tf.squeeze(tf.abs(sig_int_sweep) ** 2) * lay['P'] + noise_var + 1e-10)
+
+
 
 #####################################################
 # Loss and Optimizer
@@ -815,10 +880,14 @@ with tf.Session() as sess:
     sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(
         [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex, w_complex, v_opt, w_opt], feed_dict=feed_dict_test
     )
+
+    sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
     
     print(f"Test SINR_BD (learned):  {10 * np.log10(np.mean(sinr_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_BD (optimal):  {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
+    print(f"Test SINR_BD (signalprocessing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
+    print(f"Test SINR_BD (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
     print(f"Gap to optimal:          {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
     
     # Save results
@@ -833,6 +902,8 @@ with tf.Session() as sess:
         Scatter_location=Scatter_loc if Scatter_loc[0] is not None else [],
         sinr_learned=sinr_test,
         sinr_optimal=sinr_opt_test,
+        sinr_sp=sinr_sp_test,
+        sinr_sweep=sinr_sweep_test,
         sinr_scatter_learned=sinr_scatter_test,
         v_learned=v_learned,
         w_learned=w_learned,
@@ -909,7 +980,31 @@ scatter_azimuth = np.arctan2(scatter_loc_vis[1] - location_tx[1], scatter_loc_vi
 
 # Create figure with 2 rows, 3 columns
 fig = plt.figure(figsize=(18, 12))
+# --- SINR summary (for the selected idx) ---
+def _scalar_at(x, i):
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        return float(arr)
+    return float(np.squeeze(arr[i]))
 
+opt_sinr_val = _scalar_at(sinr_opt_test[idx], idx)
+learned_sinr_val = _scalar_at(sinr_test[idx], idx)
+sp_sinr_val = _scalar_at(sinr_sp_test[idx], idx)
+sweep_sinr_val = _scalar_at(sinr_sweep_test[idx], idx)
+
+sinr_text = (
+    f"Opt SINR: {10*np.log10(opt_sinr_val + 1e-12):.2f} dB   |   "
+    f"Learned SINR: {10*np.log10(learned_sinr_val + 1e-12):.2f} dB   |   "
+    f"SP SINR: {10*np.log10(sp_sinr_val + 1e-12):.2f} dB   |   "
+    f"Sweep SINR: {10*np.log10(sweep_sinr_val + 1e-12):.2f} dB"
+)
+
+fig.text(
+    0.5, 0.985, sinr_text,
+    ha='center', va='top', fontsize=12,
+    bbox=dict(boxstyle='round,pad=0.35', facecolor='white', alpha=0.9, edgecolor='gray')
+)
+plt.subplots_adjust(top=0.90)
 ax1 = fig.add_subplot(2, 3, 1)
 
 # Plot Tx/Rx location (co-located)
