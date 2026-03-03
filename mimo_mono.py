@@ -140,7 +140,7 @@ N_tx = args.N_ris
 N_rx = args.N_ris
 N_ris = N_rx       # Numbers of antennas are all the same
 num_users = 1
-num_scatters = 1  # excluding BD
+num_scatters = args.N_scatterers  # excluding BD
 Rician_factor = args.rician_factor
 location_bd = None
 
@@ -643,7 +643,7 @@ set_location_user_val = []
 for ii in range(num_val_samples):
     # Generate random locations
     bd_loc = generate_location_mimo(1, 'u')[0]
-    scatter_loc = generate_location_mimo(1, 's')[0]
+    scatter_loc = generate_location_mimo(num_scatters, 's')
     
     # Generate MIMO channels using generate_mimo_channel
     # Returns: H_total, H_direct, H_scatter, H_bd
@@ -727,7 +727,7 @@ with tf.Session() as sess:
             for ii in range(num_train_samples):
                 # Generate random locations
                 bd_loc = generate_location_mimo(1, 'u')[0]
-                scatter_loc = generate_location_mimo(1, 's')[0]
+                scatter_loc = generate_location_mimo(num_scatters, 's')
                 
                 # Generate MIMO channels
                 _, H_d, H_r, H_b = generate_mimo_channel(
@@ -836,7 +836,7 @@ with tf.Session() as sess:
     for ii in range(test_size):
         # Generate random locations
         bd_loc = generate_location_mimo(1, 'u')[0]
-        scatter_loc = generate_location_mimo(1, 's')[0]
+        scatter_loc = generate_location_mimo(num_scatters, 's')
 
         BD_loc.append(bd_loc)
         Scatter_loc.append(scatter_loc)
@@ -926,7 +926,11 @@ print("=" * 60)
 # Select one test instance for visualization
 idx = 8
 bd_loc_vis = BD_loc[idx]
-scatter_loc_vis = Scatter_loc[idx] if Scatter_loc[idx] is not None else np.array([0, 0, 0])
+
+# Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
+scatter_loc_vis = Scatter_loc[idx] if Scatter_loc[idx] is not None else np.array([[0, 0, 0]])
+scatter_loc_vis = np.atleast_2d(scatter_loc_vis)
+num_scatterers_vis = scatter_loc_vis.shape[0]
 
 # Array dimensions (for ULA, N_h = N, N_v = 1; for UPA, N_h = N_v = sqrt(N))
 # With elevation = 0, effectively treating as ULA in azimuth
@@ -976,7 +980,13 @@ az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_
 
 # Calculate target directions (azimuth only)
 bd_azimuth = np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0])
-scatter_azimuth = np.arctan2(scatter_loc_vis[1] - location_tx[1], scatter_loc_vis[0] - location_tx[0])
+
+# Calculate azimuth for each scatterer
+scatter_azimuths = []
+for s in range(num_scatterers_vis):
+    scatter_az = np.arctan2(scatter_loc_vis[s, 1] - location_tx[1], scatter_loc_vis[s, 0] - location_tx[0])
+    scatter_azimuths.append(scatter_az)
+scatter_azimuths = np.array(scatter_azimuths)
 
 # Create figure with 2 rows, 3 columns
 fig = plt.figure(figsize=(18, 12))
@@ -1013,23 +1023,31 @@ ax1.scatter(location_tx[0], location_tx[1], c='blue', marker='s', s=200, label='
 # Plot BD location
 ax1.scatter(bd_loc_vis[0], bd_loc_vis[1], c='red', marker='*', s=400, label='BD', zorder=10, edgecolors='black', linewidth=1.5)
 
-# Plot Scatter location
-ax1.scatter(scatter_loc_vis[0], scatter_loc_vis[1], c='orange', marker='o', s=250, label='Scatterer', zorder=10, edgecolors='black', linewidth=1.5)
+# Plot Scatter locations (multiple scatterers)
+scatter_colors = plt.cm.Oranges(np.linspace(0.4, 0.9, num_scatterers_vis))
+for s in range(num_scatterers_vis):
+    label = 'Scatterers' if s == 0 else None
+    ax1.scatter(scatter_loc_vis[s, 0], scatter_loc_vis[s, 1], c=[scatter_colors[s]], marker='o', s=250, 
+                label=label, zorder=10, edgecolors='black', linewidth=1.5)
 
 # Draw lines showing signal paths
 ax1.plot([location_tx[0], bd_loc_vis[0]], [location_tx[1], bd_loc_vis[1]], 'r--', alpha=0.6, linewidth=2, label='BD path')
-ax1.plot([location_tx[0], scatter_loc_vis[0]], [location_tx[1], scatter_loc_vis[1]], 'orange', linestyle=':', alpha=0.6, linewidth=2, label='Scatter path')
+for s in range(num_scatterers_vis):
+    label = 'Scatter paths' if s == 0 else None
+    ax1.plot([location_tx[0], scatter_loc_vis[s, 0]], [location_tx[1], scatter_loc_vis[s, 1]], 
+             color=scatter_colors[s], linestyle=':', alpha=0.6, linewidth=2, label=label)
 
 # Add direction arrows
 dir_to_bd = (bd_loc_vis[:2] - location_tx[:2]) / np.linalg.norm(bd_loc_vis[:2] - location_tx[:2])
-dir_to_scatter = (scatter_loc_vis[:2] - location_tx[:2]) / np.linalg.norm(scatter_loc_vis[:2] - location_tx[:2])
 arrow_scale = 3
 ax1.annotate('', xy=(location_tx[0] + dir_to_bd[0]*arrow_scale, location_tx[1] + dir_to_bd[1]*arrow_scale),
              xytext=(location_tx[0], location_tx[1]),
              arrowprops=dict(arrowstyle='->', color='darkred', lw=2))
-ax1.annotate('', xy=(location_tx[0] + dir_to_scatter[0]*arrow_scale, location_tx[1] + dir_to_scatter[1]*arrow_scale),
-             xytext=(location_tx[0], location_tx[1]),
-             arrowprops=dict(arrowstyle='->', color='darkorange', lw=2))
+for s in range(num_scatterers_vis):
+    dir_to_scatter = (scatter_loc_vis[s, :2] - location_tx[:2]) / (np.linalg.norm(scatter_loc_vis[s, :2] - location_tx[:2]) + 1e-10)
+    ax1.annotate('', xy=(location_tx[0] + dir_to_scatter[0]*arrow_scale, location_tx[1] + dir_to_scatter[1]*arrow_scale),
+                 xytext=(location_tx[0], location_tx[1]),
+                 arrowprops=dict(arrowstyle='->', color=scatter_colors[s], lw=2))
 
 ax1.set_xlabel('X (m)', fontsize=11, fontweight='bold')
 ax1.set_ylabel('Y (m)', fontsize=11, fontweight='bold')
@@ -1037,7 +1055,10 @@ ax1.set_title('2D Scene (XY Plane, Elevation = 0)', fontsize=12, fontweight='bol
 ax1.legend(loc='best', fontsize=9, framealpha=0.9)
 ax1.grid(True, alpha=0.3, linestyle='--')
 ax1.set_aspect('equal')
-ax1.text(0.02, 0.98, f'BD Az: {np.degrees(bd_azimuth):.1f}°\nScatter Az: {np.degrees(scatter_azimuth):.1f}°', 
+
+# Build scatter azimuth text for info box
+scatter_az_text = '\n'.join([f'Scatter {s+1} Az: {np.degrees(scatter_azimuths[s]):.1f}°' for s in range(num_scatterers_vis)])
+ax1.text(0.02, 0.98, f'BD Az: {np.degrees(bd_azimuth):.1f}°\n{scatter_az_text}', 
          transform=ax1.transAxes, fontsize=9, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
@@ -1050,7 +1071,11 @@ ax2.fill(az_tx_learned, pattern_tx_learned, 'blue', alpha=0.2)
 
 # Mark BD direction
 ax2.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-ax2.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label=f'Scatter: {np.degrees(scatter_azimuth):.1f}°')
+# Mark all scatter directions
+scatter_colors_polar = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
+for s in range(num_scatterers_vis):
+    ax2.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
 ax2.set_title('Learned Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
@@ -1065,7 +1090,9 @@ ax3.plot(az_rx_learned, pattern_rx_learned, 'g-', linewidth=2.5, label='Rx Beam'
 ax3.fill(az_rx_learned, pattern_rx_learned, 'green', alpha=0.2)
 
 ax3.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-ax3.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label=f'Scatter: {np.degrees(scatter_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax3.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
 ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
@@ -1087,9 +1114,12 @@ ax4.plot(azimuth_deg, 10*np.log10(pattern_rx_optimal + 1e-10), 'g--', linewidth=
 
 # Mark BD and scatter directions
 bd_az_deg = np.degrees(bd_azimuth)
-scatter_az_deg = np.degrees(scatter_azimuth)
 ax4.axvline(bd_az_deg, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'BD: {bd_az_deg:.1f}°')
-ax4.axvline(scatter_az_deg, color='orange', linestyle=':', linewidth=2, alpha=0.7, label=f'Scatter: {scatter_az_deg:.1f}°')
+scatter_colors_cart = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
+for s in range(num_scatterers_vis):
+    scatter_az_deg = np.degrees(scatter_azimuths[s])
+    ax4.axvline(scatter_az_deg, color=scatter_colors_cart[s], linestyle=':', linewidth=2, alpha=0.7, 
+                label=f'S{s+1}: {scatter_az_deg:.1f}°')
 
 ax4.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
 ax4.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
@@ -1109,7 +1139,9 @@ ax5.plot(az_tx_optimal, pattern_tx_optimal, 'b-', linewidth=2.5, label='Tx Beam'
 ax5.fill(az_tx_optimal, pattern_tx_optimal, 'blue', alpha=0.2)
 
 ax5.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-ax5.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label=f'Scatter: {np.degrees(scatter_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax5.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
 ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
@@ -1124,7 +1156,9 @@ ax6.plot(az_rx_optimal, pattern_rx_optimal, 'g-', linewidth=2.5, label='Rx Beam'
 ax6.fill(az_rx_optimal, pattern_rx_optimal, 'green', alpha=0.2)
 
 ax6.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-ax6.axvline(scatter_azimuth, color='orange', linestyle=':', linewidth=2.5, label=f'Scatter: {np.degrees(scatter_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax6.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
 ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)

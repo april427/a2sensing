@@ -19,3 +19,4 @@ debug_*
 retest_benchmark.py
 
 /figs
+ping_pong.py

@@ -450,19 +450,20 @@ def generate_location_mimo(num_users, type = 'u'):
     """
     location_user = np.empty([num_users, 3])
 
-    elevation_angle = 0#np.random.uniform(-np.pi, np.pi)
-    if type == 'u':
-        azimuth_angle = np.random.uniform(0, 1.87*np.pi)
-        dis = Wavelength*15 
-    else:
-        azimuth_angle = np.random.uniform(1/9*np.pi, np.pi*15/8)
-        dis = Wavelength*10 + Wavelength*10*np.random.rand()
+    for u in range(num_users):
+        elevation_angle = 0#np.random.uniform(-np.pi, np.pi)
+        if type == 'u':
+            azimuth_angle = np.random.uniform(0, 1.87*np.pi)
+            dis = Wavelength*15 
+        else:
+            azimuth_angle = np.random.uniform(1/9*np.pi, np.pi*15/8)
+            dis = Wavelength*10 + Wavelength*10*np.random.rand()
 
-    x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)
-    y1 = dis * np.cos(elevation_angle) * np.sin(azimuth_angle)
-    z1 = dis * np.sin(elevation_angle) #+ 80*Wavelength
+        x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)
+        y1 = dis * np.cos(elevation_angle) * np.sin(azimuth_angle)
+        z1 = dis * np.sin(elevation_angle) #+ 80*Wavelength
 
-    location_user[0, :] = np.array([x1, y1, z1])
+        location_user[u, :] = np.array([x1, y1, z1])
 
 
     return location_user
@@ -615,32 +616,41 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
         
         H_direct = pathloss_direct * (a_rx_direct @ a_tx_direct.T.conj())
     
-    # --- Scattered Path Channel: TX to Scatterer to RX ---
+    # --- Scattered Path Channel: TX to Scatterer(s) to RX ---
     if scatter_location is not None:
-        d_tx_scatter = np.linalg.norm(scatter_location - tx_location)
-        d_scatter_rx = np.linalg.norm(rx_location - scatter_location)
+        # Handle both single scatterer (1D array) and multiple scatterers (2D array)
+        scatter_location = np.atleast_2d(scatter_location)
+        num_scatterers = scatter_location.shape[0]
         
-        # TX to scatterer angles
-        azimuth_tx_scatter = np.arctan2(scatter_location[1] - tx_location[1],
-                                        scatter_location[0] - tx_location[0])
-        elevation_tx_scatter = np.arcsin((scatter_location[2] - tx_location[2]) / (d_tx_scatter + 1e-8))
+        H_scatter = np.zeros((N_rx, N_tx), dtype=complex)
         
-        # Scatterer to RX angles
-        azimuth_scatter_rx = np.arctan2(rx_location[1] - scatter_location[1],
-                                        rx_location[0] - scatter_location[0])
-        elevation_scatter_rx = np.arcsin((rx_location[2] - scatter_location[2]) / (d_scatter_rx + 1e-8))
-        
-        # Steering vectors for scattered path
-        a_tx_scatter = generate_upa_steering_vector(N_tx_h, N_tx_v, azimuth_tx_scatter,
-                                                    elevation_tx_scatter, wavelength)[:, np.newaxis]
-        a_rx_scatter = generate_upa_steering_vector(N_rx_h, N_rx_v, azimuth_scatter_rx,
-                                                    elevation_scatter_rx, wavelength)[:, np.newaxis]
-        
-        # Scattered path channel with pathloss
-        pathloss_scatter_db = path_loss_r(d_tx_scatter, wavelength, d_scatter_rx, type='backscatter')
-        pathloss_scatter = np.sqrt(10 ** ((-pathloss_scatter_db) / 10))
-        
-        H_scatter = pathloss_scatter * (a_rx_scatter @ a_tx_scatter.T.conj())
+        for s in range(num_scatterers):
+            scatter_loc = scatter_location[s, :]
+            
+            d_tx_scatter = np.linalg.norm(scatter_loc - tx_location)
+            d_scatter_rx = np.linalg.norm(rx_location - scatter_loc)
+            
+            # TX to scatterer angles
+            azimuth_tx_scatter = np.arctan2(scatter_loc[1] - tx_location[1],
+                                            scatter_loc[0] - tx_location[0])
+            elevation_tx_scatter = np.arcsin((scatter_loc[2] - tx_location[2]) / (d_tx_scatter + 1e-8))
+            
+            # Scatterer to RX angles
+            azimuth_scatter_rx = np.arctan2(rx_location[1] - scatter_loc[1],
+                                            rx_location[0] - scatter_loc[0])
+            elevation_scatter_rx = np.arcsin((rx_location[2] - scatter_loc[2]) / (d_scatter_rx + 1e-8))
+            
+            # Steering vectors for scattered path
+            a_tx_scatter = generate_upa_steering_vector(N_tx_h, N_tx_v, azimuth_tx_scatter,
+                                                        elevation_tx_scatter, wavelength)[:, np.newaxis]
+            a_rx_scatter = generate_upa_steering_vector(N_rx_h, N_rx_v, azimuth_scatter_rx,
+                                                        elevation_scatter_rx, wavelength)[:, np.newaxis]
+            
+            # Scattered path channel with pathloss
+            pathloss_scatter_db = path_loss_r(d_tx_scatter, wavelength, d_scatter_rx, type='backscatter')
+            pathloss_scatter = np.sqrt(10 ** ((-pathloss_scatter_db) / 10))
+            
+            H_scatter += pathloss_scatter * (a_rx_scatter @ a_tx_scatter.T.conj())
     else:
         H_scatter = np.zeros((N_rx, N_tx), dtype=complex)
     
