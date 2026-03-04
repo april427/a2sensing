@@ -120,7 +120,7 @@ class LSTM_Cell(tf.keras.layers.Layer):
 # System Configuration
 #####################################################
 
-drive_save_path = 'Bi_mimo_sinr'
+drive_save_path = 'Mo_mimo_sinr'
 os.makedirs(drive_save_path, exist_ok=True)
 
 # System parameters
@@ -145,9 +145,9 @@ Rician_factor = args.rician_factor
 location_bd = None
 
 # Sensing parameters
-tau = 16  # Pilot length (also number of BD interactions)
-K = 5  # Number of OFDM symbols per BD state
-snr_const = 10
+tau = args.tau  # Pilot length (also number of BD interactions)
+K = getattr(args, "N_symbols", 5)  # Number of OFDM symbols per BD state
+snr_const = args.snr
 snr_const = np.array([snr_const])
 ref_dis = 15*Wavelength
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
@@ -196,7 +196,7 @@ for i in range(tau):
 #####################################################
 #  
 initial_run = 1
-n_epochs = 1
+n_epochs = args.n_epochs
 learning_rate = 5e-4
 batch_per_epoch = 128
 batch_size_order = 4
@@ -208,17 +208,15 @@ he_init = tf.variance_scaling_initializer()
 
 # Placeholders
 loc_input = tf.placeholder(tf.float32, shape=(None, 3, num_users), name="loc_input")
-scatter_loc_input = tf.placeholder(tf.float32, shape=(None, 3, num_scatters), name="scatter_loc_input")
 H_d_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_d")
 H_b_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_b")
 H_r_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_r")
-s_placeholder = tf.placeholder(tf.complex64, shape=(None, 1, num_subcarriers), name="ambient_signal")
 
 ##################### ACTIVE SENSING NETWORK #####################
 
 with tf.name_scope("system_parameters"):
     lay = {}
-    lay['P'] = tf.constant(1.0)
+    lay['P'] = tf.placeholder_with_default(tf.constant(1.0, dtype=tf.float32), shape=(), name="tx_power")
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
@@ -451,49 +449,30 @@ with tf.name_scope("optimal_beamformer"):
     sinr_scatter_opt = scatter_sig_opt / (scatter_int_opt + noise_var + 1e-10)
     
 with tf.name_scope("sp_beamformer"):
-    # In the frequency domain filter out the BD signal since it induces a frequency shift, then calculate beamformer
-    # H_eff_list = []
-    # for t in range(tau):
-    #     H_eff_t = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-    #     noise_complex = tf.complex(
-    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
-    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
-    #     )
-    #     H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
-    #     H_eff_list.append(H_eff_t)
-    #     H_eff_t = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-    #     noise_complex = tf.complex(
-    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim),
-    #         tf.random_normal(tf.shape(H_eff_t), mean=0.0, stddev=noiseSTD_per_dim)
-    #     )
-    #     H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff_t + noise_complex
-    #     H_eff_list.append(H_eff_t)
-    # H_stacked = tf.stack(H_eff_list, axis=1)
-    # H_transposed = tf.transpose(H_stacked, perm=[0, 2, 3, 1])  # (batch, N_rx, N_tx, tau*2)
-    # H_fft = tf.signal.fft(tf.cast(H_transposed, tf.complex64))
-    # H_dc = H_fft[:, :, :, 0]
+    # Signal processing baseline from noisy pilot measurements.
+    s_pilot_tf = tf.constant(s_pilot, dtype=tf.complex64)
+    s_pilot_h = tf.linalg.adjoint(s_pilot_tf)
+    sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
+    normalizer = tf.cast(tau, tf.complex64) * sqrt_p
 
-    # H_bd_freq = H_fft[:, :, :, tau]
-    # H_int_estimated = H_dc / tf.cast(2*tau, tf.complex64)
-    # H_bd_estimated = 2*H_bd_freq / tf.cast(2*tau, tf.complex64)
-
-    #### Signal Processing Approach
     H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-    Y_0 = tf.matmul(H_eff0, s_pilot)  # (batch, N_rx, tau)
-    noise_complex = tf.complex(
-        tf.random_normal(tf.shape(H_eff0), mean=0.0, stddev=noiseSTD_per_dim),
-        tf.random_normal(tf.shape(H_eff0), mean=0.0, stddev=noiseSTD_per_dim)
+    Y_0_clean = tf.matmul(H_eff0, s_pilot_tf)  # (batch, N_rx, tau)
+    noise_0 = tf.complex(
+        tf.random_normal(tf.shape(Y_0_clean), mean=0.0, stddev=noiseSTD_per_dim),
+        tf.random_normal(tf.shape(Y_0_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
-    H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff0 + noise_complex
-    H_eff_hat = tf.matmul(Y_0, tf.linalg.adjoint(s_pilot))  # (batch, N_rx, N_tx)
+    Y_0 = sqrt_p * Y_0_clean + noise_0
+    H_eff_hat = tf.matmul(Y_0, s_pilot_h) / (normalizer + 1e-10)  # (batch, N_rx, N_tx)
+
     H_eff1 = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
-    Y_1 = tf.matmul(H_eff1, s_pilot)  # (batch, N_rx, tau)
-    noise_complex = tf.complex(
-        tf.random_normal(tf.shape(H_eff1), mean=0.0, stddev=noiseSTD_per_dim),
-        tf.random_normal(tf.shape(H_eff1), mean=0.0, stddev=noiseSTD_per_dim)
+    Y_1_clean = tf.matmul(H_eff1, s_pilot_tf)  # (batch, N_rx, tau)
+    noise_1 = tf.complex(
+        tf.random_normal(tf.shape(Y_1_clean), mean=0.0, stddev=noiseSTD_per_dim),
+        tf.random_normal(tf.shape(Y_1_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
-    H_eff_t = tf.complex(tf.sqrt(lay['P']), 0.0) * H_eff1 + noise_complex
-    H_eff_hat1 = tf.matmul(Y_1, tf.linalg.adjoint(s_pilot))  # (batch, N_rx, N_tx)
+    Y_1 = sqrt_p * Y_1_clean + noise_1
+    H_eff_hat1 = tf.matmul(Y_1, s_pilot_h) / (normalizer + 1e-10)  # (batch, N_rx, N_tx)
+
     H_int_estimated = (H_eff_hat + H_eff_hat1) / tf.cast(2, tf.complex64)
     H_bd_estimated = (H_eff_hat1 - H_eff_hat) / tf.cast(2, tf.complex64)
 
@@ -516,8 +495,8 @@ with tf.name_scope("sp_beamformer"):
     
     sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
 
-    #### Beam Sweeping Approach
-    tiled_s_pilot = tf.tile(tf.reshape(s_pilot, [1, N_tx, tau]), [tf.shape(H_b_placeholder)[0], 1, 1])  # (batch, N_tx, tau)
+    # Oracle beam sweeping baseline (uses true channels).
+    tiled_s_pilot = tf.tile(tf.reshape(s_pilot_tf, [1, N_tx, tau]), [tf.shape(H_b_placeholder)[0], 1, 1])  # (batch, N_tx, tau)
     nomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_b_placeholder), tiled_s_pilot)        # (batch, tau, tau)
     denomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_interference), tiled_s_pilot)       # (batch, tau, tau)
     sinr_ratio = tf.abs(nomi) ** 2 / (tf.abs(denomi) ** 2 + noise_var + 1e-10)                            # (batch, tau, tau)
@@ -531,7 +510,7 @@ with tf.name_scope("sp_beamformer"):
     best_beam_col = tf.math.floormod(best_beam_index, tau)  # for w_sweep
 
     # Build codebook as (batch, tau, N), so selecting one beam returns length-N vector
-    pilot_bank_tx = tf.tile(tf.expand_dims(tf.transpose(s_pilot), axis=0), [batch_size_sweep, 1, 1])  # (batch, tau, N_tx)
+    pilot_bank_tx = tf.tile(tf.expand_dims(tf.transpose(s_pilot_tf), axis=0), [batch_size_sweep, 1, 1])  # (batch, tau, N_tx)
     pilot_bank_rx = pilot_bank_tx  # N_rx == N_tx in current config
 
     batch_indices = tf.range(batch_size_sweep, dtype=tf.int32)
@@ -668,21 +647,12 @@ H_b_val = np.array(H_b_val_list)
 H_d_val = np.array(H_d_val_list)  # Use ALL per-sample direct channels
 H_r_val = np.array(H_r_val_list)  # Use ALL per-sample scatter channels
 
-# QPSK ambient signal
-qpsk_symbols = np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j]) / np.sqrt(2)
-s_signal_val = qpsk_symbols[np.random.randint(0, 4, size=(val_size_order * 32, 1, num_subcarriers))]
-
-# Prepare batch-sized channel matrices
-H_d_val_batch = H_d_val  # Already (num_val_samples, N_rx, N_tx)
-H_r_val_batch = H_r_val  # Already (num_val_samples, N_rx, N_tx)
-
 feed_dict_val = {
     loc_input: np.array(set_location_user_val),
     lay['P']: Pvec[0],
-    H_d_placeholder: H_d_val_batch,
+    H_d_placeholder: H_d_val,
     H_b_placeholder: H_b_val,
-    H_r_placeholder: H_r_val_batch,
-    s_placeholder: s_signal_val
+    H_r_placeholder: H_r_val
 }
 
 
@@ -696,11 +666,13 @@ print("=" * 60)
 print(f"N_tx: {N_tx}, N_rx: {N_rx}, tau: {tau}, K: {K}, SNR: {snr_const[0]} dB")
 print("=" * 60 + "\n")
 
+model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}'
+
 with tf.Session() as sess:
     if initial_run == 1:
         init.run()
     else:
-        saver.restore(sess, f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}')
+        saver.restore(sess, model_ckpt)
     
     # Early stopping
     best_val = 1e9
@@ -711,9 +683,6 @@ with tf.Session() as sess:
         batch_iter = 0
         epoch_train_losses = []
         epoch_sinr_values = []
-        
-        # QPSK ambient signal
-        s_signal = qpsk_symbols[np.random.randint(0, 4, size=(batch_size_order * 32, 1, num_subcarriers))]
         
         for rnd_indices in range(batch_per_epoch):
             # Generate training batch
@@ -759,8 +728,7 @@ with tf.Session() as sess:
                 lay['P']: Pvec[0],
                 H_d_placeholder: H_d_train_batch,
                 H_b_placeholder: H_b_train,
-                H_r_placeholder: H_r_train_batch,
-                s_placeholder: s_signal
+                H_r_placeholder: H_r_train_batch
             }
             
             _, train_loss, sinr_values, sinr_scatter_values = sess.run(
@@ -806,10 +774,10 @@ with tf.Session() as sess:
         print()
         
         # Early stopping
-        if loss_val < best_val - 1e-9:
+        if loss_val < best_val - 1e-8:
             best_val = loss_val
             wait = 0
-            saver.save(sess, f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}')
+            saver.save(sess, model_ckpt)
             with open(os.path.join(drive_save_path, "best_val_loss.txt"), "w") as f:
                 f.write(str(best_val))
         else:
@@ -865,16 +833,13 @@ with tf.Session() as sess:
 
     H_d_test_batch = H_d_test
     H_r_test_batch = H_r_test
-    
-    s_signal_test = qpsk_symbols[np.random.randint(0, 4, size=(test_size, 1, num_subcarriers))]
-    
+
     feed_dict_test = {
         loc_input: np.array(set_location_user_test),
         lay['P']: Pvec[0],
         H_d_placeholder: H_d_test_batch,
         H_b_placeholder: H_b_test,
-        H_r_placeholder: H_r_test_batch,
-        s_placeholder: s_signal_test
+        H_r_placeholder: H_r_test_batch
     }
     
     sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(

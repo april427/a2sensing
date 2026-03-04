@@ -11,6 +11,7 @@ BD_2beamsInit/
 BD_2bDNN/
 
 Bi_mimo_sinr/
+Mo_mimo_sinr/
 
 *.ipynb
 plots.py 

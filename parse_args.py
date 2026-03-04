@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument('--rician_factor', type=float, default=5.0, help='Rician factor')
     parser.add_argument('--fc', type=float, default=2400000000.0, help='Carrier frequency in Hz')
     parser.add_argument('--N_scatterers', type=int, default=1, help='Number of scatterers')
+    parser.add_argument('--N_symbols', type=int, default=1, help='Number of symbols of one sample')
 
     args, unknown = parser.parse_known_args(filtered_argv[1:])
     return args
