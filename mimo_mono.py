@@ -1065,16 +1065,20 @@ num_scatterers_vis = scatter_loc_vis.shape[0]
 N_tx_h = N_tx  # Treat as horizontal array for azimuth-only pattern
 N_rx_h = N_rx
 
+def fold_ula_azimuth(angle_rad):
+    """Fold azimuth angle(s) into ULA-equivalent sector [0, pi)."""
+    return np.mod(angle_rad, np.pi)
+
 # Function to compute 2D beam pattern (azimuth only, elevation = 0)
 def compute_beam_pattern_2d(beamformer, N_h, num_points=360):
-    """Compute 2D beam pattern for azimuth angle only (elevation = 0)
+    """Compute 2D beam pattern for azimuth in [0, pi] (elevation = 0)
     
     For elevation = 0:
     - cos(el) = 1, sin(el) = 0
     - steering_vector = exp(1j * pi * i * sin(az))
     This simplifies to a ULA pattern in azimuth.
     """
-    azimuth = np.linspace(-np.pi, np.pi, num_points)
+    azimuth = np.linspace(0.0, np.pi, num_points)
     
     pattern = np.zeros(num_points, dtype=np.float64)
     bf = beamformer.flatten()
@@ -1106,15 +1110,15 @@ az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_
 az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, num_points=360)
 az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, num_points=360)
 
-# Calculate target directions (azimuth only)
-bd_azimuth = np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0])
+# Calculate target directions and fold to ULA-equivalent azimuth sector [0, pi)
+bd_azimuth = fold_ula_azimuth(np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0]))
 
 # Calculate azimuth for each scatterer
 scatter_azimuths = []
 for s in range(num_scatterers_vis):
     scatter_az = np.arctan2(scatter_loc_vis[s, 1] - location_tx[1], scatter_loc_vis[s, 0] - location_tx[0])
     scatter_azimuths.append(scatter_az)
-scatter_azimuths = np.array(scatter_azimuths)
+scatter_azimuths = fold_ula_azimuth(np.array(scatter_azimuths))
 
 # Create figure with 2 rows, 3 columns
 fig = plt.figure(figsize=(18, 12))
@@ -1211,6 +1215,8 @@ ax2.set_title('Learned Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax2.set_theta_zero_location('E')  # 0° at East (positive X)
 ax2.set_theta_direction(1)  # Counter-clockwise
+ax2.set_thetamin(0)
+ax2.set_thetamax(180)
 ax2.set_ylim([0, 1])
 
 # ===== Row 1, Col 3: Polar Plot - Learned Rx Beam =====
@@ -1228,6 +1234,8 @@ ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax3.set_theta_zero_location('E')
 ax3.set_theta_direction(1)
+ax3.set_thetamin(0)
+ax3.set_thetamax(180)
 ax3.set_ylim([0, 1])
 
 # ===== ROW 2: OPTIMAL BEAMFORMERS =====
@@ -1254,7 +1262,7 @@ for s in range(num_scatterers_vis):
 ax4.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
 ax4.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
 ax4.set_title('Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
-ax4.set_xlim([-180, 180])
+ax4.set_xlim([0, 180])
 ax4.set_ylim([-30, 5])
 ax4.grid(True, alpha=0.3, linestyle='--')
 ax4.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
@@ -1277,6 +1285,8 @@ ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax5.set_theta_zero_location('E')
 ax5.set_theta_direction(1)
+ax5.set_thetamin(0)
+ax5.set_thetamax(180)
 ax5.set_ylim([0, 1])
 
 # ===== Row 2, Col 3: Polar Plot - Optimal Rx Beam =====
@@ -1294,6 +1304,8 @@ ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 ax6.set_theta_zero_location('E')
 ax6.set_theta_direction(1)
+ax6.set_thetamin(0)
+ax6.set_thetamax(180)
 ax6.set_ylim([0, 1])
 
 plt.tight_layout()
