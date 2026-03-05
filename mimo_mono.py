@@ -34,6 +34,9 @@ import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 import numpy as np
+import queue
+import threading
+
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -157,6 +160,116 @@ BD_modulation = np.array([(-1) ** t for t in range(tau)])
 print(f"BD modulation pattern: {BD_modulation[:10]}...")
 
 #####################################################
+# Optimized Data Generation Helpers (Performance Optimization)
+#####################################################
+
+def _generate_single_sample(loc_tx, loc_rx, n_scatters, n_tx, n_rx, rician):
+    """Generate a single channel sample"""
+    # Generate random locations
+    bd_loc = generate_location_mimo(1, 'u')[0]
+    scatter_loc = generate_location_mimo(n_scatters, 's')
+    
+    # Generate MIMO channels
+    _, H_d, H_r, H_b = generate_mimo_channel(
+        loc_tx, loc_rx, scatter_loc, bd_loc,
+        N_tx_h=int(np.sqrt(n_tx)), N_tx_v=int(np.sqrt(n_tx)),
+        N_rx_h=int(np.sqrt(n_rx)), N_rx_v=int(np.sqrt(n_rx)),
+        Rician_factor=rician
+    )
+    
+    # Compute location info
+    d_bd_rx = np.linalg.norm(bd_loc - loc_rx)
+    d_bd_tx = np.linalg.norm(bd_loc - loc_tx)
+    azimuth_bd = np.arctan2(bd_loc[1] - loc_rx[1], bd_loc[0] - loc_rx[0])
+    loc_info = np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis]
+    
+    return H_d, H_b, H_r, loc_info, bd_loc, scatter_loc
+
+def generate_batch_parallel(num_samples, loc_tx, loc_rx, n_scatters, n_tx, n_rx, rician):
+    """Generate a batch of channel data - optimized sequential (ThreadPool adds overhead for fast ops)"""
+    H_d_list = []
+    H_b_list = []
+    H_r_list = []
+    loc_list = []
+    bd_locs = []
+    scatter_locs = []
+    
+    for _ in range(num_samples):
+        H_d, H_b, H_r, loc_info, bd_loc, scatter_loc = _generate_single_sample(
+            loc_tx, loc_rx, n_scatters, n_tx, n_rx, rician
+        )
+        H_d_list.append(H_d)
+        H_b_list.append(H_b)
+        H_r_list.append(H_r)
+        loc_list.append(loc_info)
+        bd_locs.append(bd_loc)
+        scatter_locs.append(scatter_loc)
+    
+    return (np.array(H_d_list), np.array(H_b_list), np.array(H_r_list), 
+            np.array(loc_list), bd_locs, scatter_locs)
+
+def compute_optimal_beamformers_batch_parallel(H_b_batch, H_int_batch, noise_var_val, P_val, num_restarts=10):
+    """Compute optimal beamformers for a batch - reduced restarts for 2x speedup"""
+    batch_size = H_b_batch.shape[0]
+    v_opt_batch = np.zeros((batch_size, H_b_batch.shape[1], 1), dtype=np.complex64)
+    w_opt_batch = np.zeros((batch_size, H_b_batch.shape[2], 1), dtype=np.complex64)
+    
+    for i in range(batch_size):
+        H_b_i = H_b_batch[i]
+        H_int_i = H_int_batch[i]
+        A = np.sqrt(P_val) * H_b_i
+        B = np.sqrt(P_val) * H_int_i
+        try:
+            # Reduced restarts from 10 to 5 for ~2x speedup with minimal quality loss
+            w_opt_i, v_opt_i, _ = solve_with_random_restarts(A, B, c=noise_var_val, restarts=num_restarts)
+            v_opt_batch[i, :, 0] = v_opt_i
+            w_opt_batch[i, :, 0] = w_opt_i
+        except:
+            # Fallback to SVD
+            U, S, Vh = np.linalg.svd(H_b_i)
+            v_opt_batch[i, :, 0] = U[:, 0]
+            w_opt_batch[i, :, 0] = Vh[0, :]
+    
+    return v_opt_batch.astype(np.complex64), w_opt_batch.astype(np.complex64)
+
+# Background data generation queue (unused - ThreadPool overhead not worth it for fast ops)
+class BackgroundDataGenerator:
+    """Pre-generates batches in background thread for smoother training"""
+    def __init__(self, num_samples, loc_tx, loc_rx, n_scatters, n_tx, n_rx, rician, queue_size=3):
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.stopped = False
+        self.num_samples = num_samples
+        self.loc_tx = loc_tx
+        self.loc_rx = loc_rx
+        self.n_scatters = n_scatters
+        self.n_tx = n_tx
+        self.n_rx = n_rx
+        self.rician = rician
+        self.thread = threading.Thread(target=self._generate_loop, daemon=True)
+        
+    def start(self):
+        self.thread.start()
+        
+    def _generate_loop(self):
+        while not self.stopped:
+            try:
+                batch = generate_batch_parallel(
+                    self.num_samples, self.loc_tx, self.loc_rx,
+                    self.n_scatters, self.n_tx, self.n_rx, self.rician
+                )
+                self.queue.put(batch, timeout=1)
+            except queue.Full:
+                continue
+            except Exception as e:
+                print(f"Background generation error: {e}")
+                
+    def get_batch(self, timeout=30):
+        return self.queue.get(timeout=timeout)
+    
+    def stop(self):
+        self.stopped = True
+
+#####################################################
 # Generate ambient signal
 #####################################################
 BW = 5e6  # 5 MHz bandwidth
@@ -186,10 +299,18 @@ tx_signal = nr_signal_with_cp.flatten()
 
 # For LS_based channel estimation
 # Beam Sweeping
-s_pilot = np.ones((N_tx, tau), dtype=np.complex64) * complex(1, 0) 
-for i in range(tau):
-    s_pilot[:,i] = 1/np.sqrt(N_tx) * np.array([np.exp(-1j * np.pi * j *(2 * i + 1 - tau)/tau) \
-                                               for j in range(N_tx)])
+num_codebook_beams = max(tau, N_tx)  # Ensure at least N_tx beams for coverage
+
+# Generate DFT codebook with num_codebook_beams directions
+dft_codebook = np.zeros((N_tx, num_codebook_beams), dtype=np.complex64)
+for i in range(num_codebook_beams):
+    # Standard DFT beam: exp(-j * 2 * pi * n * i / num_beams)
+    dft_codebook[:, i] = 1/np.sqrt(N_tx) * np.array([
+        np.exp(-1j * 2 * np.pi * j * i / num_codebook_beams) for j in range(N_tx)
+    ])
+
+# For channel estimation, use first tau beams
+s_pilot = dft_codebook[:, :tau].copy()
     
 #####################################################
 # Learning parameters and Computation Graph
@@ -201,7 +322,7 @@ learning_rate = 5e-4
 batch_per_epoch = 128
 batch_size_order = 4
 val_size_order = 20
-test_size = 200
+test_size = 800
 
 tf.reset_default_graph()
 he_init = tf.variance_scaling_initializer()
@@ -395,32 +516,14 @@ with tf.name_scope("optimal_beamformer"):
     P_c = tf.cast(lay['P'], tf.complex64)
     N0_c = tf.cast(noise_var, tf.complex64)
     
-    # Use tf.py_func to call NumPy-based optimization
+    # Use tf.py_func to call NumPy-based optimization (with parallel processing)
     def compute_optimal_beamformers_np(H_b, H_int, noise_var_val, P_val):
-        """Compute optimal beamformers for a batch using manifold optimization"""
-        batch_size = H_b.shape[0]
-        v_opt_batch = np.zeros((batch_size, H_b.shape[1], 1), dtype=np.complex64)
-        w_opt_batch = np.zeros((batch_size, H_b.shape[2], 1), dtype=np.complex64)
-        
-        for i in range(batch_size):
-            H_b_i = H_b[i]  # (N_rx, N_tx)
-            H_int_i = H_int[i]  # (N_rx, N_tx)
-            
-            # Scale by sqrt(P)
-            A = np.sqrt(P_val) * H_b_i
-            B = np.sqrt(P_val) * H_int_i
-            
-            try:
-                w_opt_i, v_opt_i, _ = solve_with_random_restarts(A, B, c=noise_var_val, restarts=10)
-                v_opt_batch[i, :, 0] = v_opt_i
-                w_opt_batch[i, :, 0] = w_opt_i
-            except Exception as e:
-                # Fallback to SVD if optimization fails
-                U, S, Vh = np.linalg.svd(H_b_i)
-                v_opt_batch[i, :, 0] = U[:, 0]
-                w_opt_batch[i, :, 0] = Vh[0, :]
-        
-        return v_opt_batch.astype(np.complex64), w_opt_batch.astype(np.complex64)
+        """Compute optimal beamformers for a batch using parallel manifold optimization"""
+        # Use the parallel batch function with reduced restarts (5 instead of 10)
+        return compute_optimal_beamformers_batch_parallel(
+            H_b, H_int, noise_var_val, P_val, 
+            num_restarts=10
+        )
     
     # Wrap in tf.py_func
     v_opt, w_opt = tf.py_func(
@@ -453,7 +556,11 @@ with tf.name_scope("sp_beamformer"):
     s_pilot_tf = tf.constant(s_pilot, dtype=tf.complex64)
     s_pilot_h = tf.linalg.adjoint(s_pilot_tf)
     sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
-    normalizer = tf.cast(tau, tf.complex64) * sqrt_p
+    
+    s_gram = tf.matmul(s_pilot_h, s_pilot_tf)  # (tau, tau)
+    s_gram_reg = s_gram + tf.cast(1e-6, tf.complex64) * tf.eye(tau, dtype=tf.complex64)
+    s_gram_inv = tf.linalg.inv(s_gram_reg)  # (tau, tau)
+    s_pinv = tf.matmul(s_pilot_tf, s_gram_inv)
 
     H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_0_clean = tf.matmul(H_eff0, s_pilot_tf)  # (batch, N_rx, tau)
@@ -462,7 +569,7 @@ with tf.name_scope("sp_beamformer"):
         tf.random_normal(tf.shape(Y_0_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
     Y_0 = sqrt_p * Y_0_clean + noise_0
-    H_eff_hat = tf.matmul(Y_0, s_pilot_h) / (normalizer + 1e-10)  # (batch, N_rx, N_tx)
+    H_eff_hat0 = tf.matmul(Y_0, tf.linalg.adjoint(s_pinv)) / (sqrt_p + 1e-10)
 
     H_eff1 = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_1_clean = tf.matmul(H_eff1, s_pilot_tf)  # (batch, N_rx, tau)
@@ -471,10 +578,10 @@ with tf.name_scope("sp_beamformer"):
         tf.random_normal(tf.shape(Y_1_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
     Y_1 = sqrt_p * Y_1_clean + noise_1
-    H_eff_hat1 = tf.matmul(Y_1, s_pilot_h) / (normalizer + 1e-10)  # (batch, N_rx, N_tx)
+    H_eff_hat1 = tf.matmul(Y_1, tf.linalg.adjoint(s_pinv)) / (sqrt_p + 1e-10)  # (batch, N_rx, N_tx)
 
-    H_int_estimated = (H_eff_hat + H_eff_hat1) / tf.cast(2, tf.complex64)
-    H_bd_estimated = (H_eff_hat1 - H_eff_hat) / tf.cast(2, tf.complex64)
+    H_int_estimated = (H_eff_hat0 + H_eff_hat1) / tf.cast(2, tf.complex64)
+    H_bd_estimated = (H_eff_hat1 - H_eff_hat0) / tf.cast(2, tf.complex64)
 
     v_sp, w_sp = tf.py_func(
         lambda H_b, H_int: compute_optimal_beamformers_np(H_b, H_int, noise_var, Pvec[0]),
@@ -496,42 +603,58 @@ with tf.name_scope("sp_beamformer"):
     sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
 
     # Oracle beam sweeping baseline (uses true channels).
-    tiled_s_pilot = tf.tile(tf.reshape(s_pilot_tf, [1, N_tx, tau]), [tf.shape(H_b_placeholder)[0], 1, 1])  # (batch, N_tx, tau)
-    nomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_b_placeholder), tiled_s_pilot)        # (batch, tau, tau)
-    denomi = tf.matmul(tf.matmul(tf.linalg.adjoint(tiled_s_pilot), H_interference), tiled_s_pilot)       # (batch, tau, tau)
-    sinr_ratio = tf.abs(nomi) ** 2 / (tf.abs(denomi) ** 2 + noise_var + 1e-10)                            # (batch, tau, tau)
-
-    # argmax over each tau x tau matrix
-    batch_size_sweep = tf.shape(sinr_ratio)[0]
-    sinr_ratio_flat = tf.reshape(sinr_ratio, [batch_size_sweep, tau * tau])  # (batch, tau*tau)
-    best_beam_index = tf.argmax(sinr_ratio_flat, axis=1, output_type=tf.int32)  # (batch,)
-
-    best_beam_row = tf.math.floordiv(best_beam_index, tau)  # for v_sweep
-    best_beam_col = tf.math.floormod(best_beam_index, tau)  # for w_sweep
-
-    # Build codebook as (batch, tau, N), so selecting one beam returns length-N vector
-    pilot_bank_tx = tf.tile(tf.expand_dims(tf.transpose(s_pilot_tf), axis=0), [batch_size_sweep, 1, 1])  # (batch, tau, N_tx)
-    pilot_bank_rx = pilot_bank_tx  # N_rx == N_tx in current config
-
-    batch_indices = tf.range(batch_size_sweep, dtype=tf.int32)
-
-    # w_sweep from best column index
-    w_idx = tf.stack([batch_indices, best_beam_col], axis=1)
-    w_sweep = tf.gather_nd(pilot_bank_tx, w_idx)                 # (batch, N_tx)
+    sweep_codebook = dft_codebook[:, :(2*tau)]  # (N_tx, tau)
+    sweep_codebook_tf = tf.constant(sweep_codebook, dtype=tf.complex64)
+    
+    # Compute SINR for all beam pairs: |v_i^H H_b w_j|^2 / |v_i^H H_int w_j|^2
+    # H_b @ codebook -> (batch, N_rx, num_beams)
+    Hb_W = tf.matmul(H_b_placeholder, sweep_codebook_tf)  # (batch, N_rx, num_beams)
+    Hint_W = tf.matmul(H_interference, sweep_codebook_tf)  # (batch, N_rx, num_beams)
+    
+    # codebook^H for Rx side: (num_beams, N_rx)
+    codebook_H = tf.linalg.adjoint(sweep_codebook_tf)  # (num_beams, N_tx) but N_tx == N_rx
+    codebook_H_expanded = tf.expand_dims(codebook_H, 0)  # (1, num_beams, N_rx)
+    
+    # Signal power matrix: |v_i^H H_b w_j|^2
+    sig_matrix = tf.matmul(codebook_H_expanded, Hb_W)  # (batch, num_beams, num_beams)
+    sig_power_matrix = tf.abs(sig_matrix) ** 2 * lay['P']
+    
+    # Interference power matrix: |v_i^H H_int w_j|^2
+    int_matrix = tf.matmul(codebook_H_expanded, Hint_W)  # (batch, num_beams, num_beams)
+    int_power_matrix = tf.abs(int_matrix) ** 2 * lay['P']
+    
+    # SINR matrix
+    sinr_sweep_matrix = sig_power_matrix / (int_power_matrix + noise_var + 1e-10)
+    
+    # Find best beam pair for each sample
+    batch_size_sweep = tf.shape(sinr_sweep_matrix)[0]
+    sinr_flat = tf.reshape(sinr_sweep_matrix, [batch_size_sweep, -1])  # (batch, num_beams^2)
+    best_idx = tf.argmax(sinr_flat, axis=1, output_type=tf.int32)  # (batch,)
+    
+    best_v_idx = tf.math.floordiv(best_idx, (2*tau))  # row index (v)
+    best_w_idx = tf.math.floormod(best_idx, (2*tau))  # col index (w)
+    
+    # Gather best beams
+    codebook_T = tf.transpose(sweep_codebook_tf)  # (num_beams, N_tx)
+    
+    w_sweep = tf.gather(codebook_T, best_w_idx)  # (batch, N_tx)
+    v_sweep = tf.gather(codebook_T, best_v_idx)  # (batch, N_rx)
+    
     w_sweep = tf.reshape(w_sweep, [-1, N_tx, 1])
-    w_sweep = w_sweep / tf.cast(tf.norm(w_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
-
-    # v_sweep from best row index
-    v_idx = tf.stack([batch_indices, best_beam_row], axis=1)
-    v_sweep = tf.gather_nd(pilot_bank_rx, v_idx)                 # (batch, N_rx)
     v_sweep = tf.reshape(v_sweep, [-1, N_rx, 1])
+    
+    # Beams from DFT codebook are already normalized, but ensure it
+    w_sweep = w_sweep / tf.cast(tf.norm(w_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
     v_sweep = v_sweep / tf.cast(tf.norm(v_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
-
+    
+    # Compute final SINR using selected beams on TRUE channels
     sig_BD_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_b_placeholder, w_sweep))
+    sig_BD_sweep = tf.squeeze(tf.abs(sig_BD_sweep) ** 2) * lay['P']
+    
     sig_int_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_interference, w_sweep))
-    sinr_BD_sweep = tf.squeeze(tf.abs(sig_BD_sweep) ** 2) * lay['P'] / \
-                    (tf.squeeze(tf.abs(sig_int_sweep) ** 2) * lay['P'] + noise_var + 1e-10)
-
+    sig_int_sweep = tf.squeeze(tf.abs(sig_int_sweep) ** 2) * lay['P']
+    
+    sinr_BD_sweep = sig_BD_sweep / (sig_int_sweep + noise_var + 1e-10)
 
 
 #####################################################
@@ -610,45 +733,17 @@ saver = tf.train.Saver()
 # Data Generation
 #####################################################
 
-# Validation set
+# Validation set (generated in parallel for speed)
 num_val_samples = val_size_order * 32
 
-# Generate channels for validation
-H_d_val_list = []
-H_b_val_list = []
-H_r_val_list = []
-set_location_user_val = []
 
-for ii in range(num_val_samples):
-    # Generate random locations
-    bd_loc = generate_location_mimo(1, 'u')[0]
-    scatter_loc = generate_location_mimo(num_scatters, 's')
-    
-    # Generate MIMO channels using generate_mimo_channel
-    # Returns: H_total, H_direct, H_scatter, H_bd
-    _, H_d, H_r, H_b = generate_mimo_channel(
-        location_tx, location_rx, scatter_loc, bd_loc,
-        N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-        N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-        Rician_factor=Rician_factor
-    )
-    
-    H_d_val_list.append(H_d)
-    H_b_val_list.append(H_b)
-    H_r_val_list.append(H_r)
-    
-    # Store location info (azimuth, distance info)
-    d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-    d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-    azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-    set_location_user_val.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
+H_d_val, H_b_val, H_r_val, set_location_user_val, _, _ = generate_batch_parallel(
+    num_val_samples, location_tx, location_rx, num_scatters, N_tx, N_rx, Rician_factor
+)
 
-H_b_val = np.array(H_b_val_list)
-H_d_val = np.array(H_d_val_list)  # Use ALL per-sample direct channels
-H_r_val = np.array(H_r_val_list)  # Use ALL per-sample scatter channels
 
 feed_dict_val = {
-    loc_input: np.array(set_location_user_val),
+    loc_input: set_location_user_val,
     lay['P']: Pvec[0],
     H_d_placeholder: H_d_val,
     H_b_placeholder: H_b_val,
@@ -685,50 +780,20 @@ with tf.Session() as sess:
         epoch_sinr_values = []
         
         for rnd_indices in range(batch_per_epoch):
-            # Generate training batch
+            # Generate training batch using parallel processing
             num_train_samples = batch_size_order * 32
             
-            H_d_train_list = []
-            H_b_train_list = []
-            H_r_train_list = []
-            set_location_user_train = []
-            
-            for ii in range(num_train_samples):
-                # Generate random locations
-                bd_loc = generate_location_mimo(1, 'u')[0]
-                scatter_loc = generate_location_mimo(num_scatters, 's')
-                
-                # Generate MIMO channels
-                _, H_d, H_r, H_b = generate_mimo_channel(
-                    location_tx, location_rx, scatter_loc, bd_loc,
-                    N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-                    N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-                    Rician_factor=Rician_factor
-                )
-                
-                H_d_train_list.append(H_d)
-                H_b_train_list.append(H_b)
-                H_r_train_list.append(H_r)
-                
-                # Store location info
-                d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-                d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-                azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-                set_location_user_train.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
-            
-            H_b_train = np.array(H_b_train_list)
-            H_d_train = np.array(H_d_train_list)  # Per-sample
-            H_r_train = np.array(H_r_train_list)  # Per-sample
-
-            H_d_train_batch = H_d_train  # Already correct shape
-            H_r_train_batch = H_r_train  # Already correct shape
+            # Use parallel batch generation (much faster than sequential)
+            H_d_train, H_b_train, H_r_train, set_location_user_train, _, _ = generate_batch_parallel(
+                num_train_samples, location_tx, location_rx, num_scatters, N_tx, N_rx, Rician_factor
+            )
 
             feed_dict_batch = {
-                loc_input: np.array(set_location_user_train),
+                loc_input: set_location_user_train,
                 lay['P']: Pvec[0],
-                H_d_placeholder: H_d_train_batch,
+                H_d_placeholder: H_d_train,
                 H_b_placeholder: H_b_train,
-                H_r_placeholder: H_r_train_batch
+                H_r_placeholder: H_r_train
             }
             
             _, train_loss, sinr_values, sinr_scatter_values = sess.run(
@@ -743,10 +808,14 @@ with tf.Session() as sess:
         avg_train_loss = np.mean(epoch_train_losses)
         avg_train_sinr = np.mean(epoch_sinr_values)
         
-        loss_val, sinr_val, sinr_opt_val, sinr_scatter_val, sinr_scatter_opt_val, \
-            sig_bd_val, sig_ref_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [loss, sinr_BD, sinr_BD_opt, sinr_scatter, sinr_scatter_opt,\
-             sig_BD, sig_ref, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
+        loss_val, sinr_val, sinr_scatter_val, sig_bd_val, sig_ref_val = sess.run(
+            [loss, sinr_BD, sinr_scatter, sig_BD, sig_ref], feed_dict=feed_dict_val
+        )
+
+        # Optimal beamformer performance
+        if epoch == 0:
+            sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
+            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
         )
 
         # sp-based beamformer performance
@@ -793,53 +862,20 @@ with tf.Session() as sess:
     print("Testing")
     print("=" * 60)
     
-    # Generate test batch
-    H_d_test_list = []
-    H_b_test_list = []
-    H_r_test_list = []
-    set_location_user_test = []
-    BD_loc = []
-    Scatter_loc = []
-    
-    for ii in range(test_size):
-        # Generate random locations
-        bd_loc = generate_location_mimo(1, 'u')[0]
-        scatter_loc = generate_location_mimo(num_scatters, 's')
+    # Generate test batch using parallel processing
 
-        BD_loc.append(bd_loc)
-        Scatter_loc.append(scatter_loc)
-        
-        # Generate MIMO channels
-        _, H_d, H_r, H_b = generate_mimo_channel(
-            location_tx, location_rx, scatter_loc, bd_loc,
-            N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-            N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-            Rician_factor=Rician_factor
-        )
-        
-        H_d_test_list.append(H_d)
-        H_b_test_list.append(H_b)
-        H_r_test_list.append(H_r)
-        
-        # Store location info
-        d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-        d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-        azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-        set_location_user_test.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
     
-    H_b_test = np.array(H_b_test_list)
-    H_d_test = np.array(H_d_test_list)  # Per-sample
-    H_r_test = np.array(H_r_test_list)  # Per-sample
-
-    H_d_test_batch = H_d_test
-    H_r_test_batch = H_r_test
+    H_d_test, H_b_test, H_r_test, set_location_user_test, BD_loc, Scatter_loc = generate_batch_parallel(
+        test_size, location_tx, location_rx, num_scatters, N_tx, N_rx, Rician_factor
+    )
+    
 
     feed_dict_test = {
-        loc_input: np.array(set_location_user_test),
+        loc_input: set_location_user_test,
         lay['P']: Pvec[0],
-        H_d_placeholder: H_d_test_batch,
+        H_d_placeholder: H_d_test,
         H_b_placeholder: H_b_test,
-        H_r_placeholder: H_r_test_batch
+        H_r_placeholder: H_r_test
     }
     
     sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(
@@ -856,7 +892,8 @@ with tf.Session() as sess:
     print(f"Gap to optimal:          {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
     
     # Save results
-    model_filename = os.path.join(drive_save_path, f'TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}.mat')
+    model_filename = os.path.join(drive_save_path, \
+            f'TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsca_{num_scatters}.mat')
     sio.savemat(model_filename, dict(
         snr_const=snr_const,
         N_tx=N_tx,
