@@ -297,20 +297,24 @@ for t in range(num_ofdm_symbols):
 
 tx_signal = nr_signal_with_cp.flatten()
 
-# For LS_based channel estimation
-# Beam Sweeping
-num_codebook_beams = max(tau, N_tx)  # Ensure at least N_tx beams for coverage
+# For LS_based channel estimation and beam sweeping
+def dft_codebook(n, m):
+    """Create a unit-norm DFT codebook of shape (n, m)."""
+    dft_matrix = np.ones((n, m), dtype=np.complex64)
+    for i in range(m):
+        dft_matrix[:, i] = (1 / np.sqrt(n)) * np.array(
+            [np.exp(-1j * 2 * np.pi * j * i / m) for j in range(n)],
+            dtype=np.complex64
+        )
+    return dft_matrix
 
-# Generate DFT codebook with num_codebook_beams directions
-dft_codebook = np.zeros((N_tx, num_codebook_beams), dtype=np.complex64)
-for i in range(num_codebook_beams):
-    # Standard DFT beam: exp(-j * 2 * pi * n * i / num_beams)
-    dft_codebook[:, i] = 1/np.sqrt(N_tx) * np.array([
-        np.exp(-1j * 2 * np.pi * j * i / num_codebook_beams) for j in range(N_tx)
-    ])
+# Use an N_tx-point DFT and take the first tau columns as pilots.
+# This keeps pilot columns orthonormal when tau <= N_tx.
+pilot_codebook = dft_codebook(N_tx, max(N_tx, tau))
+s_pilot = pilot_codebook[:, :tau].copy()
 
-# For channel estimation, use first tau beams
-s_pilot = dft_codebook[:, :tau].copy()
+# Beam-sweeping codebook: ensure exactly 2*tau beams are available.
+sweep_codebook = dft_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].copy()
     
 #####################################################
 # Learning parameters and Computation Graph
@@ -554,13 +558,12 @@ with tf.name_scope("optimal_beamformer"):
 with tf.name_scope("sp_beamformer"):
     # Signal processing baseline from noisy pilot measurements.
     s_pilot_tf = tf.constant(s_pilot, dtype=tf.complex64)
-    s_pilot_h = tf.linalg.adjoint(s_pilot_tf)
-    sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
-    
+    s_pilot_h = tf.linalg.adjoint(s_pilot_tf)  # (tau, N_tx)
+    # Complex-safe LS pseudo-inverse: (S^H S + eps I)^(-1) S^H
     s_gram = tf.matmul(s_pilot_h, s_pilot_tf)  # (tau, tau)
     s_gram_reg = s_gram + tf.cast(1e-6, tf.complex64) * tf.eye(tau, dtype=tf.complex64)
-    s_gram_inv = tf.linalg.inv(s_gram_reg)  # (tau, tau)
-    s_pinv = tf.matmul(s_pilot_tf, s_gram_inv)
+    s_pilot_pinv = tf.linalg.solve(s_gram_reg, s_pilot_h)  # (tau, N_tx)
+    sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
 
     H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_0_clean = tf.matmul(H_eff0, s_pilot_tf)  # (batch, N_rx, tau)
@@ -569,7 +572,7 @@ with tf.name_scope("sp_beamformer"):
         tf.random_normal(tf.shape(Y_0_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
     Y_0 = sqrt_p * Y_0_clean + noise_0
-    H_eff_hat0 = tf.matmul(Y_0, tf.linalg.adjoint(s_pinv)) / (sqrt_p + 1e-10)
+    H_eff_hat0 = tf.matmul(Y_0, s_pilot_pinv) / (sqrt_p + 1e-10)
 
     H_eff1 = (1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_1_clean = tf.matmul(H_eff1, s_pilot_tf)  # (batch, N_rx, tau)
@@ -578,7 +581,7 @@ with tf.name_scope("sp_beamformer"):
         tf.random_normal(tf.shape(Y_1_clean), mean=0.0, stddev=noiseSTD_per_dim)
     )
     Y_1 = sqrt_p * Y_1_clean + noise_1
-    H_eff_hat1 = tf.matmul(Y_1, tf.linalg.adjoint(s_pinv)) / (sqrt_p + 1e-10)  # (batch, N_rx, N_tx)
+    H_eff_hat1 = tf.matmul(Y_1, s_pilot_pinv) / (sqrt_p + 1e-10)  # (batch, N_rx, N_tx)
 
     H_int_estimated = (H_eff_hat0 + H_eff_hat1) / tf.cast(2, tf.complex64)
     H_bd_estimated = (H_eff_hat1 - H_eff_hat0) / tf.cast(2, tf.complex64)
@@ -602,50 +605,45 @@ with tf.name_scope("sp_beamformer"):
     
     sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
 
-    # Oracle beam sweeping baseline (uses true channels).
-    sweep_codebook = dft_codebook[:, :(2*tau)]  # (N_tx, tau)
+    # Beam sweeping baseline (selection from estimated channels; evaluation on true channels).
     sweep_codebook_tf = tf.constant(sweep_codebook, dtype=tf.complex64)
     
-    # Compute SINR for all beam pairs: |v_i^H H_b w_j|^2 / |v_i^H H_int w_j|^2
-    # H_b @ codebook -> (batch, N_rx, num_beams)
-    Hb_W = tf.matmul(H_b_placeholder, sweep_codebook_tf)  # (batch, N_rx, num_beams)
-    Hint_W = tf.matmul(H_interference, sweep_codebook_tf)  # (batch, N_rx, num_beams)
-    
-    # codebook^H for Rx side: (num_beams, N_rx)
-    codebook_H = tf.linalg.adjoint(sweep_codebook_tf)  # (num_beams, N_tx) but N_tx == N_rx
-    codebook_H_expanded = tf.expand_dims(codebook_H, 0)  # (1, num_beams, N_rx)
-    
-    # Signal power matrix: |v_i^H H_b w_j|^2
-    sig_matrix = tf.matmul(codebook_H_expanded, Hb_W)  # (batch, num_beams, num_beams)
-    sig_power_matrix = tf.abs(sig_matrix) ** 2 * lay['P']
-    
-    # Interference power matrix: |v_i^H H_int w_j|^2
-    int_matrix = tf.matmul(codebook_H_expanded, Hint_W)  # (batch, num_beams, num_beams)
-    int_power_matrix = tf.abs(int_matrix) ** 2 * lay['P']
-    
-    # SINR matrix
-    sinr_sweep_matrix = sig_power_matrix / (int_power_matrix + noise_var + 1e-10)
-    
-    # Find best beam pair for each sample
-    batch_size_sweep = tf.shape(sinr_sweep_matrix)[0]
-    sinr_flat = tf.reshape(sinr_sweep_matrix, [batch_size_sweep, -1])  # (batch, num_beams^2)
-    best_idx = tf.argmax(sinr_flat, axis=1, output_type=tf.int32)  # (batch,)
-    
-    best_v_idx = tf.math.floordiv(best_idx, (2*tau))  # row index (v)
-    best_w_idx = tf.math.floormod(best_idx, (2*tau))  # col index (w)
-    
-    # Gather best beams
+    # Beam sweeping from estimated channels:
+    # 1) choose best Tx beam from codebook using diagonal metric |w^H H_bd_est w|^2
+    # 2) design Rx beam by nulling estimated interference channel for chosen Tx beam
+    Hbd_est_W = tf.matmul(H_bd_estimated, sweep_codebook_tf)  # (batch, N_rx, num_beams)
+    codebook_H = tf.linalg.adjoint(sweep_codebook_tf)         # (num_beams, N_tx), N_tx == N_rx
+    codebook_H_expanded = tf.expand_dims(codebook_H, 0)       # (1, num_beams, N_rx)
+    bi_matrix = tf.abs(tf.matmul(codebook_H_expanded, Hbd_est_W)) ** 2  # (batch, num_beams, num_beams)
+    sweep_metric = tf.linalg.diag_part(bi_matrix)  # (batch, num_beams)
+    best_w_idx = tf.argmax(sweep_metric, axis=1, output_type=tf.int32)
+
+    # Gather selected Tx beam
     codebook_T = tf.transpose(sweep_codebook_tf)  # (num_beams, N_tx)
-    
     w_sweep = tf.gather(codebook_T, best_w_idx)  # (batch, N_tx)
-    v_sweep = tf.gather(codebook_T, best_v_idx)  # (batch, N_rx)
-    
     w_sweep = tf.reshape(w_sweep, [-1, N_tx, 1])
-    v_sweep = tf.reshape(v_sweep, [-1, N_rx, 1])
-    
-    # Beams from DFT codebook are already normalized, but ensure it
     w_sweep = w_sweep / tf.cast(tf.norm(w_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
-    v_sweep = v_sweep / tf.cast(tf.norm(v_sweep, axis=1, keepdims=True) + 1e-10, tf.complex64)
+
+    # Nulling Rx beam: v = (I - xx^H/||x||^2) * seed, where x = H_int_est * w
+    x_int_est = tf.matmul(H_int_estimated, w_sweep)  # (batch, N_rx, 1)
+    x_norm_sq = tf.reduce_sum(tf.abs(x_int_est) ** 2, axis=[1, 2], keepdims=True)  # (batch,1,1)
+    proj_x = tf.matmul(x_int_est, tf.linalg.adjoint(x_int_est)) / tf.cast(x_norm_sq + 1e-10, tf.complex64)
+
+    batch_size_sweep = tf.shape(w_sweep)[0]
+    eye_rx = tf.tile(tf.expand_dims(tf.eye(N_rx, dtype=tf.complex64), 0), [batch_size_sweep, 1, 1])
+    null_proj = eye_rx - proj_x
+
+    if N_rx == N_tx:
+        v_seed = w_sweep
+    else:
+        v_seed = tf.matmul(H_bd_estimated, w_sweep)
+
+    v_sweep_raw = tf.matmul(null_proj, v_seed)
+    # Use real-valued power norm for compatibility in TF versions that keep complex dtype in tf.norm.
+    v_raw_norm_sq = tf.reduce_sum(tf.abs(v_sweep_raw) ** 2, axis=[1, 2], keepdims=True)  # (batch,1,1), real
+    v_valid_mask = tf.tile(v_raw_norm_sq > 1e-8, [1, N_rx, 1])  # (batch,N_rx,1)
+    v_sweep_safe = tf.where(v_valid_mask, v_sweep_raw, v_seed)
+    v_sweep = v_sweep_safe / tf.cast(tf.norm(v_sweep_safe, axis=1, keepdims=True) + 1e-10, tf.complex64)
     
     # Compute final SINR using selected beams on TRUE channels
     sig_BD_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_b_placeholder, w_sweep))
@@ -925,9 +923,137 @@ print("\n" + "=" * 60)
 print("Beam Pattern Visualization (2D - Azimuth)")
 print("=" * 60)
 
-# Select one test instance for visualization
-idx = 8
-bd_loc_vis = BD_loc[idx]
+# Allow running this section alone (e.g., in an IDE/Jupyter cell).
+if 'np' not in globals():
+    import numpy as np
+if 'plt' not in globals():
+    import matplotlib.pyplot as plt
+if 'sio' not in globals():
+    import scipy.io as sio
+if 'os' not in globals():
+    import os
+
+# This section can run standalone by loading a saved .mat result file.
+def _decode_saved_locations(raw):
+    arr = np.asarray(raw)
+    if arr.size == 0:
+        return []
+    if arr.dtype != object:
+        arr = np.squeeze(arr)
+        if arr.ndim == 2 and arr.shape[-1] == 3:
+            return [arr[i] for i in range(arr.shape[0])]
+        if arr.ndim == 2 and arr.shape[0] == 3:
+            return [arr[:, i] for i in range(arr.shape[1])]
+        return [np.squeeze(arr)]
+
+    out = []
+    for elem in arr.ravel():
+        if elem is None:
+            out.append(None)
+            continue
+        val = np.squeeze(np.asarray(elem))
+        out.append(None if val.size == 0 else val)
+    return out
+
+def _pick_result_file(result_dir):
+    override_file = globals().get('visualization_result_file', None)
+    if override_file is not None and os.path.isfile(override_file):
+        return override_file
+
+    candidate = None
+    if all(name in globals() for name in ['N_tx', 'N_rx', 'tau', 'snr_const', 'K', 'num_scatters']):
+        snr_arr = np.atleast_1d(np.squeeze(np.asarray(globals()['snr_const'])))
+        snr0 = int(snr_arr[0])
+        candidate = os.path.join(
+            result_dir,
+            f"TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}.mat"
+        )
+        if os.path.isfile(candidate):
+            return candidate
+
+    files = [
+        os.path.join(result_dir, f) for f in os.listdir(result_dir)
+        if f.startswith('TEST_sinr_') and f.endswith('.mat')
+    ]
+    if not files:
+        raise FileNotFoundError(
+            f"No saved TEST_sinr*.mat files found in {result_dir}. "
+            "Run testing once or set visualization_result_file."
+        )
+    files.sort(key=os.path.getmtime)
+    return files[-1]
+
+required_vis_vars = [
+    'w_learned', 'v_learned', 'w_optimal', 'v_optimal',
+    'sinr_test', 'sinr_opt_test', 'sinr_sp_test', 'sinr_sweep_test',
+    'BD_loc', 'Scatter_loc'
+]
+force_reload = bool(globals().get('force_load_visualization_data', False))
+if force_reload or any(name not in globals() for name in required_vis_vars):
+    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr')
+    if not os.path.isdir(result_dir):
+        raise FileNotFoundError(f"Result directory not found: {result_dir}")
+    result_file = _pick_result_file(result_dir)
+    loaded = sio.loadmat(result_file)
+    print(f"Loaded visualization data from: {result_file}")
+
+    if 'N_tx' in loaded:
+        N_tx = int(np.squeeze(loaded['N_tx']))
+    if 'N_rx' in loaded:
+        N_rx = int(np.squeeze(loaded['N_rx']))
+    if 'tau' in loaded:
+        tau = int(np.squeeze(loaded['tau']))
+    if 'snr_const' in loaded:
+        snr_const = np.atleast_1d(np.squeeze(loaded['snr_const']))
+
+    w_learned = loaded['w_learned']
+    v_learned = loaded['v_learned']
+    w_optimal = loaded['w_optimal']
+    v_optimal = loaded['v_optimal']
+
+    sinr_test = np.squeeze(loaded.get('sinr_learned', np.array([np.nan])))
+    sinr_opt_test = np.squeeze(loaded.get('sinr_optimal', np.array([np.nan])))
+    sinr_sp_test = np.squeeze(loaded.get('sinr_sp', np.full_like(np.atleast_1d(sinr_test), np.nan, dtype=np.float64)))
+    sinr_sweep_test = np.squeeze(loaded.get('sinr_sweep', np.full_like(np.atleast_1d(sinr_test), np.nan, dtype=np.float64)))
+
+    BD_loc = _decode_saved_locations(loaded.get('BD_location', np.array([])))
+    Scatter_loc = _decode_saved_locations(loaded.get('Scatter_location', np.array([])))
+
+if 'location_tx' not in globals():
+    location_tx = np.array([0, 0, 0])
+if 'snr_const' not in globals():
+    snr_const = np.array([np.nan], dtype=np.float64)
+snr_display = np.atleast_1d(np.squeeze(np.asarray(snr_const)))[0]
+
+w_learned = np.asarray(w_learned)
+v_learned = np.asarray(v_learned)
+w_optimal = np.asarray(w_optimal)
+v_optimal = np.asarray(v_optimal)
+
+if w_learned.ndim == 2:
+    w_learned = w_learned[np.newaxis, ...]
+if v_learned.ndim == 2:
+    v_learned = v_learned[np.newaxis, ...]
+if w_optimal.ndim == 2:
+    w_optimal = w_optimal[np.newaxis, ...]
+if v_optimal.ndim == 2:
+    v_optimal = v_optimal[np.newaxis, ...]
+
+num_realizations = int(w_learned.shape[0])
+if len(BD_loc) == 0:
+    BD_loc = [np.array([0, 0, 0], dtype=np.float64) for _ in range(num_realizations)]
+if len(Scatter_loc) == 0:
+    Scatter_loc = [None for _ in range(num_realizations)]
+if len(BD_loc) < num_realizations:
+    BD_loc += [np.array([0, 0, 0], dtype=np.float64) for _ in range(num_realizations - len(BD_loc))]
+if len(Scatter_loc) < num_realizations:
+    Scatter_loc += [None for _ in range(num_realizations - len(Scatter_loc))]
+
+# Select one test instance for visualization (random unless beam_pattern_idx is set)
+idx_default = np.random.randint(num_realizations)
+idx = int(globals().get('beam_pattern_idx', idx_default))
+idx = max(0, min(idx, num_realizations - 1))
+bd_loc_vis = np.squeeze(np.asarray(BD_loc[idx]))
 
 # Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
 scatter_loc_vis = Scatter_loc[idx] if Scatter_loc[idx] is not None else np.array([[0, 0, 0]])
@@ -997,12 +1123,14 @@ def _scalar_at(x, i):
     arr = np.asarray(x)
     if arr.ndim == 0:
         return float(arr)
+    arr = np.ravel(arr)
+    i = max(0, min(i, arr.size - 1))
     return float(np.squeeze(arr[i]))
 
-opt_sinr_val = _scalar_at(sinr_opt_test[idx], idx)
-learned_sinr_val = _scalar_at(sinr_test[idx], idx)
-sp_sinr_val = _scalar_at(sinr_sp_test[idx], idx)
-sweep_sinr_val = _scalar_at(sinr_sweep_test[idx], idx)
+opt_sinr_val = _scalar_at(sinr_opt_test, idx)
+learned_sinr_val = _scalar_at(sinr_test, idx)
+sp_sinr_val = _scalar_at(sinr_sp_test, idx)
+sweep_sinr_val = _scalar_at(sinr_sweep_test, idx)
 
 sinr_text = (
     f"Opt SINR: {10*np.log10(opt_sinr_val + 1e-12):.2f} dB   |   "
@@ -1130,7 +1258,7 @@ ax4.set_xlim([-180, 180])
 ax4.set_ylim([-30, 5])
 ax4.grid(True, alpha=0.3, linestyle='--')
 ax4.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
-ax4.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_const[0]} dB', 
+ax4.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_display} dB', 
          transform=ax4.transAxes, fontsize=9, verticalalignment='bottom',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
