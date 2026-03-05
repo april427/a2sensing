@@ -614,7 +614,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
         pathloss_direct_db = path_loss_r(d_tx_rx, wavelength, type='direct')
         pathloss_direct = np.sqrt(10 ** ((-pathloss_direct_db) / 10))
         
-        H_direct = pathloss_direct * (a_rx_direct @ a_tx_direct.T.conj())
+        H_direct = pathloss_direct * (a_rx_direct @ a_tx_direct.T)
     
     # --- Scattered Path Channel: TX to Scatterer(s) to RX ---
     if scatter_location is not None:
@@ -650,7 +650,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             pathloss_scatter_db = path_loss_r(d_tx_scatter, wavelength, d_scatter_rx, type='backscatter')
             pathloss_scatter = np.sqrt(10 ** ((-pathloss_scatter_db) / 10))
             
-            H_scatter += pathloss_scatter * (a_rx_scatter @ a_tx_scatter.T.conj())
+            H_scatter += pathloss_scatter * (a_rx_scatter @ a_tx_scatter.T)
     else:
         H_scatter = np.zeros((N_rx, N_tx), dtype=complex)
     
@@ -678,7 +678,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     pathloss_bd_db = path_loss_r(d_tx_bd, wavelength, d_bd_rx, type='backscatter')
     pathloss_bd = np.sqrt(10 ** ((-pathloss_bd_db) / 10))
     
-    H_bd = pathloss_bd * (a_rx_bd @ a_tx_bd.T.conj())
+    H_bd = pathloss_bd * (a_rx_bd @ a_tx_bd.T)
     
     # --- Total Channel with Rician Fading ---
     normalize_factor = np.linalg.norm(H_direct, 'fro')
