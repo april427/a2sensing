@@ -923,6 +923,13 @@ print("\n" + "=" * 60)
 print("Beam Pattern Visualization (2D - Azimuth)")
 print("=" * 60)
 
+N_tx = 36
+N_rx = 36
+tau = 7
+K = 1
+num_scatters = 3
+snr_const = 10  # dB
+
 # Allow running this section alone (e.g., in an IDE/Jupyter cell).
 if 'np' not in globals():
     import numpy as np
@@ -940,7 +947,12 @@ def _decode_saved_locations(raw):
         return []
     if arr.dtype != object:
         arr = np.squeeze(arr)
+        # Common numeric formats from savemat:
+        # (num_realizations, 3) for single point per realization
+        # (num_realizations, num_scatterers, 3) for multiple points per realization
         if arr.ndim == 2 and arr.shape[-1] == 3:
+            return [arr[i] for i in range(arr.shape[0])]
+        if arr.ndim == 3 and arr.shape[-1] == 3:
             return [arr[i] for i in range(arr.shape[0])]
         if arr.ndim == 2 and arr.shape[0] == 3:
             return [arr[:, i] for i in range(arr.shape[1])]
@@ -953,6 +965,17 @@ def _decode_saved_locations(raw):
             continue
         val = np.squeeze(np.asarray(elem))
         out.append(None if val.size == 0 else val)
+
+    # Some object-array saves wrap all realizations in a single element:
+    # [ (num_realizations, num_scatterers, 3) ].
+    if len(out) == 1 and out[0] is not None:
+        first = np.squeeze(np.asarray(out[0]))
+        if first.ndim == 3 and first.shape[-1] == 3:
+            return [first[i] for i in range(first.shape[0])]
+        if first.ndim == 2 and first.shape[-1] == 3:
+            return [first[i] for i in range(first.shape[0])]
+        if first.ndim == 2 and first.shape[0] == 3 and first.shape[1] != 3:
+            return [first[:, i] for i in range(first.shape[1])]
     return out
 
 def _pick_result_file(result_dir):
@@ -961,27 +984,25 @@ def _pick_result_file(result_dir):
         return override_file
 
     candidate = None
-    if all(name in globals() for name in ['N_tx', 'N_rx', 'tau', 'snr_const', 'K', 'num_scatters']):
-        snr_arr = np.atleast_1d(np.squeeze(np.asarray(globals()['snr_const'])))
-        snr0 = int(snr_arr[0])
-        candidate = os.path.join(
-            result_dir,
-            f"TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}.mat"
-        )
-        if os.path.isfile(candidate):
-            return candidate
-
-    files = [
-        os.path.join(result_dir, f) for f in os.listdir(result_dir)
-        if f.startswith('TEST_sinr_') and f.endswith('.mat')
-    ]
-    if not files:
-        raise FileNotFoundError(
-            f"No saved TEST_sinr*.mat files found in {result_dir}. "
-            "Run testing once or set visualization_result_file."
-        )
-    files.sort(key=os.path.getmtime)
-    return files[-1]
+    snr_arr = np.atleast_1d(np.squeeze(np.asarray(globals()['snr_const'])))
+    snr0 = int(snr_arr[0])
+    candidate = os.path.join(
+        result_dir,
+        f"TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}.mat"
+    )
+    if not os.path.isfile(candidate):
+        candidate = [
+            os.path.join(result_dir, f) for f in os.listdir(result_dir)
+            if f.startswith('TEST_sinr_') and f.endswith('.mat')
+        ]
+        if not candidate:
+            raise FileNotFoundError(
+                f"No saved TEST_sinr*.mat files found in {result_dir}. "
+                "Run testing once or set visualization_result_file."
+            )
+        candidate.sort(key=os.path.getmtime)
+        candidate = candidate[-1]
+    return candidate
 
 required_vis_vars = [
     'w_learned', 'v_learned', 'w_optimal', 'v_optimal',
@@ -1056,8 +1077,20 @@ idx = max(0, min(idx, num_realizations - 1))
 bd_loc_vis = np.squeeze(np.asarray(BD_loc[idx]))
 
 # Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
-scatter_loc_vis = Scatter_loc[idx] if Scatter_loc[idx] is not None else np.array([[0, 0, 0]])
-scatter_loc_vis = np.atleast_2d(scatter_loc_vis)
+scatter_entry = Scatter_loc[idx] if idx < len(Scatter_loc) else None
+if scatter_entry is None:
+    scatter_loc_vis = np.array([[0, 0, 0]], dtype=np.float64)
+else:
+    scatter_loc_vis = np.asarray(scatter_entry)
+    scatter_loc_vis = np.squeeze(scatter_loc_vis)
+    if scatter_loc_vis.ndim == 1:
+        scatter_loc_vis = scatter_loc_vis[np.newaxis, :]
+    if scatter_loc_vis.ndim == 2 and scatter_loc_vis.shape[0] == 3 and scatter_loc_vis.shape[1] != 3:
+        scatter_loc_vis = scatter_loc_vis.T
+    if scatter_loc_vis.ndim > 2 and scatter_loc_vis.size % 3 == 0:
+        scatter_loc_vis = scatter_loc_vis.reshape(-1, 3)
+    if scatter_loc_vis.shape[-1] != 3:
+        scatter_loc_vis = np.array([[0, 0, 0]], dtype=np.float64)
 num_scatterers_vis = scatter_loc_vis.shape[0]
 
 # Array dimensions (for ULA, N_h = N, N_v = 1; for UPA, N_h = N_v = sqrt(N))
@@ -1065,20 +1098,20 @@ num_scatterers_vis = scatter_loc_vis.shape[0]
 N_tx_h = N_tx  # Treat as horizontal array for azimuth-only pattern
 N_rx_h = N_rx
 
-def fold_ula_azimuth(angle_rad):
-    """Fold azimuth angle(s) into ULA-equivalent sector [0, pi)."""
-    return np.mod(angle_rad, np.pi)
+def fold_ula_azimuth(angle_rad, sector_start=-np.pi / 2):
+    """Fold azimuth angle(s) into ULA-equivalent sector [sector_start, sector_start + pi)."""
+    return np.mod(angle_rad - sector_start, np.pi) + sector_start
 
 # Function to compute 2D beam pattern (azimuth only, elevation = 0)
 def compute_beam_pattern_2d(beamformer, N_h, num_points=360):
-    """Compute 2D beam pattern for azimuth in [0, pi] (elevation = 0)
+    """Compute 2D beam pattern for azimuth in [-pi/2, pi/2] (elevation = 0)
     
     For elevation = 0:
     - cos(el) = 1, sin(el) = 0
     - steering_vector = exp(1j * pi * i * sin(az))
     This simplifies to a ULA pattern in azimuth.
     """
-    azimuth = np.linspace(0.0, np.pi, num_points)
+    azimuth = np.linspace(-np.pi / 2, np.pi / 2, num_points)
     
     pattern = np.zeros(num_points, dtype=np.float64)
     bf = beamformer.flatten()
@@ -1110,7 +1143,7 @@ az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_
 az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, num_points=360)
 az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, num_points=360)
 
-# Calculate target directions and fold to ULA-equivalent azimuth sector [0, pi)
+# Calculate target directions and fold to ULA-equivalent azimuth sector [-pi/2, pi/2)
 bd_azimuth = fold_ula_azimuth(np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0]))
 
 # Calculate azimuth for each scatterer
@@ -1119,6 +1152,16 @@ for s in range(num_scatterers_vis):
     scatter_az = np.arctan2(scatter_loc_vis[s, 1] - location_tx[1], scatter_loc_vis[s, 0] - location_tx[0])
     scatter_azimuths.append(scatter_az)
 scatter_azimuths = fold_ula_azimuth(np.array(scatter_azimuths))
+
+def configure_upper_half_polar_axis(ax):
+    """Show -pi/2..pi/2 as an upward-facing semicircle with radian tick labels."""
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(1)
+    ax.set_thetamin(-90)
+    ax.set_thetamax(90)
+    ax.set_xticks([-np.pi / 2, -np.pi / 4, 0.0, np.pi / 4, np.pi / 2])
+    ax.set_xticklabels([r'$-\pi/2$', r'$-\pi/4$', '0', r'$\pi/4$', r'$\pi/2$'])
+    ax.set_ylim([0, 1])
 
 # Create figure with 2 rows, 3 columns
 fig = plt.figure(figsize=(18, 12))
@@ -1213,11 +1256,7 @@ for s in range(num_scatterers_vis):
 
 ax2.set_title('Learned Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-ax2.set_theta_zero_location('E')  # 0° at East (positive X)
-ax2.set_theta_direction(1)  # Counter-clockwise
-ax2.set_thetamin(0)
-ax2.set_thetamax(180)
-ax2.set_ylim([0, 1])
+configure_upper_half_polar_axis(ax2)
 
 # ===== Row 1, Col 3: Polar Plot - Learned Rx Beam =====
 ax3 = fig.add_subplot(2, 3, 3, projection='polar')
@@ -1232,11 +1271,7 @@ for s in range(num_scatterers_vis):
 
 ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-ax3.set_theta_zero_location('E')
-ax3.set_theta_direction(1)
-ax3.set_thetamin(0)
-ax3.set_thetamax(180)
-ax3.set_ylim([0, 1])
+configure_upper_half_polar_axis(ax3)
 
 # ===== ROW 2: OPTIMAL BEAMFORMERS =====
 # ===== Row 2, Col 1: Cartesian Comparison Plot =====
@@ -1262,7 +1297,7 @@ for s in range(num_scatterers_vis):
 ax4.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
 ax4.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
 ax4.set_title('Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
-ax4.set_xlim([0, 180])
+ax4.set_xlim([-90, 90])
 ax4.set_ylim([-30, 5])
 ax4.grid(True, alpha=0.3, linestyle='--')
 ax4.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
@@ -1283,11 +1318,7 @@ for s in range(num_scatterers_vis):
 
 ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-ax5.set_theta_zero_location('E')
-ax5.set_theta_direction(1)
-ax5.set_thetamin(0)
-ax5.set_thetamax(180)
-ax5.set_ylim([0, 1])
+configure_upper_half_polar_axis(ax5)
 
 # ===== Row 2, Col 3: Polar Plot - Optimal Rx Beam =====
 ax6 = fig.add_subplot(2, 3, 6, projection='polar')
@@ -1302,11 +1333,7 @@ for s in range(num_scatterers_vis):
 
 ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-ax6.set_theta_zero_location('E')
-ax6.set_theta_direction(1)
-ax6.set_thetamin(0)
-ax6.set_thetamax(180)
-ax6.set_ylim([0, 1])
+configure_upper_half_polar_axis(ax6)
 
 plt.tight_layout()
 
@@ -1316,5 +1343,6 @@ plt.tight_layout()
 # print(f"Beam pattern figure saved to {fig_filename}")
 
 plt.show()
+
 
 # %%
