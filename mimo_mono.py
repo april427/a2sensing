@@ -314,19 +314,51 @@ def dft_codebook(n, m):
         )
     return dft_matrix
 
-# Use an N_tx-point DFT and take the first tau columns as pilots.
-# This keeps pilot columns orthonormal when tau <= N_tx.
-pilot_codebook = dft_codebook(N_tx, max(N_tx, tau))
+def hadamard_codebook(n, m):
+    """
+    Create a unit-norm Hadamard-based codebook of shape (n, m).
+    
+    Hadamard matrices only exist for sizes 1, 2, or multiples of 4.
+    We find the smallest valid Hadamard size >= max(n, m), construct it,
+    then take the first n rows and m columns with unit-norm normalization.
+    
+    Properties:
+    - All columns are orthogonal: S^H S = I (when m <= hadamard_size)
+    - SS^H has better conditioning than truncated DFT for arbitrary tau
+    """
+    from scipy.linalg import hadamard
+    
+    # Find smallest Hadamard size >= max(n, m)
+    target_size = max(n, m)
+    if target_size <= 1:
+        had_size = 1
+    elif target_size <= 2:
+        had_size = 2
+    else:
+        # Hadamard exists for multiples of 4
+        had_size = 4
+        while had_size < target_size:
+            had_size *= 2
+    
+    # Generate Hadamard matrix and normalize
+    H = hadamard(had_size).astype(np.float64) / np.sqrt(n)
+    
+    # Take first n rows and m columns, convert to complex
+    codebook = H[:n, :m].astype(np.complex64)
+    
+    return codebook
+
+pilot_codebook = hadamard_codebook(N_tx, max(N_tx, tau))
 s_pilot = pilot_codebook[:, :tau].copy()
 
 # Beam-sweeping codebook: ensure exactly 2*tau beams are available.
-sweep_codebook = dft_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].copy()
+sweep_codebook = hadamard_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].copy()
     
 #####################################################
 # Learning parameters and Computation Graph
 #####################################################
 #  
-initial_run = 1
+initial_run = 1 if args.n_epochs > 0 else 0
 n_epochs = args.n_epochs
 learning_rate = 5e-4
 batch_per_epoch = 128
@@ -567,8 +599,10 @@ with tf.name_scope("sp_beamformer"):
     s_pilot_h = tf.linalg.adjoint(s_pilot_tf)  # (tau, N_tx)
     ss_h = tf.matmul(s_pilot_tf, s_pilot_h)  # (N_tx, N_tx) = SS^H
     sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
-
-    s_pilot_pinv = tf.matmul(s_pilot_h, tf.linalg.inv(ss_h + 1e-10 * tf.eye(N_tx, dtype=tf.complex64)))  # (tau, N_tx) * (N_tx, N_tx)^{-1} = (tau, N_tx)
+    
+    reg = tf.cast(1e-1, tf.complex64) * tf.eye(N_tx, dtype=tf.complex64)
+    ss_h_reg = ss_h + reg
+    s_pilot_pinv = tf.linalg.adjoint(tf.linalg.solve(ss_h_reg, s_pilot_tf))  # (tau, N_tx)
 
     H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_0_clean = tf.matmul(H_eff0, s_pilot_tf)  # (batch, N_rx, tau)
@@ -816,13 +850,12 @@ with tf.Session() as sess:
         # Optimal beamformer performance
         if epoch == 0:
             sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val
-        )
+            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
 
-        # sp-based beamformer performance
-        sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-            [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val
-        )
+            # sp-based beamformer performance
+            sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
+                        [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
+
         
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
