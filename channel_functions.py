@@ -453,10 +453,10 @@ def generate_location_mimo(num_users, type = 'u'):
     for u in range(num_users):
         elevation_angle = 0#np.random.uniform(-np.pi, np.pi)
         if type == 'u':
-            azimuth_angle = np.random.uniform(0, 1.87*np.pi)
+            azimuth_angle = np.random.uniform(-np.pi/2, np.pi/2)
             dis = Wavelength*15 
         else:
-            azimuth_angle = np.random.uniform(1/9*np.pi, np.pi*15/8)
+            azimuth_angle = np.random.uniform(-np.pi/2, np.pi/2)
             dis = Wavelength*10 + Wavelength*10*np.random.rand()
 
         x1 = dis * np.cos(elevation_angle) * np.cos(azimuth_angle)

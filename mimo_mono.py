@@ -73,6 +73,12 @@ if gpus:
 else:
     print("No GPU found, running on CPU")
 
+# Set random seeds for reproducibility
+seed = getattr(args, 'seed', 42)
+np.random.seed(seed)
+tf.set_random_seed(seed)
+print(f"Random seed set to: {seed}")
+
 
 #####################################################
 # Network Components
@@ -523,7 +529,6 @@ with tf.name_scope("optimal_beamformer"):
     # Use tf.py_func to call NumPy-based optimization (with parallel processing)
     def compute_optimal_beamformers_np(H_b, H_int, noise_var_val, P_val):
         """Compute optimal beamformers for a batch using parallel manifold optimization"""
-        # Use the parallel batch function with reduced restarts (5 instead of 10)
         return compute_optimal_beamformers_batch_parallel(
             H_b, H_int, noise_var_val, P_val, 
             num_restarts=10
@@ -557,13 +562,13 @@ with tf.name_scope("optimal_beamformer"):
     
 with tf.name_scope("sp_beamformer"):
     # Signal processing baseline from noisy pilot measurements.
+    # System model: Y = sqrt(P) * H * S + N
     s_pilot_tf = tf.constant(s_pilot, dtype=tf.complex64)
     s_pilot_h = tf.linalg.adjoint(s_pilot_tf)  # (tau, N_tx)
-    # Complex-safe LS pseudo-inverse: (S^H S + eps I)^(-1) S^H
-    s_gram = tf.matmul(s_pilot_h, s_pilot_tf)  # (tau, tau)
-    s_gram_reg = s_gram + tf.cast(1e-6, tf.complex64) * tf.eye(tau, dtype=tf.complex64)
-    s_pilot_pinv = tf.linalg.solve(s_gram_reg, s_pilot_h)  # (tau, N_tx)
+    ss_h = tf.matmul(s_pilot_tf, s_pilot_h)  # (N_tx, N_tx) = SS^H
     sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
+
+    s_pilot_pinv = tf.matmul(s_pilot_h, tf.linalg.inv(ss_h + 1e-10 * tf.eye(N_tx, dtype=tf.complex64)))  # (tau, N_tx) * (N_tx, N_tx)^{-1} = (tau, N_tx)
 
     H_eff0 = (-1) * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
     Y_0_clean = tf.matmul(H_eff0, s_pilot_tf)  # (batch, N_rx, tau)
@@ -605,12 +610,10 @@ with tf.name_scope("sp_beamformer"):
     
     sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
 
-    # Beam sweeping baseline (selection from estimated channels; evaluation on true channels).
+    #### Beam sweeping baseline (selection from estimated channels; evaluation on true channels).
     sweep_codebook_tf = tf.constant(sweep_codebook, dtype=tf.complex64)
     
-    # Beam sweeping from estimated channels:
-    # 1) choose best Tx beam from codebook using diagonal metric |w^H H_bd_est w|^2
-    # 2) design Rx beam by nulling estimated interference channel for chosen Tx beam
+    # Beam sweeping from estimated channels
     Hbd_est_W = tf.matmul(H_bd_estimated, sweep_codebook_tf)  # (batch, N_rx, num_beams)
     codebook_H = tf.linalg.adjoint(sweep_codebook_tf)         # (num_beams, N_tx), N_tx == N_rx
     codebook_H_expanded = tf.expand_dims(codebook_H, 0)       # (1, num_beams, N_rx)
@@ -859,6 +862,12 @@ with tf.Session() as sess:
     print("\n" + "=" * 60)
     print("Testing")
     print("=" * 60)
+    
+    # Reset seed before generating test data to ensure reproducibility across runs
+    # This guarantees the same test set regardless of training parameters (tau, epochs, etc.)
+    test_seed = seed + 10000  # Offset to separate from training data
+    np.random.seed(test_seed)
+    print(f"Test data seed: {test_seed}")
     
     # Generate test batch using parallel processing
 
