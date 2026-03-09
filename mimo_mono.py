@@ -178,8 +178,8 @@ def _generate_single_sample(loc_tx, loc_rx, n_scatters, n_tx, n_rx, rician):
     # Generate MIMO channels
     _, H_d, H_r, H_b = generate_mimo_channel(
         loc_tx, loc_rx, scatter_loc, bd_loc,
-        N_tx_h=int(np.sqrt(n_tx)), N_tx_v=int(np.sqrt(n_tx)),
-        N_rx_h=int(np.sqrt(n_rx)), N_rx_v=int(np.sqrt(n_rx)),
+        N_tx_h=n_tx, N_tx_v=1,
+        N_rx_h=n_rx, N_rx_v=1,
         Rician_factor=rician
     )
     
