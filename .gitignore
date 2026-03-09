@@ -17,7 +17,7 @@ Mo_mimo_sinr/
 plots.py 
 
 debug_*
-retest_benchmark.py
+# retest_benchmark.py
 
 /figs
 ping_pong.py
