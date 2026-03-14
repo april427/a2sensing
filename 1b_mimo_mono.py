@@ -509,7 +509,7 @@ with tf.name_scope("optimal_beamformer"):
     v_opt = tf.py_func(
         lambda H_b, H_int: compute_optimal_beamformers_np(H_b, H_int, noise_var, Pvec[0]),
         [H_b_placeholder, H_interference],
-        [tf.complex64, tf.complex64]
+           tf.complex64
     )
     
     # Set shapes explicitly
@@ -567,7 +567,7 @@ with tf.name_scope("sp_beamformer"):
     v_sp = tf.py_func(
         lambda H_b, H_int: compute_optimal_beamformers_np(H_b, H_int, noise_var, Pvec[0]),
         [H_bd_estimated, H_int_estimated],
-        [tf.complex64, tf.complex64]
+           tf.complex64
     )
     
     # Set shapes explicitly
@@ -879,13 +879,6 @@ print("\n" + "=" * 60)
 print("Beam Pattern Visualization (2D - Azimuth)")
 print("=" * 60)
 
-N_tx = 36
-N_rx = 36
-tau = 7
-K = 1
-num_scatters = 3
-snr_const = 10  # dB
-
 # Allow running this section alone (e.g., in an IDE/Jupyter cell).
 if 'np' not in globals():
     import numpy as np
@@ -895,6 +888,13 @@ if 'sio' not in globals():
     import scipy.io as sio
 if 'os' not in globals():
     import os
+
+N_tx = int(globals().get('N_tx', 36))
+N_rx = int(globals().get('N_rx', 36))
+tau = int(globals().get('tau', 7))
+K = int(globals().get('K', 1))
+num_scatters = int(globals().get('num_scatters', 3))
+snr_const = np.atleast_1d(np.squeeze(np.asarray(globals().get('snr_const', np.array([10.0], dtype=np.float64)))))
 
 # This section can run standalone by loading a saved .mat result file.
 def _decode_saved_locations(raw):
@@ -961,13 +961,13 @@ def _pick_result_file(result_dir):
     return candidate
 
 required_vis_vars = [
-    'w_learned', 'v_learned', 'w_optimal', 'v_optimal',
+    'v_learned', 'v_optimal',
     'sinr_test', 'sinr_opt_test', 'sinr_sp_test', 'sinr_sweep_test',
     'BD_loc', 'Scatter_loc'
 ]
 force_reload = bool(globals().get('force_load_visualization_data', False))
 if force_reload or any(name not in globals() for name in required_vis_vars):
-    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr')
+    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr_1b')
     if not os.path.isdir(result_dir):
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
     result_file = _pick_result_file(result_dir)
@@ -983,9 +983,7 @@ if force_reload or any(name not in globals() for name in required_vis_vars):
     if 'snr_const' in loaded:
         snr_const = np.atleast_1d(np.squeeze(loaded['snr_const']))
 
-    w_learned = loaded['w_learned']
     v_learned = loaded['v_learned']
-    w_optimal = loaded['w_optimal']
     v_optimal = loaded['v_optimal']
 
     sinr_test = np.squeeze(loaded.get('sinr_learned', np.array([np.nan])))
@@ -1002,21 +1000,18 @@ if 'snr_const' not in globals():
     snr_const = np.array([np.nan], dtype=np.float64)
 snr_display = np.atleast_1d(np.squeeze(np.asarray(snr_const)))[0]
 
-w_learned = np.asarray(w_learned)
+
 v_learned = np.asarray(v_learned)
-w_optimal = np.asarray(w_optimal)
 v_optimal = np.asarray(v_optimal)
 
-if w_learned.ndim == 2:
-    w_learned = w_learned[np.newaxis, ...]
+
 if v_learned.ndim == 2:
     v_learned = v_learned[np.newaxis, ...]
-if w_optimal.ndim == 2:
-    w_optimal = w_optimal[np.newaxis, ...]
+
 if v_optimal.ndim == 2:
     v_optimal = v_optimal[np.newaxis, ...]
 
-num_realizations = int(w_learned.shape[0])
+num_realizations = int(v_learned.shape[0])
 if len(BD_loc) == 0:
     BD_loc = [np.array([0, 0, 0], dtype=np.float64) for _ in range(num_realizations)]
 if len(Scatter_loc) == 0:
@@ -1035,7 +1030,7 @@ bd_loc_vis = np.squeeze(np.asarray(BD_loc[idx]))
 # Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
 scatter_entry = Scatter_loc[idx] if idx < len(Scatter_loc) else None
 if scatter_entry is None:
-    scatter_loc_vis = np.array([[0, 0, 0]], dtype=np.float64)
+    scatter_loc_vis = np.zeros((0, 3), dtype=np.float64)
 else:
     scatter_loc_vis = np.asarray(scatter_entry)
     scatter_loc_vis = np.squeeze(scatter_loc_vis)
@@ -1046,13 +1041,11 @@ else:
     if scatter_loc_vis.ndim > 2 and scatter_loc_vis.size % 3 == 0:
         scatter_loc_vis = scatter_loc_vis.reshape(-1, 3)
     if scatter_loc_vis.shape[-1] != 3:
-        scatter_loc_vis = np.array([[0, 0, 0]], dtype=np.float64)
+        scatter_loc_vis = np.zeros((0, 3), dtype=np.float64)
 num_scatterers_vis = scatter_loc_vis.shape[0]
 
-# Array dimensions (for ULA, N_h = N, N_v = 1; for UPA, N_h = N_v = sqrt(N))
-# With elevation = 0, effectively treating as ULA in azimuth
-N_tx_h = N_tx  # Treat as horizontal array for azimuth-only pattern
-N_rx_h = N_rx
+# Shared beamformer case: the same beam is used on transmit and receive (w = v).
+N_shared_h = N_rx
 
 def fold_ula_azimuth(angle_rad, sector_start=-np.pi / 2):
     """Fold azimuth angle(s) into ULA-equivalent sector [sector_start, sector_start + pi)."""
@@ -1088,16 +1081,12 @@ def compute_beam_pattern_2d(beamformer, N_h, num_points=360):
     return azimuth, pattern
 
 # Get learned and optimal beamformers for this instance
-w_learned_vis = w_learned[idx]  # (N_tx, 1)
-v_learned_vis = v_learned[idx]  # (N_rx, 1)
-w_optimal_vis = w_optimal[idx]  # (N_tx, 1)
-v_optimal_vis = v_optimal[idx]  # (N_rx, 1)
+shared_beam_learned_vis = v_learned[idx]  # (N_rx, 1)
+shared_beam_optimal_vis = v_optimal[idx]  # (N_rx, 1)
 
 # Compute 2D beam patterns
-az_tx_learned, pattern_tx_learned = compute_beam_pattern_2d(w_learned_vis, N_tx_h, num_points=360)
-az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_h, num_points=360)
-az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, num_points=360)
-az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, num_points=360)
+az_shared_learned, pattern_shared_learned = compute_beam_pattern_2d(shared_beam_learned_vis, N_shared_h, num_points=360)
+az_shared_optimal, pattern_shared_optimal = compute_beam_pattern_2d(shared_beam_optimal_vis, N_shared_h, num_points=360)
 
 # Calculate target directions and fold to ULA-equivalent azimuth sector [-pi/2, pi/2)
 bd_azimuth = fold_ula_azimuth(np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0]))
@@ -1190,58 +1179,61 @@ ax1.grid(True, alpha=0.3, linestyle='--')
 ax1.set_aspect('equal')
 
 # Build scatter azimuth text for info box
-scatter_az_text = '\n'.join([f'Scatter {s+1} Az: {np.degrees(scatter_azimuths[s]):.1f}°' for s in range(num_scatterers_vis)])
+if num_scatterers_vis:
+    scatter_az_text = '\n'.join([f'Scatter {s+1} Az: {np.degrees(scatter_azimuths[s]):.1f}°' for s in range(num_scatterers_vis)])
+else:
+    scatter_az_text = 'No scatterers'
 ax1.text(0.02, 0.98, f'BD Az: {np.degrees(bd_azimuth):.1f}°\n{scatter_az_text}', 
          transform=ax1.transAxes, fontsize=9, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
-# ===== Row 1, Col 2: Polar Plot - Learned Tx Beam =====
+# Utilities for comparison plots.
+def pattern_to_db(pattern):
+    return 10 * np.log10(np.asarray(pattern) + 1e-10)
+
+def sample_pattern_at_angles(azimuth_grid, pattern, angles):
+    sample_angles = np.atleast_1d(np.asarray(angles, dtype=np.float64))
+    return np.interp(sample_angles, azimuth_grid, pattern)
+
+# ===== Row 1, Col 2: Polar Plot - Learned Shared Beam =====
 ax2 = fig.add_subplot(2, 3, 2, projection='polar')
 
-# Plot beam pattern
-ax2.plot(az_tx_learned, pattern_tx_learned, 'b-', linewidth=2.5, label='Tx Beam')
-ax2.fill(az_tx_learned, pattern_tx_learned, 'blue', alpha=0.2)
+ax2.plot(az_shared_learned, pattern_shared_learned, color='navy', linewidth=2.5, label='Learned beam')
+ax2.fill(az_shared_learned, pattern_shared_learned, color='steelblue', alpha=0.2)
 
-# Mark BD direction
 ax2.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-# Mark all scatter directions
 scatter_colors_polar = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
 for s in range(num_scatterers_vis):
     ax2.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax2.set_title('Learned Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax2.set_title('Learned Shared Beamformer (w = v)', fontsize=12, fontweight='bold', pad=15)
 ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax2)
 
-# ===== Row 1, Col 3: Polar Plot - Learned Rx Beam =====
+# ===== Row 1, Col 3: Polar Plot - Optimal Shared Beam =====
 ax3 = fig.add_subplot(2, 3, 3, projection='polar')
 
-ax3.plot(az_rx_learned, pattern_rx_learned, 'g-', linewidth=2.5, label='Rx Beam')
-ax3.fill(az_rx_learned, pattern_rx_learned, 'green', alpha=0.2)
+ax3.plot(az_shared_optimal, pattern_shared_optimal, color='black', linewidth=2.5, label='Optimal beam')
+ax3.fill(az_shared_optimal, pattern_shared_optimal, color='gray', alpha=0.2)
 
 ax3.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
 for s in range(num_scatterers_vis):
     ax3.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax3.set_title('Optimal Shared Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax3)
 
-# ===== ROW 2: OPTIMAL BEAMFORMERS =====
 # ===== Row 2, Col 1: Cartesian Comparison Plot =====
 ax4 = fig.add_subplot(2, 3, 4)
 
-azimuth_deg = np.degrees(az_tx_learned)
+azimuth_deg = np.degrees(az_shared_learned)
 
-# Plot all patterns in dB
-ax4.plot(azimuth_deg, 10*np.log10(pattern_tx_learned + 1e-10), 'b-', linewidth=2, label='Learned Tx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_rx_learned + 1e-10), 'g-', linewidth=2, label='Learned Rx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_tx_optimal + 1e-10), 'b--', linewidth=2, label='Optimal Tx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_rx_optimal + 1e-10), 'g--', linewidth=2, label='Optimal Rx', alpha=0.8)
+ax4.plot(azimuth_deg, pattern_to_db(pattern_shared_learned), 'b-', linewidth=2.2, label='Learned', alpha=0.85)
+ax4.plot(azimuth_deg, pattern_to_db(pattern_shared_optimal), 'k--', linewidth=2.2, label='Optimal', alpha=0.85)
 
-# Mark BD and scatter directions
 bd_az_deg = np.degrees(bd_azimuth)
 ax4.axvline(bd_az_deg, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'BD: {bd_az_deg:.1f}°')
 scatter_colors_cart = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
@@ -1252,44 +1244,56 @@ for s in range(num_scatterers_vis):
 
 ax4.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
 ax4.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
-ax4.set_title('Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
+ax4.set_title('Shared Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
 ax4.set_xlim([-90, 90])
 ax4.set_ylim([-30, 5])
 ax4.grid(True, alpha=0.3, linestyle='--')
-ax4.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
+ax4.legend(loc='upper right', fontsize=8, framealpha=0.9)
 ax4.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_display} dB', 
          transform=ax4.transAxes, fontsize=9, verticalalignment='bottom',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
-# ===== Row 2, Col 2: Polar Plot - Optimal Tx Beam =====
+# ===== Row 2, Col 2: Polar Overlay - Learned vs Optimal =====
 ax5 = fig.add_subplot(2, 3, 5, projection='polar')
 
-ax5.plot(az_tx_optimal, pattern_tx_optimal, 'b-', linewidth=2.5, label='Tx Beam')
-ax5.fill(az_tx_optimal, pattern_tx_optimal, 'blue', alpha=0.2)
+ax5.plot(az_shared_learned, pattern_shared_learned, color='navy', linewidth=2.5, label='Learned')
+ax5.fill(az_shared_learned, pattern_shared_learned, color='steelblue', alpha=0.12)
+ax5.plot(az_shared_optimal, pattern_shared_optimal, color='black', linestyle='--', linewidth=2.5, label='Optimal')
 
 ax5.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
 for s in range(num_scatterers_vis):
     ax5.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax5.set_title('Learned vs Optimal Shared Beam', fontsize=12, fontweight='bold', pad=15)
 ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax5)
 
-# ===== Row 2, Col 3: Polar Plot - Optimal Rx Beam =====
-ax6 = fig.add_subplot(2, 3, 6, projection='polar')
+# ===== Row 2, Col 3: Gain at BD / Scatter Directions =====
+ax6 = fig.add_subplot(2, 3, 6)
 
-ax6.plot(az_rx_optimal, pattern_rx_optimal, 'g-', linewidth=2.5, label='Rx Beam')
-ax6.fill(az_rx_optimal, pattern_rx_optimal, 'green', alpha=0.2)
+direction_labels = ['BD'] + [f'S{s+1}' for s in range(num_scatterers_vis)]
+direction_angles = np.concatenate(([bd_azimuth], scatter_azimuths)) if num_scatterers_vis else np.array([bd_azimuth])
+learned_direction_gains_db = pattern_to_db(sample_pattern_at_angles(az_shared_learned, pattern_shared_learned, direction_angles))
+optimal_direction_gains_db = pattern_to_db(sample_pattern_at_angles(az_shared_optimal, pattern_shared_optimal, direction_angles))
 
-ax6.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-for s in range(num_scatterers_vis):
-    ax6.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
-                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
+x = np.arange(len(direction_labels))
+width = 0.36
+ax6.bar(x - width / 2, learned_direction_gains_db, width=width, color='steelblue', alpha=0.85, label='Learned')
+ax6.bar(x + width / 2, optimal_direction_gains_db, width=width, color='gray', alpha=0.85, label='Optimal')
 
-ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
-ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-configure_upper_half_polar_axis(ax6)
+ax6.set_xticks(x)
+ax6.set_xticklabels(direction_labels)
+ax6.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
+ax6.set_title('Gain at BD and Scatter Directions', fontsize=12, fontweight='bold')
+ax6.grid(True, axis='y', alpha=0.3, linestyle='--')
+ax6.legend(loc='upper right', fontsize=9, framealpha=0.9)
+
+gain_floor = min(-30.0, np.min(np.concatenate([learned_direction_gains_db, optimal_direction_gains_db])) - 3.0)
+ax6.set_ylim([gain_floor, 2.0])
+ax6.text(0.02, 0.98, 'Angles use ULA-folded azimuth sector',
+         transform=ax6.transAxes, fontsize=9, verticalalignment='top',
+         bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
 plt.tight_layout()
 

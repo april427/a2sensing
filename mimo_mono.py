@@ -1173,6 +1173,25 @@ def compute_beam_pattern_2d(beamformer, N_h, num_points=360):
     pattern = pattern / (np.max(pattern) + 1e-10)
     return azimuth, pattern
 
+def compute_joint_beam_pattern_2d(v_beamformer, w_beamformer, num_points=360):
+    """Compute the normalized joint response |v^H a a^T w|^2 over azimuth."""
+    azimuth = np.linspace(-np.pi / 2, np.pi / 2, num_points)
+    pattern = np.zeros(num_points, dtype=np.float64)
+
+    v_vec = np.asarray(v_beamformer).reshape(-1)
+    w_vec = np.asarray(w_beamformer).reshape(-1)
+    rx_indices = np.arange(v_vec.size)
+    tx_indices = np.arange(w_vec.size)
+
+    for i_az, az in enumerate(azimuth):
+        sin_azimuth = np.sin(az)
+        a_rx = np.exp(1j * np.pi * rx_indices * sin_azimuth)
+        a_tx = np.exp(1j * np.pi * tx_indices * sin_azimuth)
+        pattern[i_az] = np.abs(np.vdot(v_vec, a_rx) * np.dot(a_tx, w_vec)) ** 2
+
+    pattern = pattern / (np.max(pattern) + 1e-10)
+    return azimuth, pattern
+
 # Get learned and optimal beamformers for this instance
 w_learned_vis = w_learned[idx]  # (N_tx, 1)
 v_learned_vis = v_learned[idx]  # (N_rx, 1)
@@ -1184,6 +1203,8 @@ az_tx_learned, pattern_tx_learned = compute_beam_pattern_2d(w_learned_vis, N_tx_
 az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_h, num_points=360)
 az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, num_points=360)
 az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, num_points=360)
+az_joint_learned, pattern_joint_learned = compute_joint_beam_pattern_2d(v_learned_vis, w_learned_vis, num_points=360)
+az_joint_optimal, pattern_joint_optimal = compute_joint_beam_pattern_2d(v_optimal_vis, w_optimal_vis, num_points=360)
 
 # Calculate target directions and fold to ULA-equivalent azimuth sector [-pi/2, pi/2)
 bd_azimuth = fold_ula_azimuth(np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0]))
@@ -1205,8 +1226,8 @@ def configure_upper_half_polar_axis(ax):
     ax.set_xticklabels([r'$-\pi/2$', r'$-\pi/4$', '0', r'$\pi/4$', r'$\pi/2$'])
     ax.set_ylim([0, 1])
 
-# Create figure with 2 rows, 3 columns
-fig = plt.figure(figsize=(18, 12))
+# Create figure with 3 rows, 3 columns
+fig = plt.figure(figsize=(18, 16))
 # --- SINR summary (for the selected idx) ---
 def _scalar_at(x, i):
     arr = np.asarray(x)
@@ -1234,7 +1255,7 @@ fig.text(
     bbox=dict(boxstyle='round,pad=0.35', facecolor='white', alpha=0.9, edgecolor='gray')
 )
 plt.subplots_adjust(top=0.90)
-ax1 = fig.add_subplot(2, 3, 1)
+ax1 = fig.add_subplot(3, 3, 1)
 
 # Plot Tx/Rx location (co-located)
 ax1.scatter(location_tx[0], location_tx[1], c='blue', marker='s', s=200, label='Tx/Rx Array', zorder=10, edgecolors='black')
@@ -1282,7 +1303,7 @@ ax1.text(0.02, 0.98, f'BD Az: {np.degrees(bd_azimuth):.1f}°\n{scatter_az_text}'
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
 # ===== Row 1, Col 2: Polar Plot - Learned Tx Beam =====
-ax2 = fig.add_subplot(2, 3, 2, projection='polar')
+ax2 = fig.add_subplot(3, 3, 2, projection='polar')
 
 # Plot beam pattern
 ax2.plot(az_tx_learned, pattern_tx_learned, 'b-', linewidth=2.5, label='Tx Beam')
@@ -1301,7 +1322,7 @@ ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax2)
 
 # ===== Row 1, Col 3: Polar Plot - Learned Rx Beam =====
-ax3 = fig.add_subplot(2, 3, 3, projection='polar')
+ax3 = fig.add_subplot(3, 3, 3, projection='polar')
 
 ax3.plot(az_rx_learned, pattern_rx_learned, 'g-', linewidth=2.5, label='Rx Beam')
 ax3.fill(az_rx_learned, pattern_rx_learned, 'green', alpha=0.2)
@@ -1315,67 +1336,102 @@ ax3.set_title('Learned Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
 ax3.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax3)
 
-# ===== ROW 2: OPTIMAL BEAMFORMERS =====
-# ===== Row 2, Col 1: Cartesian Comparison Plot =====
-ax4 = fig.add_subplot(2, 3, 4)
+# ===== Row 2, Col 1: Learned Joint Pattern =====
+ax4 = fig.add_subplot(3, 3, 4, projection='polar')
+
+ax4.plot(az_joint_learned, pattern_joint_learned, color='purple', linewidth=2.5, label=r'$|v^H a a^T w|^2$')
+ax4.fill(az_joint_learned, pattern_joint_learned, color='purple', alpha=0.2)
+
+ax4.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax4.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0,
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
+
+ax4.set_title(r'Learned Joint Pattern $|v^H a a^T w|^2$', fontsize=12, fontweight='bold', pad=15)
+ax4.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
+configure_upper_half_polar_axis(ax4)
+
+# ===== Row 2, Col 2: Cartesian Comparison Plot =====
+ax5 = fig.add_subplot(3, 3, 5)
 
 azimuth_deg = np.degrees(az_tx_learned)
 
 # Plot all patterns in dB
-ax4.plot(azimuth_deg, 10*np.log10(pattern_tx_learned + 1e-10), 'b-', linewidth=2, label='Learned Tx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_rx_learned + 1e-10), 'g-', linewidth=2, label='Learned Rx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_tx_optimal + 1e-10), 'b--', linewidth=2, label='Optimal Tx', alpha=0.8)
-ax4.plot(azimuth_deg, 10*np.log10(pattern_rx_optimal + 1e-10), 'g--', linewidth=2, label='Optimal Rx', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_tx_learned + 1e-10), 'b-', linewidth=2, label='Learned Tx', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_rx_learned + 1e-10), 'g-', linewidth=2, label='Learned Rx', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_joint_learned + 1e-10), color='purple', linewidth=2, label='Learned Joint', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_tx_optimal + 1e-10), 'b--', linewidth=2, label='Optimal Tx', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_rx_optimal + 1e-10), 'g--', linewidth=2, label='Optimal Rx', alpha=0.8)
+ax5.plot(azimuth_deg, 10*np.log10(pattern_joint_optimal + 1e-10), color='purple', linestyle='--', linewidth=2, label='Optimal Joint', alpha=0.8)
 
 # Mark BD and scatter directions
 bd_az_deg = np.degrees(bd_azimuth)
-ax4.axvline(bd_az_deg, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'BD: {bd_az_deg:.1f}°')
+ax5.axvline(bd_az_deg, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'BD: {bd_az_deg:.1f}°')
 scatter_colors_cart = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
 for s in range(num_scatterers_vis):
     scatter_az_deg = np.degrees(scatter_azimuths[s])
-    ax4.axvline(scatter_az_deg, color=scatter_colors_cart[s], linestyle=':', linewidth=2, alpha=0.7, 
+    ax5.axvline(scatter_az_deg, color=scatter_colors_cart[s], linestyle=':', linewidth=2, alpha=0.7, 
                 label=f'S{s+1}: {scatter_az_deg:.1f}°')
 
-ax4.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
-ax4.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
-ax4.set_title('Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
-ax4.set_xlim([-90, 90])
-ax4.set_ylim([-30, 5])
-ax4.grid(True, alpha=0.3, linestyle='--')
-ax4.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
-ax4.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_display} dB', 
-         transform=ax4.transAxes, fontsize=9, verticalalignment='bottom',
+ax5.set_xlabel('Azimuth Angle (degrees)', fontsize=11, fontweight='bold')
+ax5.set_ylabel('Normalized Gain (dB)', fontsize=11, fontweight='bold')
+ax5.set_title('Beam Pattern Comparison (Elevation = 0°)', fontsize=12, fontweight='bold')
+ax5.set_xlim([-90, 90])
+ax5.set_ylim([-30, 5])
+ax5.grid(True, alpha=0.3, linestyle='--')
+ax5.legend(loc='upper right', fontsize=8, framealpha=0.9, ncol=2)
+ax5.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_display} dB', 
+         transform=ax5.transAxes, fontsize=9, verticalalignment='bottom',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
-# ===== Row 2, Col 2: Polar Plot - Optimal Tx Beam =====
-ax5 = fig.add_subplot(2, 3, 5, projection='polar')
+# ===== Row 2, Col 3: Optimal Joint Pattern =====
+ax6 = fig.add_subplot(3, 3, 6, projection='polar')
 
-ax5.plot(az_tx_optimal, pattern_tx_optimal, 'b-', linewidth=2.5, label='Tx Beam')
-ax5.fill(az_tx_optimal, pattern_tx_optimal, 'blue', alpha=0.2)
-
-ax5.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
-for s in range(num_scatterers_vis):
-    ax5.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
-                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
-
-ax5.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
-ax5.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-configure_upper_half_polar_axis(ax5)
-
-# ===== Row 2, Col 3: Polar Plot - Optimal Rx Beam =====
-ax6 = fig.add_subplot(2, 3, 6, projection='polar')
-
-ax6.plot(az_rx_optimal, pattern_rx_optimal, 'g-', linewidth=2.5, label='Rx Beam')
-ax6.fill(az_rx_optimal, pattern_rx_optimal, 'green', alpha=0.2)
+ax6.plot(az_joint_optimal, pattern_joint_optimal, color='purple', linewidth=2.5, label=r'$|v^H a a^T w|^2$')
+ax6.fill(az_joint_optimal, pattern_joint_optimal, color='purple', alpha=0.2)
 
 ax6.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
 for s in range(num_scatterers_vis):
-    ax6.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+    ax6.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0,
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax6.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax6.set_title(r'Optimal Joint Pattern $|v^H a a^T w|^2$', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax6)
+
+# ===== Row 3, Col 2: Polar Plot - Optimal Tx Beam =====
+ax7 = fig.add_subplot(3, 3, 8, projection='polar')
+
+ax7.plot(az_tx_optimal, pattern_tx_optimal, 'b-', linewidth=2.5, label='Tx Beam')
+ax7.fill(az_tx_optimal, pattern_tx_optimal, 'blue', alpha=0.2)
+
+ax7.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax7.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
+
+ax7.set_title('Optimal Tx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax7.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
+configure_upper_half_polar_axis(ax7)
+
+# ===== Row 3, Col 3: Polar Plot - Optimal Rx Beam =====
+ax8 = fig.add_subplot(3, 3, 9, projection='polar')
+
+ax8.plot(az_rx_optimal, pattern_rx_optimal, 'g-', linewidth=2.5, label='Rx Beam')
+ax8.fill(az_rx_optimal, pattern_rx_optimal, 'green', alpha=0.2)
+
+ax8.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+for s in range(num_scatterers_vis):
+    ax8.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
+                label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
+
+ax8.set_title('Optimal Rx Beamformer', fontsize=12, fontweight='bold', pad=15)
+ax8.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
+configure_upper_half_polar_axis(ax8)
+
+# Keep the center-bottom subplot empty to avoid over-crowding the figure.
+ax9 = fig.add_subplot(3, 3, 7)
+ax9.axis('off')
 
 plt.tight_layout()
 
