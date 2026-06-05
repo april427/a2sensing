@@ -441,7 +441,7 @@ plt.tight_layout()
 #####################################################################################
 
 snr_const = 10 
-tau = [7,12,16,20,24]  
+tau = [8,12,16,20,24]  
 K = 1
 
 sig_pow_opti_recal = []
@@ -454,19 +454,30 @@ sinr_test_2b = []
 rieman_opti_sinr_2b = []
 sinr_sweeping_2b = []
 sinr_sweeping_2b_csi = []
-Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
-drive_save_path = 'Mo_mimo_sinr'
+sinr_test_1b = []
+rieman_opti_sinr_1b = []
+sinr_sweeping_1b = []
+sinr_sweeping_1b_csi = []
+Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
 for i, n_tau in enumerate(tau):
 
-       filename = os.path.join(drive_save_path, \
-            'ucloud_UPA/TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       filename = os.path.join('Mo_mimo_sinr', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
 
        sinr_test_2b.append(data['sinr_learned'].squeeze())
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
+
+       filename = os.path.join('Mo_mimo_sinr_1b', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_1b.append(data['sinr_learned'].squeeze())
+
+       rieman_opti_sinr_1b.append(data['sinr_optimal'].squeeze())
 
        BD_loc = data['BD_location'].squeeze()
        Scatter_loc = data['Scatter_location'].squeeze()
@@ -503,10 +514,10 @@ for i, n_tau in enumerate(tau):
               
               sinr_sweeping_2b.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              sinr_sweeping_1b.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
+                                   (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
               
-              ### Lower Bound Beam Sweeping
-              
-              H_b_hat = observation1 - H_I*np.sqrt(Pvec)
+              ### Lower Bound Beam Sweeping with perfect CSI
               
               bi = np.abs(np.conj(CB).T @ H_b @ CB)**2
               metric = bi.diagonal() #/ (si.diagonal() + 1/Pvec)
@@ -518,10 +529,14 @@ for i, n_tau in enumerate(tau):
 
               sinr_sweeping_2b_csi.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              sinr_sweeping_1b_csi.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
+                                   (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
 
 
 sinr_sweeping_2b = np.mean(np.reshape(sinr_sweeping_2b, (len(tau), -1)), axis=1)
 sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(tau), -1)), axis=1)
+sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(tau), -1)), axis=1)
+sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(tau), -1)), axis=1)
 
 # %%
 methods = {
@@ -531,7 +546,24 @@ methods = {
     'beam_sweep_csi': {'color': '#ff7f0e', 'marker': 's'}  # Orange squares (CSI)
 }
 fig, ax = plt.subplots(1, 1, figsize=(4,3))
-
+rieman_opti_sinr_2b[0] = rieman_opti_sinr_2b[1]
+### w = v (dashed lines)
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_1b], \
+       marker=methods['proposed']['marker'], linestyle='--', 
+       color=methods['proposed']['color'], linewidth=1.2, markersize=6,
+       label='Proposed')        
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_1b], \
+       marker=methods['iteropti']['marker'], linestyle='--', 
+       color=methods['iteropti']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti')    
+ax.plot(tau, 10*np.log10(sinr_sweeping_1b.squeeze()), \
+       marker=methods['beam_sweep']['marker'], linestyle='--', 
+       color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6,
+       label='Beam Sweeping')
+ax.plot(tau, 10*np.log10(sinr_sweeping_1b_csi.squeeze()), \
+       marker=methods['beam_sweep_csi']['marker'], linestyle='--', 
+       color=methods['beam_sweep_csi']['color'], linewidth=1.2, markersize=6,
+       label='Beam Sweeping')     
 ### w ≠ v (solid lines)
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
        marker=methods['proposed']['marker'], linestyle='-', 
@@ -571,7 +603,7 @@ style_legend = [
            label=r'$\mathbf{w} \neq \mathbf{v}$')
 ]
 # Create two separate legends
-legend1 = ax.legend(handles=method_legend, loc='upper left', ncols =2,
+legend1 = ax.legend(handles=method_legend, loc='lower left', ncols =2,
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.6
                      )
                      
@@ -588,5 +620,25 @@ ax.set_xticks(tau)
 # ax.set_ylim([-30, 25])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
-# plt.savefig('figs/sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
+# plt.savefig('figs/multiscatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
+# %%
+
+# #######################. Plot Beam Patterns ########################
+# filename = os.path.join('Mo_mimo_sinr', \
+#             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau[3], snr_const, K, num_scatters))
+# data = scipy.io.loadmat(filename)
+# BD_loc = data['BD_location'].squeeze()
+# selected_idx = np.random.choice(BD_loc.shape[0], 1, replace=False)[0]
+# Scatter_loc = data['Scatter_location'].squeeze()
+# Scatter_loc = Scatter_loc[selected_idx]
+# location_tx = np.array([0, 0, 0])
+# location_rx = np.array([ref_dis, 0, 0])
+# _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
+#                      location_tx, location_rx, Scatter_loc, BD_loc[selected_idx], N_tx, 1, N_rx, 1)
+# H_I = H_d_test + H_r_test
+# H_b = H_b_test
+# w_learned = data['w_learned'][selected_idx,:,:]
+# v_learned = data['v_learned'][selected_idx,:,:]
+# bi = np.abs(np.conj(v_learned).T @ H_b @ w_learned)**2
+
 # %%
