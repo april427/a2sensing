@@ -590,6 +590,9 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
                 # Calculate 2D distance between TX and RX elements
                 dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
                 H_SI[i, j] = (1/(dist + 1e-8)) * np.exp(- 1j * 2 * np.pi * dist / wavelength)
+        H_SI = np.sqrt(Rician_factor_linear / (1 + Rician_factor_linear)) * H_SI\
+              + np.sqrt(1 / (1 + Rician_factor_linear)) * (np.random.normal(loc=0, scale=np.sqrt(0.5), size=(N_total, N_total)) \
+                                                           + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=(N_total, N_total)))
         H_direct =  5e-2 * H_SI / np.linalg.norm(H_SI, 'fro') 
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
