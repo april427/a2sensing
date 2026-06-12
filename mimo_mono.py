@@ -129,7 +129,7 @@ class LSTM_Cell(tf.keras.layers.Layer):
 # System Configuration
 #####################################################
 
-drive_save_path = 'Mo_mimo_sinr'
+drive_save_path = 'Mo_mimo_sinr_modelsave'
 os.makedirs(drive_save_path, exist_ok=True)
 
 # System parameters
@@ -403,6 +403,7 @@ with tf.name_scope("active_sensing_agent"):
     
     # Storage
     v_list = []
+    w_list = []
     Y1 = tf.zeros([tf.shape(loc_input)[0], N_rx], dtype=tf.complex64) 
     Y2 = tf.zeros([tf.shape(loc_input)[0], N_rx], dtype=tf.complex64)
 
@@ -488,8 +489,9 @@ with tf.name_scope("active_sensing_agent"):
         v1 = tf.reshape(v1, [-1, N_rx, 1])
         
         # Store beamformers for analysis
-        v_list.append(tf.concat([tf.real(tf.squeeze(v1, axis=2)), tf.imag(tf.squeeze(v1, axis=2))], axis=1))
-    
+        v_list.append(v1)
+        w_list.append(w1)
+
     #####################################################
     # Output Final Beamformers after tau interactions
     # Both RIS and Rx use the shared LSTM state c_old
@@ -511,6 +513,8 @@ with tf.name_scope("active_sensing_agent"):
     v_complex = tf.complex(v_tmp[:, 0:N_rx], v_tmp[:, N_rx:2 * N_rx])
     v_complex = tf.reshape(v_complex, [-1, N_rx, 1])
 
+    v_list.append(v_complex)
+    w_list.append(w_complex)
 #####################################################
 # Loss Function: Maximize BD SINR
 # SINR = P_s * |v^H H_b w|^2 / (P_s * |v^H (H_d + H_r) w|^2 + noise_power)
@@ -530,11 +534,11 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_interference, w_complex))  # (batch, 1, 1)
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
-    sinr_BD = sig_BD / (sig_int + noise_var + 1e-10)
+    sinr_BD = sig_BD / (sig_int + noise_var)
     sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-4, 1e4)
     
     # Log SINR with per-sample clipping to prevent outliers from dominating
-    log_sinr_BD_raw = tf.log(sinr_BD_clipped + 1e-9)
+    log_sinr_BD_raw = tf.log(sinr_BD_clipped )
     log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -8.0, 8.0)  # ~±35 dB range
     
     # For backward compatibility, define sig_ref as interference
@@ -545,7 +549,7 @@ with tf.name_scope("sinr_computation"):
     int_scatter = tf.matmul(tf.linalg.adjoint(v_complex), \
                             tf.matmul(H_d_placeholder+H_b_placeholder, w_complex))  # (batch, 1, 1)
     sinr_scatter = tf.squeeze(tf.abs(sig_scatter) ** 2) * lay['P'] / \
-                    (tf.squeeze(tf.abs(int_scatter) ** 2) * lay['P'] + noise_var + 1e-10)
+                    (tf.squeeze(tf.abs(int_scatter) ** 2) * lay['P'] + noise_var)
 
 
 #####################################################
@@ -583,14 +587,14 @@ with tf.name_scope("optimal_beamformer"):
     sig_int_opt = tf.matmul(tf.linalg.adjoint(v_opt), tf.matmul(H_interference, w_opt))
     sig_int_opt = tf.squeeze(tf.abs(sig_int_opt) ** 2) * lay['P']
     
-    sinr_BD_opt = sig_BD_opt / (sig_int_opt + noise_var + 1e-10)
+    sinr_BD_opt = sig_BD_opt / (sig_int_opt + noise_var )
 
     scatter_sig_opt = tf.matmul(tf.linalg.adjoint(v_opt), tf.matmul(H_r_placeholder, w_opt))  # (batch, 1, 1)
     scatter_sig_opt = tf.squeeze(tf.abs(scatter_sig_opt) ** 2) * lay['P']
     scatter_int_opt = tf.matmul(tf.linalg.adjoint(v_opt), \
                             tf.matmul(H_d_placeholder+H_b_placeholder, w_opt))  # (batch, 1, 1)
     scatter_int_opt = tf.squeeze(tf.abs(scatter_int_opt) ** 2) * lay['P']
-    sinr_scatter_opt = scatter_sig_opt / (scatter_int_opt + noise_var + 1e-10)
+    sinr_scatter_opt = scatter_sig_opt / (scatter_int_opt + noise_var )
     
 with tf.name_scope("sp_beamformer"):
     # Signal processing baseline from noisy pilot measurements.
@@ -642,7 +646,7 @@ with tf.name_scope("sp_beamformer"):
     sig_int_sp = tf.matmul(tf.linalg.adjoint(v_sp), tf.matmul(H_interference, w_sp))
     sig_int_sp = tf.squeeze(tf.abs(sig_int_sp) ** 2) * lay['P']
     
-    sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var + 1e-10)
+    sinr_BD_sp = sig_BD_sp / (sig_int_sp + noise_var )
 
     #### Beam sweeping baseline (selection from estimated channels; evaluation on true channels).
     sweep_codebook_tf = tf.constant(sweep_codebook, dtype=tf.complex64)
@@ -796,7 +800,7 @@ print("=" * 60)
 print(f"N_tx: {N_tx}, N_rx: {N_rx}, tau: {tau}, K: {K}, SNR: {snr_const[0]} dB")
 print("=" * 60 + "\n")
 
-model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}'
+model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsc_{num_scatters}'
 
 with tf.Session() as sess:
     if initial_run == 1:
@@ -918,8 +922,10 @@ with tf.Session() as sess:
         H_r_placeholder: H_r_test
     }
     
-    sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal = sess.run(
-        [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex, w_complex, v_opt, w_opt], feed_dict=feed_dict_test
+    sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, \
+        v_optimal, w_optimal, v_list_test, w_list_test = sess.run(
+                [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex, w_complex, \
+                v_opt, w_opt, v_list, w_list], feed_dict=feed_dict_test
     )
 
     sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
@@ -950,10 +956,11 @@ with tf.Session() as sess:
         v_learned=v_learned,
         w_learned=w_learned,
         v_optimal=v_optimal,
-        w_optimal=w_optimal
+        w_optimal=w_optimal,
+        v_list_test=v_list_test, 
+        w_list_test=w_list_test
     ))
     print(f"\nResults saved to {model_filename}")
-
 
 
 
@@ -1053,7 +1060,7 @@ required_vis_vars = [
 ]
 force_reload = bool(globals().get('force_load_visualization_data', False))
 if force_reload or any(name not in globals() for name in required_vis_vars):
-    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr')
+    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr_modelsave')
     if not os.path.isdir(result_dir):
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
     result_file = _pick_result_file(result_dir)
