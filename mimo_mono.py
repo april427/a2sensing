@@ -19,8 +19,9 @@ import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 
-# Suppress TensorFlow logging
+# TensorFlow/CUDA environment variables must be set before importing TensorFlow.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress INFO and WARNING logs
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 try:
     import tensorflow.compat.v1 as tf
@@ -47,7 +48,7 @@ except ImportError:
     os.system('pip install scipy')
 import scipy.io as sio
 from scipy.linalg import eig
-from keras.layers import BatchNormalization, Dense
+from tensorflow.keras.layers import BatchNormalization, Dense
 from manifold_optimization import solve_with_random_restarts
 from parse_args import parse_args
 from channel_functions import *
@@ -55,8 +56,6 @@ from channel_functions import *
 args = parse_args()
 
 # GPU configuration
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-
 if False:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     print(tf.config.list_physical_devices('CPU'))
@@ -807,6 +806,7 @@ with tf.Session() as sess:
         init.run()
     else:
         saver.restore(sess, model_ckpt)
+        n_epochs = 5 # If continue training
     
     # Early stopping
     best_val = 1e9

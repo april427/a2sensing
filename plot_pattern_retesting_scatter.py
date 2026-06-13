@@ -16,7 +16,7 @@ import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
 
-from keras.layers import BatchNormalization, Dense
+from tensorflow.keras.layers import BatchNormalization, Dense
 from parse_args import parse_args
 from channel_functions import generate_location_mimo, generate_mimo_channel
 
@@ -233,6 +233,44 @@ def build_inference_graph(args):
     return graph
 
 
+def build_compatible_saver(checkpoint_path):
+    """Build a saver that restores only variables that exactly match checkpoint keys and shapes."""
+    ckpt_vars = {name: shape for name, shape in tf.train.list_variables(checkpoint_path)}
+    graph_vars = tf.global_variables()
+
+    matched = {}
+    skipped_shape = []
+    missing = []
+
+    for v in graph_vars:
+        name = v.op.name
+        shape = v.shape.as_list()
+        ckpt_shape = ckpt_vars.get(name)
+        if ckpt_shape is None:
+            missing.append(name)
+            continue
+        if list(ckpt_shape) != list(shape):
+            skipped_shape.append((name, ckpt_shape, shape))
+            continue
+        matched[name] = v
+
+    if not matched:
+        raise RuntimeError(
+            f"No variables matched between graph and checkpoint: {checkpoint_path}"
+        )
+
+    print(
+        f"Restore summary: matched={len(matched)}, "
+        f"missing_in_ckpt={len(missing)}, shape_mismatch={len(skipped_shape)}"
+    )
+    if missing:
+        print("First missing keys:", missing[:8])
+    if skipped_shape:
+        print("First shape mismatches:", skipped_shape[:3])
+
+    return tf.train.Saver(var_list=matched)
+
+
 def generate_test_samples(num_samples, n_tx, n_rx, n_scatters, rician_factor, location_tx, location_rx):
     samples = []
     for _ in range(num_samples):
@@ -441,9 +479,9 @@ def create_beam_pattern_animation(angles, beam_r_steps, sinr_steps_db, true_bd_a
     return fig, anim
 
 args = parse_args()
-seed = getattr(args, 'seed', 42)
-test_seed = seed + 10000  # Offset to separate from training data
-np.random.seed(test_seed)
+# seed = getattr(args, 'seed', 42)
+# test_seed = seed + 10000  # Offset to separate from training data
+# np.random.seed(test_seed)
 n_tx = args.N_ris
 n_rx = args.N_ris
 n_scatters = 1
@@ -464,7 +502,7 @@ location_tx = np.array([0.0, 0.0, 0.0])
 location_rx = np.array([0.0, 0.0, 0.0])
 
 graph = build_inference_graph(args)
-saver = tf.train.Saver()
+saver = build_compatible_saver(model_path)
 
 num_samples = max(1, int(getattr(args, 'num_users', 1)))
 test_samples = generate_test_samples(num_samples, n_tx, n_rx, n_scatters, args.rician_factor, location_tx, location_rx)
@@ -473,6 +511,8 @@ angles = np.linspace(-np.pi / 2, np.pi / 2, 361)
 angles_deg = np.degrees(angles)
 
 with tf.Session() as sess:
+    # Initialize everything first so unmatched variables have valid values.
+    sess.run(tf.global_variables_initializer())
     saver.restore(sess, model_path)
     print('Model restored successfully.')
 
