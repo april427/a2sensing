@@ -589,12 +589,13 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             for j in range(N_total):
                 # Calculate 2D distance between TX and RX elements
                 dist = np.sqrt((rx_pos_x[j] - tx_pos_x[i])**2 + (rx_pos_y[j] - tx_pos_y[i])**2)
-                H_SI[i, j] = (1/(dist + 1e-8)) * (np.sqrt(10 / (1 + 10)) * np.exp(- 1j * 2 * np.pi * dist / wavelength) +\
-                                    np.sqrt(1 / (1 + 10)) * (np.random.normal(loc=0, scale=np.sqrt(0.5)) + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5))))
-        # H_SI = np.sqrt(10 / (1 + 10)) * H_SI / np.linalg.norm(H_SI, 'fro')\
-        #       + np.sqrt(1 / (1 + 10)) * (np.random.normal(loc=0, scale=np.sqrt(0.5), size=(N_total, N_total)) \
-                                                        #    + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=(N_total, N_total)))
-        H_direct =  2e-2 * H_SI / np.linalg.norm(H_SI, 'fro') 
+                H_SI[i, j] = (1/(dist + 1e-8)) * np.exp(- 1j * 2 * np.pi * dist / wavelength) 
+        H_nlos = (np.random.normal(0.0, np.sqrt(0.5), size=(N_total, N_total))
+                        + 1j * np.random.normal(0.0, np.sqrt(0.5), size=(N_total, N_total))
+                        ).astype(np.complex64)
+        H_nlos = H_nlos / np.linalg.norm(H_nlos, "fro")
+        H_SI = H_SI / np.linalg.norm(H_SI, 'fro') 
+        H_direct =  2e-2 * (np.sqrt(100/(1+100)) * H_SI + np.sqrt(1/(1+100)) * H_nlos)
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
         d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])

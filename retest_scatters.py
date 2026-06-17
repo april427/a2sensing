@@ -471,7 +471,7 @@ for i, n_tau in enumerate(tau):
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
 
-       filename = os.path.join('Mo_mimo_sinr_1b', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
 
@@ -623,22 +623,4 @@ plt.tight_layout()
 # plt.savefig('figs/multiscatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
 # %%
 
-# #######################. Plot Beam Patterns ########################
-# filename = os.path.join('Mo_mimo_sinr', \
-#             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau[3], snr_const, K, num_scatters))
-# data = scipy.io.loadmat(filename)
-# BD_loc = data['BD_location'].squeeze()
-# selected_idx = np.random.choice(BD_loc.shape[0], 1, replace=False)[0]
-# Scatter_loc = data['Scatter_location'].squeeze()
-# Scatter_loc = Scatter_loc[selected_idx]
-# location_tx = np.array([0, 0, 0])
-# location_rx = np.array([ref_dis, 0, 0])
-# _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
-#                      location_tx, location_rx, Scatter_loc, BD_loc[selected_idx], N_tx, 1, N_rx, 1)
-# H_I = H_d_test + H_r_test
-# H_b = H_b_test
-# w_learned = data['w_learned'][selected_idx,:,:]
-# v_learned = data['v_learned'][selected_idx,:,:]
-# bi = np.abs(np.conj(v_learned).T @ H_b @ w_learned)**2
 
-# %%

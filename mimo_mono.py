@@ -359,7 +359,7 @@ sweep_codebook = hadamard_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].cop
 #  
 initial_run = 1 if args.n_epochs > 0 else 0
 n_epochs = args.n_epochs
-learning_rate = 5e-4
+learning_rate = 3e-4
 batch_per_epoch = 128
 batch_size_order = 4
 val_size_order = 20
@@ -534,11 +534,11 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
     sinr_BD = sig_BD / (sig_int + noise_var)
-    sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-4, 1e4)
+    sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-5, 1e2)
     
     # Log SINR with per-sample clipping to prevent outliers from dominating
     log_sinr_BD_raw = tf.log(sinr_BD_clipped )
-    log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -8.0, 8.0)  # ~±35 dB range
+    log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -10.0, 10.0)  # ~±35 dB range
     
     # For backward compatibility, define sig_ref as interference
     sig_ref = sig_int
@@ -717,8 +717,8 @@ warmup_lr = learning_rate * tf.minimum(1.0, global_step_float / warmup_steps)
 decayed_lr = tf.train.exponential_decay(
     learning_rate, 
     global_step, 
-    decay_steps=2000,  # Slower decay
-    decay_rate=0.96,    # Gentler decay
+    decay_steps=1000,  # Slower decay
+    decay_rate=0.95,    # Gentler decay
     staircase=True
 )
 
@@ -740,7 +740,7 @@ for g, v in grads_vars:
         safe_grads.append(g)
         vars_list.append(v)
 
-clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 1.0)
+clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 3.0)
 
 final_grads = []
 clip_index = 0
@@ -811,7 +811,7 @@ with tf.Session() as sess:
     # Early stopping
     best_val = 1e9
     wait = 0
-    PATIENCE = 20
+    PATIENCE = max(20, 2*tau)
     
     for epoch in range(n_epochs):
         batch_iter = 0
