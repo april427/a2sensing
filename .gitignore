@@ -13,6 +13,7 @@ BD_2bDNN/
 Bi_mimo_sinr/
 Mo_mimo_sinr/
 Mo_mimo_sinr_1b/
+Mo_mimo_sinr_modelsave_*/
 Mo_mimo_sinr_modelsave/
 
 *.ipynb

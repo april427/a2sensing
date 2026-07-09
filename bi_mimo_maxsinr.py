@@ -135,8 +135,12 @@ location_rx = np.array([0, 0, d0])                    # Rx center location
 N_tx = 4 
 N_rx = args.N_ris
 N_ris = N_rx  # Alias for backward compatibility
+N_tx_h_ch = int(np.sqrt(N_tx))
+N_tx_v_ch = int(np.sqrt(N_tx))
+N_rx_h_ch = int(np.sqrt(N_rx))
+N_rx_v_ch = int(np.sqrt(N_rx))
 num_users = 1
-num_scatters = 1  # excluding BD
+num_scatters = args.N_scatterers  # excluding BD
 Rician_factor = args.rician_factor
 location_bd = None
 
@@ -184,8 +188,8 @@ tx_signal = nr_signal_with_cp.flatten()
 initial_run = 1
 n_epochs = 50
 learning_rate = 5e-4
-batch_per_epoch = 4
-batch_size_order = 8
+batch_per_epoch = 128
+batch_size_order = 4
 val_size_order = 10
 test_size = 200
 
@@ -202,6 +206,9 @@ scatter_loc_input = tf.placeholder(tf.float32, shape=(None, 3, num_scatters), na
 H_d_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_d")
 H_b_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_b")
 H_r_placeholder = tf.placeholder(tf.complex64, shape=(None, N_ris, N_tx), name="H_r")
+H_d_rev_placeholder = tf.placeholder(tf.complex64, shape=(None, N_tx, N_ris), name="H_d_rev")
+H_b_rev_placeholder = tf.placeholder(tf.complex64, shape=(None, N_tx, N_ris), name="H_b_rev")
+H_r_rev_placeholder = tf.placeholder(tf.complex64, shape=(None, N_tx, N_ris), name="H_r_rev")
 s_placeholder = tf.placeholder(tf.complex64, shape=(None, 1, num_subcarriers), name="ambient_signal")
 
 ##################### ACTIVE SENSING NETWORK #####################
@@ -279,26 +286,23 @@ with tf.name_scope("active_sensing_agent"):
         # x_BD[t] is scalar (+1 or -1)
         x_bd_t = tf.reshape(tf.cast(x_BD[t], tf.complex64), [-1, 1, 1])  # (batch, 1, 1)
         H_eff = x_bd_t * H_b_placeholder + H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+        H_eff_rev = x_bd_t * H_b_rev_placeholder + H_d_rev_placeholder + H_r_rev_placeholder  # (batch, N_tx, N_rx)
         
         'Rx observes K samples: y = sqrt(P) * v^H * H * w * s + noise'
-        # Generate K samples with noise
         y_noiseless_before_rx = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.matmul(H_eff, w1)  # (batch, N_rx, 1)
-        y_complex_nobf = []
-        for k in range(K):
-            noise_k = tf.complex(
-                tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim),
-                tf.random_normal([batch_size, N_rx, 1], mean=0.0, stddev=noiseSTD_per_dim)
-            )
-            y_k = y_noiseless_before_rx + noise_k
-            y_complex_nobf.append(y_k)
-
-        y_complex_rx_bf = tf.matmul(tf.transpose(tf.conj(v1), perm=[0, 2, 1]), y_complex_nobf)  # (batch, K, 1)
-        y_complex_rx_bf = tf.reshape(y_complex_rx_bf, [-1, 1])  # (batch, K)
+        y_noiseless_before_rx = tf.tile(y_noiseless_before_rx, [1, 1, K])  # (batch, N_rx, K)
+        noise_rx = tf.complex(
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
+        )
+        y_complex_nobf = y_noiseless_before_rx + noise_rx
+        y_complex_rx_bf = tf.matmul(tf.linalg.adjoint(v1), y_complex_nobf)  # (batch, 1, K)
+        y_complex_rx_bf = tf.squeeze(y_complex_rx_bf, axis=1)  # (batch, K)
         
         # Stack and compute sufficient statistics (mean and power)
-        y_mean = tf.reduce_mean(y_complex_rx_bf, axis=1)[:,tf.newaxis]  # (batch, 1)
-        y_power = tf.reduce_mean(tf.abs(y_complex_rx_bf) ** 2, axis=1)[:,tf.newaxis]  # (batch, 1)
-        y_samples_flat = tf.reshape(y_complex_nobf, [batch_size, N_rx])  # (batch, N_rx)
+        y_mean = tf.reduce_mean(y_complex_rx_bf, axis=1, keepdims=True)  # (batch, 1)
+        y_power = tf.reduce_mean(tf.abs(y_complex_rx_bf) ** 2, axis=1, keepdims=True)  # (batch, 1)
+        y_samples_flat = tf.reduce_mean(y_complex_nobf, axis=2)  # (batch, N_rx)
 
         # Feature for Rx LSTM: [Re(y_mean), Im(y_mean), y_power, x_BD[t], snr]
         y_real2 = tf.concat([
@@ -326,22 +330,18 @@ with tf.name_scope("active_sensing_agent"):
         v2 = tf.complex(v_tx_her[:, 0:N_rx], v_tx_her[:, N_rx:2 * N_rx])  # Tx dim for reverse
         v2 = tf.reshape(v2, [-1, N_rx, 1])
         
-        'Tx observes reverse link: y = sqrt(P) * w^H * H^T * v2 * s + noise'
-        # Reverse channel: H^T (transposed channel)
-        H_eff_T = tf.transpose(H_eff, perm=[0, 2, 1])  # (batch, N_tx, N_rx)
-        y_noiseless_before_tx = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.matmul(H_eff_T, v2)  # (batch, N_tx, 1)
-        ytx_complex_nobf = []
-        for k in range(K):
-            noise_k_rev = tf.complex(
-                tf.random_normal([batch_size, N_tx, 1], mean=0.0, stddev=noiseSTD_per_dim),
-                tf.random_normal([batch_size, N_tx, 1], mean=0.0, stddev=noiseSTD_per_dim)
-            )
-            y_k_rev = y_noiseless_before_tx + noise_k_rev
-            ytx_complex_nobf.append(y_k_rev)
-        ytx_sample_flat = tf.reshape(ytx_complex_nobf, [batch_size, N_tx])  # (batch, N_tx)
+        'Tx observes reverse link: y = sqrt(P) * w^H * H_rev * v2 * s + noise'
+        y_noiseless_before_tx = tf.complex(tf.sqrt(lay['P']), 0.0) * tf.matmul(H_eff_rev, v2)  # (batch, N_tx, 1)
+        y_noiseless_before_tx = tf.tile(y_noiseless_before_tx, [1, 1, K])  # (batch, N_tx, K)
+        noise_tx = tf.complex(
+            tf.random_normal([batch_size, N_tx, K], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([batch_size, N_tx, K], mean=0.0, stddev=noiseSTD_per_dim)
+        )
+        ytx_complex_nobf = y_noiseless_before_tx + noise_tx
+        ytx_sample_flat = tf.reduce_mean(ytx_complex_nobf, axis=2)  # (batch, N_tx)
         
-        y_complex_tx_bf = tf.matmul(tf.transpose(tf.conj(w2), perm=[0, 2, 1]), ytx_complex_nobf)  # Using v2 as Rx transmit
-        y_complex_tx_bf = tf.reshape(y_complex_tx_bf, [-1, K])
+        y_complex_tx_bf = tf.matmul(tf.linalg.adjoint(w2), ytx_complex_nobf)
+        y_complex_tx_bf = tf.squeeze(y_complex_tx_bf, axis=1)  # (batch, K)
         
         y_mean_rev = tf.reduce_mean(y_complex_tx_bf, axis=1)[:,tf.newaxis]
         y_power_rev = tf.reduce_mean(tf.abs(y_complex_tx_bf) ** 2, axis=1)[:,tf.newaxis]
@@ -579,6 +579,29 @@ with tf.control_dependencies(nan_checks):
 init = tf.global_variables_initializer()
 saver = tf.train.Saver()
 
+def sample_bistatic_batch(num_samples):
+    """Generate one batched bi-static dataset sample for training/evaluation."""
+    bd_locations = generate_location_mimo_batch(num_samples, 1, 'u')[:, 0, :]
+    if num_scatters > 0:
+        scatter_locations = generate_location_mimo_batch(num_samples, num_scatters, 's')
+    else:
+        scatter_locations = np.zeros((num_samples, 0, 3), dtype=np.float32)
+
+    (_, H_d, H_r, H_b,
+     _, H_d_rev, H_r_rev, H_b_rev) = generate_bistatic_mimo_channel_batch(
+        location_tx,
+        location_rx,
+        scatter_locations,
+        bd_locations,
+        N_tx_h=N_tx_h_ch,
+        N_tx_v=N_tx_v_ch,
+        N_rx_h=N_rx_h_ch,
+        N_rx_v=N_rx_v_ch,
+        Rician_factor=Rician_factor
+    )
+    loc_features = build_mimo_location_features(bd_locations, location_tx, location_rx)
+    return loc_features, H_d, H_b, H_r, H_d_rev, H_b_rev, H_r_rev, bd_locations, scatter_locations
+
 
 #####################################################
 # Data Generation
@@ -587,54 +610,25 @@ saver = tf.train.Saver()
 # Validation set
 num_val_samples = val_size_order * 32
 
-# Generate channels for validation
-H_d_val_list = []
-H_b_val_list = []
-H_r_val_list = []
-set_location_user_val = []
-
-for ii in range(num_val_samples):
-    # Generate random locations
-    bd_loc = generate_location_mimo(1)[0]
-    scatter_loc = generate_location_mimo(1)[0]
-    
-    # Generate MIMO channels using generate_mimo_channel
-    # Returns: H_total, H_direct, H_scatter, H_bd
-    _, H_d, H_r, H_b = generate_mimo_channel(
-        location_tx, location_rx, scatter_loc, bd_loc,
-        N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-        N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-        Rician_factor=Rician_factor
-    )
-    
-    H_d_val_list.append(H_d)
-    H_b_val_list.append(H_b)
-    H_r_val_list.append(H_r)
-    
-    # Store location info (azimuth, distance info)
-    d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-    d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-    azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-    set_location_user_val.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
-
-H_b_val = np.array(H_b_val_list)
-H_d_val = np.array(H_d_val_list)  # Use ALL per-sample direct channels
-H_r_val = np.array(H_r_val_list)  # Use ALL per-sample scatter channels
+set_location_user_val, H_d_val, H_b_val, H_r_val, H_d_val_rev, H_b_val_rev, H_r_val_rev, _, _ = sample_bistatic_batch(num_val_samples)
 
 # QPSK ambient signal
-qpsk_symbols = np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j]) / np.sqrt(2)
-s_signal_val = qpsk_symbols[np.random.randint(0, 4, size=(val_size_order * 32, 1, num_subcarriers))]
+qpsk_symbols = np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j], dtype=np.complex64) / np.sqrt(2)
+s_signal_val = qpsk_symbols[np.random.randint(0, 4, size=(val_size_order * 32, 1, num_subcarriers))].astype(np.complex64)
 
 # Prepare batch-sized channel matrices
 H_d_val_batch = H_d_val  # Already (num_val_samples, N_rx, N_tx)
 H_r_val_batch = H_r_val  # Already (num_val_samples, N_rx, N_tx)
 
 feed_dict_val = {
-    loc_input: np.array(set_location_user_val),
+    loc_input: set_location_user_val,
     lay['P']: Pvec[0],
     H_d_placeholder: H_d_val_batch,
     H_b_placeholder: H_b_val,
     H_r_placeholder: H_r_val_batch,
+    H_d_rev_placeholder: H_d_val_rev,
+    H_b_rev_placeholder: H_b_val_rev,
+    H_r_rev_placeholder: H_r_val_rev,
     s_placeholder: s_signal_val
 }
 
@@ -664,55 +658,27 @@ with tf.Session() as sess:
         batch_iter = 0
         epoch_train_losses = []
         epoch_sinr_values = []
+        num_train_samples = batch_size_order * 32
         
         # QPSK ambient signal
-        s_signal = qpsk_symbols[np.random.randint(0, 4, size=(batch_size_order * 32, 1, num_subcarriers))]
+        s_signal = qpsk_symbols[np.random.randint(0, 4, size=(num_train_samples, 1, num_subcarriers))].astype(np.complex64)
         
         for rnd_indices in range(batch_per_epoch):
-            # Generate training batch
-            num_train_samples = batch_size_order * 32
-            
-            H_d_train_list = []
-            H_b_train_list = []
-            H_r_train_list = []
-            set_location_user_train = []
-            
-            for ii in range(num_train_samples):
-                # Generate random locations
-                bd_loc = generate_location_mimo(1)[0]
-                scatter_loc = generate_location_mimo(1)[0]
-                
-                # Generate MIMO channels
-                _, H_d, H_r, H_b = generate_mimo_channel(
-                    location_tx, location_rx, scatter_loc, bd_loc,
-                    N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-                    N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-                    Rician_factor=Rician_factor
-                )
-                
-                H_d_train_list.append(H_d)
-                H_b_train_list.append(H_b)
-                H_r_train_list.append(H_r)
-                
-                # Store location info
-                d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-                d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-                azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-                set_location_user_train.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
-            
-            H_b_train = np.array(H_b_train_list)
-            H_d_train = np.array(H_d_train_list)  # Per-sample
-            H_r_train = np.array(H_r_train_list)  # Per-sample
+            (set_location_user_train, H_d_train, H_b_train, H_r_train,
+             H_d_train_rev, H_b_train_rev, H_r_train_rev, _, _) = sample_bistatic_batch(num_train_samples)
 
             H_d_train_batch = H_d_train  # Already correct shape
             H_r_train_batch = H_r_train  # Already correct shape
 
             feed_dict_batch = {
-                loc_input: np.array(set_location_user_train),
+                loc_input: set_location_user_train,
                 lay['P']: Pvec[0],
                 H_d_placeholder: H_d_train_batch,
                 H_b_placeholder: H_b_train,
                 H_r_placeholder: H_r_train_batch,
+                H_d_rev_placeholder: H_d_train_rev,
+                H_b_rev_placeholder: H_b_train_rev,
+                H_r_rev_placeholder: H_r_train_rev,
                 s_placeholder: s_signal
             }
             
@@ -770,54 +736,23 @@ with tf.Session() as sess:
     print("=" * 60)
     
     # Generate test batch
-    H_d_test_list = []
-    H_b_test_list = []
-    H_r_test_list = []
-    set_location_user_test = []
-    BD_loc = []
-    Scatter_loc = []
-    
-    for ii in range(test_size):
-        # Generate random locations
-        bd_loc = generate_location_mimo(1)[0]
-        scatter_loc = generate_location_mimo(1)[0]
-
-        BD_loc.append(bd_loc)
-        Scatter_loc.append(scatter_loc)
-        
-        # Generate MIMO channels
-        _, H_d, H_r, H_b = generate_mimo_channel(
-            location_tx, location_rx, scatter_loc, bd_loc,
-            N_tx_h=int(np.sqrt(N_tx)), N_tx_v=int(np.sqrt(N_tx)),
-            N_rx_h=int(np.sqrt(N_rx)), N_rx_v=int(np.sqrt(N_rx)),
-            Rician_factor=Rician_factor
-        )
-        
-        H_d_test_list.append(H_d)
-        H_b_test_list.append(H_b)
-        H_r_test_list.append(H_r)
-        
-        # Store location info
-        d_bd_rx = np.linalg.norm(bd_loc - location_rx)
-        d_bd_tx = np.linalg.norm(bd_loc - location_tx)
-        azimuth_bd = np.arctan2(bd_loc[1] - location_rx[1], bd_loc[0] - location_rx[0])
-        set_location_user_test.append(np.array([azimuth_bd, d_bd_rx, d_bd_tx])[:, np.newaxis])
-    
-    H_b_test = np.array(H_b_test_list)
-    H_d_test = np.array(H_d_test_list)  # Per-sample
-    H_r_test = np.array(H_r_test_list)  # Per-sample
+    (set_location_user_test, H_d_test, H_b_test, H_r_test,
+     H_d_test_rev, H_b_test_rev, H_r_test_rev, BD_loc, Scatter_loc) = sample_bistatic_batch(test_size)
 
     H_d_test_batch = H_d_test
     H_r_test_batch = H_r_test
     
-    s_signal_test = qpsk_symbols[np.random.randint(0, 4, size=(test_size, 1, num_subcarriers))]
+    s_signal_test = qpsk_symbols[np.random.randint(0, 4, size=(test_size, 1, num_subcarriers))].astype(np.complex64)
     
     feed_dict_test = {
-        loc_input: np.array(set_location_user_test),
+        loc_input: set_location_user_test,
         lay['P']: Pvec[0],
         H_d_placeholder: H_d_test_batch,
         H_b_placeholder: H_b_test,
         H_r_placeholder: H_r_test_batch,
+        H_d_rev_placeholder: H_d_test_rev,
+        H_b_rev_placeholder: H_b_test_rev,
+        H_r_rev_placeholder: H_r_test_rev,
         s_placeholder: s_signal_test
     }
     
@@ -839,7 +774,7 @@ with tf.Session() as sess:
         tau=tau,
         K=K,
         BD_location=BD_loc,
-        Scatter_location=Scatter_loc if Scatter_loc[0] is not None else [],
+        Scatter_location=Scatter_loc if num_scatters > 0 else [],
         sinr_learned=sinr_test,
         sinr_optimal=sinr_opt_test,
         pe_learned=pe_test,
@@ -866,7 +801,13 @@ from mpl_toolkits.mplot3d import Axes3D
 # Select one test instance for visualization
 idx = 8
 bd_loc_vis = BD_loc[idx]
-scatter_loc_vis = Scatter_loc[idx] if Scatter_loc[idx] is not None else np.array([0, 0, 0])
+if num_scatters > 0:
+    scatter_loc_vis = Scatter_loc[idx]
+    scatter_loc_vis = np.asarray(scatter_loc_vis)
+    if scatter_loc_vis.ndim > 1:
+        scatter_loc_vis = scatter_loc_vis[0]
+else:
+    scatter_loc_vis = np.array([0, 0, 0])
 
 # Reshape beamformers to 2D arrays for UPA
 N_tx_h = int(np.sqrt(N_tx))

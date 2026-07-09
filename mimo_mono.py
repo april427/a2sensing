@@ -359,9 +359,9 @@ sweep_codebook = hadamard_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].cop
 #  
 initial_run = 1 if args.n_epochs > 0 else 0
 n_epochs = args.n_epochs
-learning_rate = 3e-4
-batch_per_epoch = 128
-batch_size_order = 4
+learning_rate = args.learning_rate
+batch_per_epoch = args.batch_per_epoch
+batch_size_order = args.batch_size_order
 val_size_order = 20
 test_size = 800
 
@@ -382,7 +382,7 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size = 128  # Shared hidden size for both nodes
+    hidden_size = args.hidden_size  # Shared hidden size for both nodes
     
     LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')
     LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
@@ -704,21 +704,21 @@ loss = -tf.reduce_mean(log_sinr_BD)
 
 # Regularization
 global_step = tf.train.get_or_create_global_step()
-l2 = 1e-5
+l2 = args.l2
 reg_term = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 loss_reg = loss + l2 * reg_term
 
 
 # Add warmup and slower decay
-warmup_steps = 300
+warmup_steps = args.warmup_steps
 global_step_float = tf.cast(global_step, tf.float32)
 warmup_lr = learning_rate * tf.minimum(1.0, global_step_float / warmup_steps)
 
 decayed_lr = tf.train.exponential_decay(
     learning_rate, 
     global_step, 
-    decay_steps=1000,  # Slower decay
-    decay_rate=0.95,    # Gentler decay
+    decay_steps=args.decay_steps,  # Slower decay
+    decay_rate=args.decay_rate,    # Gentler decay
     staircase=True
 )
 
@@ -740,7 +740,7 @@ for g, v in grads_vars:
         safe_grads.append(g)
         vars_list.append(v)
 
-clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 3.0)
+clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], args.clip_norm)
 
 final_grads = []
 clip_index = 0
@@ -797,6 +797,8 @@ print("\n" + "=" * 60)
 print("BD SINR Maximization via Active Sensing")
 print("=" * 60)
 print(f"N_tx: {N_tx}, N_rx: {N_rx}, tau: {tau}, K: {K}, SNR: {snr_const[0]} dB")
+print(f"LR: {learning_rate:g}, clip_norm: {args.clip_norm:g}, warmup: {warmup_steps}, "
+    f"decay_steps: {args.decay_steps}, decay_rate: {args.decay_rate:g}, hidden: {hidden_size}")
 print("=" * 60 + "\n")
 
 model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsc_{num_scatters}'
@@ -811,7 +813,7 @@ with tf.Session() as sess:
     # Early stopping
     best_val = 1e9
     wait = 0
-    PATIENCE = max(20, 2*tau)
+    PATIENCE = args.patience if args.patience > 0 else max(20, 2 * tau)
     
     for epoch in range(n_epochs):
         batch_iter = 0

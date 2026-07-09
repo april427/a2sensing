@@ -31,6 +31,16 @@ def parse_args():
     parser.add_argument('--N_scatterers', type=int, default=1, help='Number of scatterers')
     parser.add_argument('--N_symbols', type=int, default=1, help='Number of symbols of one sample')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--learning_rate', type=float, default=3e-4, help='Initial learning rate')
+    parser.add_argument('--clip_norm', type=float, default=3.0, help='Global gradient clipping norm')
+    parser.add_argument('--warmup_steps', type=int, default=600, help='Learning-rate warmup steps')
+    parser.add_argument('--decay_steps', type=int, default=1000, help='Learning-rate decay steps')
+    parser.add_argument('--decay_rate', type=float, default=0.97, help='Exponential decay rate')
+    parser.add_argument('--l2', type=float, default=1e-5, help='L2 regularization weight')
+    parser.add_argument('--batch_per_epoch', type=int, default=128, help='Mini-batches per epoch')
+    parser.add_argument('--batch_size_order', type=int, default=4, help='Batch size multiplier (batch = value * 32)')
+    parser.add_argument('--hidden_size', type=int, default=128, help='LSTM hidden size')
+    parser.add_argument('--patience', type=int, default=-1, help='Early stopping patience; <=0 uses default max(20, 2*tau)')
 
     args, unknown = parser.parse_known_args(filtered_argv[1:])
     return args
