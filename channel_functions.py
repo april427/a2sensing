@@ -536,7 +536,8 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     scatter_location : numpy.ndarray
         Scatterer location [x, y, z]
     bd_location : numpy.ndarray
-        Backscatter device location [x, y, z]
+        One backscatter-device location with shape (3,), or multiple locations
+        with shape (num_devices, 3).
     N_tx_h : int
         Number of TX antenna elements in horizontal direction
     N_tx_v : int
@@ -559,7 +560,8 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     H_scatter : numpy.ndarray
         Scattered path channel (via scatterer)
     H_bd : numpy.ndarray
-        BD scattered path channel (via BD)
+        BD scattered path channel. Shape (N_rx, N_tx) for a single location
+        input, or (num_devices, N_rx, N_tx) for multiple locations.
     """
     if wavelength is None:
         wavelength = Wavelength
@@ -659,35 +661,53 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     else:
         H_scatter = np.zeros((N_rx, N_tx), dtype=complex)
     
-    # --- BD Scattered Path Channel: TX to BD to RX ---
-    d_tx_bd = np.linalg.norm(bd_location - tx_location)
-    d_bd_rx = np.linalg.norm(rx_location - bd_location)
-    
-    # TX to BD angles
-    azimuth_tx_bd = np.arctan2(bd_location[1] - tx_location[1],
-                                bd_location[0] - tx_location[0])
-    elevation_tx_bd = np.arcsin((bd_location[2] - tx_location[2]) / (d_tx_bd + 1e-8))
-    
-    # BD to RX angles
-    azimuth_bd_rx = np.arctan2(rx_location[1] - bd_location[1],
-                                rx_location[0] - bd_location[0])
-    elevation_bd_rx = np.arcsin((rx_location[2] - bd_location[2]) / (d_bd_rx + 1e-8))
-    
-    # Steering vectors for BD path
-    a_tx_bd = generate_upa_steering_vector(N_tx_h, N_tx_v, azimuth_tx_bd,
-                                            elevation_tx_bd, wavelength)[:, np.newaxis]
-    a_rx_bd = generate_upa_steering_vector(N_rx_h, N_rx_v, azimuth_bd_rx,
-                                            elevation_bd_rx, wavelength)[:, np.newaxis]
-    
-    # BD path channel with pathloss
-    pathloss_bd_db = path_loss_r(d_tx_bd, wavelength, d_bd_rx, type='backscatter')
-    pathloss_bd = np.sqrt(10 ** ((-pathloss_bd_db) / 10))
-    
-    H_bd = pathloss_bd * (a_rx_bd @ a_tx_bd.T)
+    # --- BD Scattered Path Channels: TX to each BD to RX ---
+    bd_location_array = np.asarray(bd_location)
+    single_bd_input = bd_location_array.ndim == 1
+    bd_locations = np.atleast_2d(bd_location_array)
+    if bd_locations.shape[1] != 3 or bd_locations.shape[0] == 0:
+        raise ValueError(
+            "bd_location must have shape (3,) or (num_devices, 3)"
+        )
+
+    H_bd_all = np.zeros((bd_locations.shape[0], N_rx, N_tx), dtype=complex)
+    for device_idx, device_location in enumerate(bd_locations):
+        d_tx_bd = np.linalg.norm(device_location - tx_location)
+        d_bd_rx = np.linalg.norm(rx_location - device_location)
+
+        # TX to BD angles
+        azimuth_tx_bd = np.arctan2(device_location[1] - tx_location[1],
+                                   device_location[0] - tx_location[0])
+        elevation_tx_bd = np.arcsin(
+            (device_location[2] - tx_location[2]) / (d_tx_bd + 1e-8)
+        )
+
+        # BD to RX angles
+        azimuth_bd_rx = np.arctan2(rx_location[1] - device_location[1],
+                                   rx_location[0] - device_location[0])
+        elevation_bd_rx = np.arcsin(
+            (rx_location[2] - device_location[2]) / (d_bd_rx + 1e-8)
+        )
+
+        a_tx_bd = generate_upa_steering_vector(
+            N_tx_h, N_tx_v, azimuth_tx_bd, elevation_tx_bd, wavelength
+        )[:, np.newaxis]
+        a_rx_bd = generate_upa_steering_vector(
+            N_rx_h, N_rx_v, azimuth_bd_rx, elevation_bd_rx, wavelength
+        )[:, np.newaxis]
+
+        pathloss_bd_db = path_loss_r(
+            d_tx_bd, wavelength, d_bd_rx, type='backscatter'
+        )
+        pathloss_bd = np.sqrt(10 ** ((-pathloss_bd_db) / 10))
+        H_bd_all[device_idx] = pathloss_bd * (a_rx_bd @ a_tx_bd.T)
+
+    # Preserve the original 2-D return for callers that pass one (3,) location.
+    H_bd = H_bd_all[0] if single_bd_input else H_bd_all
     
     # --- Total Channel with Rician Fading ---
     normalize_factor = np.linalg.norm(H_direct, 'fro')
-    H_total = H_direct + H_scatter + H_bd 
+    H_total = H_direct + H_scatter + np.sum(H_bd_all, axis=0)
 
     # scatters that are far away, modeled as Rayleigh fading
     # H_nlos = (np.random.normal(loc=0, scale=np.sqrt(0.5), size=(N_rx, N_tx)) +
@@ -705,5 +725,4 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
     H_bd = H_bd  
     
     return H_total, H_direct, H_scatter, H_bd
-
 
