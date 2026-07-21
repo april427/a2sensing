@@ -538,8 +538,17 @@ with tf.name_scope("active_sensing_agent"):
             'p,bprk->brk', tf.cast(common_seq, tf.complex64), y_preamble
         ) / tf.cast(preamble_length, tf.complex64)
 
-        Y1 = Y1 + tf.reduce_mean(y_bd_despread, axis=3)
-        Y2 = Y2 + tf.reduce_mean(y_common_despread, axis=2)
+        # Average the K repeated observations while retaining the full receive-
+        # antenna vectors before applying v1^H.
+        y_bd_before_beamforming = tf.reduce_mean(
+            y_bd_despread, axis=3
+        )  # (batch, num_users, N_rx)
+        y_common_before_beamforming = tf.reduce_mean(
+            y_common_despread, axis=2
+        )  # (batch, N_rx)
+
+        Y1 = Y1 + y_bd_before_beamforming
+        Y2 = Y2 + y_common_before_beamforming
 
         # Apply the receive beamformer: Y1_after = v1^H Y1 and
         # Y2_after = v1^H Y2.
@@ -552,16 +561,27 @@ with tf.name_scope("active_sensing_agent"):
             [-1, 1]
         )  # (batch, 1)
 
-        # Stack only the real and imaginary parts of the beamformed quantities.
+        # Include both the despread receive vectors before beamforming and the
+        # scalar observations after applying v1^H.
         y_real = tf.concat([
+            tf.reshape(
+                tf.cast(tf.real(y_bd_before_beamforming), tf.float32),
+                [batch_size, num_users * N_rx]
+            ),
+            tf.reshape(
+                tf.cast(tf.imag(y_bd_before_beamforming), tf.float32),
+                [batch_size, num_users * N_rx]
+            ),
             tf.cast(tf.real(Y1_after), tf.float32),
             tf.cast(tf.imag(Y1_after), tf.float32),
-        ], axis=1)  # (batch, 2*num_users)
+        ], axis=1)  # (batch, 2*num_users*N_rx + 2*num_users)
 
         y_real2 = tf.concat([
+            tf.cast(tf.real(y_common_before_beamforming), tf.float32),
+            tf.cast(tf.imag(y_common_before_beamforming), tf.float32),
             tf.cast(tf.real(Y2_after), tf.float32),
             tf.cast(tf.imag(Y2_after), tf.float32),
-        ], axis=1)  # (batch, 2)
+        ], axis=1)  # (batch, 2*N_rx + 2)
         
         'Update one fused LSTM state from concatenated Y1/Y2 statistics'
         fused_obs = tf.concat([y_real, y_real2, snr_normal], axis=1)
@@ -683,6 +703,18 @@ with tf.name_scope("sinr_computation"):
 
 with tf.name_scope("optimal_beamformer"):
     batch_size_opt = tf.shape(H_b_placeholder)[0]
+
+    # Keep only the woke-up BD channel for each sample. The resulting shape is
+    # (batch, 1, N_rx, N_tx), as expected by the batch optimizer.
+    active_channel_mask = tf.reshape(
+        tf.cast(active_mask, tf.complex64), [-1, num_users, 1, 1]
+    )
+    H_b_active = tf.reduce_sum(
+        active_channel_mask * H_b_placeholder,
+        axis=1,
+        keepdims=True,
+        name="active_BD_channel"
+    )
     
     P_c = tf.cast(lay['P'], tf.complex64)
     N0_c = tf.cast(noise_var, tf.complex64)
@@ -698,17 +730,21 @@ with tf.name_scope("optimal_beamformer"):
     # Wrap in tf.py_func
     v_opt, w_opt = tf.py_func(
         lambda H_b, H_int: compute_optimal_beamformers_np(H_b, H_int, noise_var, Pvec[0]),
-        [H_b_placeholder, H_interference],
+        [H_b_active, H_interference],
         [tf.complex64, tf.complex64]
     )
     
     # Set shapes explicitly
     v_opt = tf.reshape(v_opt, [-1, N_rx, 1])
     w_opt = tf.reshape(w_opt, [-1, N_tx, 1])
-    # Optimal SINR with SVD-based beamformers
-    opt_bd_amp = tf.einsum('bri,buri->bu', tf.math.conj(v_opt), tf.einsum('burc,bci->buri', H_b_placeholder, w_opt))
+    # Optimal SINR for the woke-up BD only.
+    opt_bd_amp = tf.einsum(
+        'bri,buri->bu',
+        tf.math.conj(v_opt),
+        tf.einsum('burc,bci->buri', H_b_active, w_opt)
+    )
     sig_BD_opt_per_device = tf.abs(opt_bd_amp) ** 2 * lay['P']
-    sig_BD_opt = tf.reduce_sum(sig_BD_opt_per_device, axis=1)
+    sig_BD_opt = tf.squeeze(sig_BD_opt_per_device, axis=1)
     
     sig_int_opt = tf.matmul(tf.linalg.adjoint(v_opt), tf.matmul(H_interference, w_opt))
     sig_int_opt = tf.squeeze(tf.abs(sig_int_opt) ** 2) * lay['P']
@@ -1018,7 +1054,7 @@ with tf.Session() as sess:
               f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
               f'SINR_active (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
-              f'SINR_BD (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
+              f'SINR_active (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
         print(f'         | '
               f'Sig_BD: {np.mean(sig_bd_val):8.4f} | '
               f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
@@ -1090,11 +1126,11 @@ with tf.Session() as sess:
     print(f"Test sum-SINR (learned):    {10 * np.log10(np.mean(sinr_sum_test) + 1e-10):6.2f} dB")
     for device_idx in range(num_users):
         print(f"  BD {device_idx + 1}: {10 * np.log10(np.mean(sinr_per_device_test[:, device_idx]) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (optimal):  {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
+    print(f"Test SINR_active (optimal): {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_BD (signalprocessing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_BD (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
-    print(f"Sum-SINR gap to optimal: {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_sum_test) + 1e-10)):6.2f} dB")
+    print(f"Active-SINR gap to optimal: {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
     
     # Save results
     model_filename = os.path.join(drive_save_path, \
