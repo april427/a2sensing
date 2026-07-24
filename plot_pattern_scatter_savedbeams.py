@@ -63,7 +63,7 @@ def steering_vector_ula(n_ant, angle_rad):
     return np.exp(1j * np.pi * idx * np.sin(angle_rad))[:, np.newaxis]
 
 
-def joint_beam_pattern_db(v_vec, w_vec, angles):
+def joint_beam_pattern_gains(v_vec, w_vec, angles):
     gains = np.zeros_like(angles, dtype=np.float64)
     v = v_vec.reshape(-1, 1)
     w = w_vec.reshape(-1, 1)
@@ -71,8 +71,17 @@ def joint_beam_pattern_db(v_vec, w_vec, angles):
         a = steering_vector_ula(v.shape[0], angle)
         h = a @ a.T
         gains[i] = np.abs(np.conj(v).T @ h @ w).item() ** 2
-    gains = gains / (np.max(gains) + 1e-12)
-    return 10.0 * np.log10(gains + 1e-12)
+    return gains
+
+
+def gains_to_db(gains, reference_gain):
+    normalized_gains = gains / (reference_gain + 1e-12)
+    return 10.0 * np.log10(normalized_gains + 1e-12)
+
+
+def joint_beam_pattern_db(v_vec, w_vec, angles):
+    gains = joint_beam_pattern_gains(v_vec, w_vec, angles)
+    return gains_to_db(gains, np.max(gains))
 
 
 def extract_locations(mat_data, num_samples):
@@ -118,8 +127,8 @@ def compute_single_sinr_db(v_vec, w_vec, h_b, h_d, h_r, p_tx, noise_var=1.0):
 args = parse_args()
 
 n_ant = args.N_ris
-tau = 24
-snr_db = args.snr
+tau = 16
+snr_db = 10#args.snr
 n_symbols = getattr(args, "N_symbols", 1)
 n_scatters = 5
 rician_factor = args.rician_factor
@@ -132,7 +141,7 @@ p_tx = 10 ** (snr_db / 10) / (wavelength**4 / (4 * np.pi * ref_dis) ** 4) / n_an
 location_tx = np.array([0.0, 0.0, 0.0])
 location_rx = np.array([0.0, 0.0, 0.0])
 
-result_dir = "Mo_mimo_sinr_modelsave"
+result_dir = "Mo_mimo_sinr_modelsave_one_lstm"
 if not os.path.isdir(result_dir):
     raise FileNotFoundError(f"Result directory not found: {result_dir}")
 
@@ -177,7 +186,7 @@ angles = np.linspace(-np.pi / 2, np.pi / 2, 361)
 db_floor = -45.0
 r_max = 46.0
 
-n_show = [245]#np.random.choice(num_samples, size=1, replace=False)
+n_show = np.random.choice(num_samples, size=1, replace=False) #[1]#
 print(f"Plotting {len(n_show)} sample(s)")
 
 for sample_idx in n_show:
@@ -217,12 +226,20 @@ for sample_idx in n_show:
     sinr_steps_db, sig_steps_db, inter_steps_db = metrics_steps_db.T
 
     learned_final_sinr_db = float(sinr_steps_db[-1])
-    beam_learned_final = joint_beam_pattern_db(v_list[-1, sample_idx], w_list[-1, sample_idx], angles)
+    beam_gains_steps = np.asarray(
+        [
+            joint_beam_pattern_gains(v_list[t, sample_idx], w_list[t, sample_idx], angles)
+            for t in range(num_steps)
+        ]
+    )
+    beam_steps_db = gains_to_db(beam_gains_steps, np.max(beam_gains_steps))
+    beam_learned_final = beam_steps_db[-1]
     beam_r_learned_final = np.clip(beam_learned_final, db_floor, 1.0) - db_floor
 
     v_opt, w_opt = compute_optimal_beamformers(h_b, h_d + h_r, 1, p_tx, num_restarts=10)
     optimal_final_sinr_db, _, _ = compute_single_sinr_db(v_opt, w_opt, h_b, h_d, h_r, p_tx)
-    beam_opt = joint_beam_pattern_db(v_opt, w_opt, angles)
+    beam_opt_gains = joint_beam_pattern_gains(v_opt, w_opt, angles)
+    beam_opt = gains_to_db(beam_opt_gains, np.max(beam_gains_steps))
     beam_r_opt = np.clip(beam_opt, db_floor, 1.0) - db_floor
 
     n_plot = num_steps + 1
@@ -242,7 +259,7 @@ for sample_idx in n_show:
         axes[empty_idx].set_visible(False)
 
     for step_idx in range(num_steps):
-        beam_db = joint_beam_pattern_db(v_list[step_idx, sample_idx], w_list[step_idx, sample_idx], angles)
+        beam_db = beam_steps_db[step_idx]
         beam_r = np.clip(beam_db, db_floor, 1.0) - db_floor
 
         ax = axes[step_idx]
@@ -406,5 +423,5 @@ for sample_idx in n_show:
     # ax1.set_title(f"Sample {sample_idx + 1}: Learned vs Optimal Beam")
     ax1.legend(fontsize=9, loc="upper right", bbox_to_anchor=(1.24, 1.12))
     plt.tight_layout()
-    plt.savefig('figs/beam_pattern_compares.pdf', format = 'pdf', bbox_inches = 'tight')
+    # plt.savefig('figs/beam_pattern_compares.pdf', format = 'pdf', bbox_inches = 'tight')
     plt.show()

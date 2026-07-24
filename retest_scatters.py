@@ -60,16 +60,17 @@ rieman_opti_sinr_2b = []
 sinr_sweeping_2b = []
 sinr_sweeping_2b_csi = []
 iterative_generalized_eig = []
-tau = 8
+tau = 16
 K = 1
+N_scatter = 5
 CB = dft_codebook(N_tx, tau)
-snr_const = [-5, 0, 5, 10]
+snr_const = [-5, 0, 5, 10, 15]
 for i, snr in enumerate(snr_const):
 
        ###############################################################
        #            files with scatters (Extension)
        ###############################################################
-       filename = os.path.join('Mo_mimo_sinr', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave', \
               'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
        data = scipy.io.loadmat(filename)
 
@@ -77,7 +78,7 @@ for i, snr in enumerate(snr_const):
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
 
-       filename = os.path.join('Mo_mimo_sinr_1b', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
        data1b = scipy.io.loadmat(filename)
        sinr_test_1b.append(data1b['sinr_learned'].squeeze())
@@ -234,7 +235,7 @@ ax.add_artist(legend1)
 ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(snr_const)
-ax.set_ylim([-40, 30])
+ax.set_ylim([-20, 20])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
 # plt.savefig('figs/scatter_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
@@ -463,7 +464,7 @@ Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
 for i, n_tau in enumerate(tau):
 
-       filename = os.path.join('Mo_mimo_sinr', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
 
@@ -471,7 +472,7 @@ for i, n_tau in enumerate(tau):
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
 
-       filename = os.path.join('Mo_mimo_sinr_modelsave', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave_K10', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
 
@@ -621,6 +622,121 @@ ax.set_xticks(tau)
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
 # plt.savefig('figs/multiscatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
+
 # %%
+#####################################################################################
+# ------------------------- Cell, Hidden state or both ----------------------------- #
+#####################################################################################
+
+snr_const = 10 
+tau = [8,16,24]  
+K = 1
+
+sig_pow_opti_recal = []
+int_pow_opti_recal = []
+sinr_opti_recal = []
+num_scatters = 5
+
+sinr_test_2_lstm = []
+sinr_test_2_lstm_fixedSI = []
+sinr_test_both = []
+sinr_test_hidden = []
+sinr_test_cell = []
+
+sinr_2_lstm_opti_sinr = []
+sinr_2_lstm_fixedSI_opti_sinr = []
+
+Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
+
+for i, n_tau in enumerate(tau):
+       filename = os.path.join('Mo_mimo_sinr', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_2_lstm_fixedSI.append(data['sinr_learned'].squeeze())
+       sinr_2_lstm_fixedSI_opti_sinr.append(data['sinr_optimal'].squeeze())
+
+       filename = os.path.join('Mo_mimo_sinr_modelsave', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_2_lstm.append(data['sinr_learned'].squeeze())
+       sinr_2_lstm_opti_sinr.append(data['sinr_optimal'].squeeze())
+
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_both.append(data['sinr_learned'].squeeze())
+
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm_hidden', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_hidden.append(data['sinr_learned'].squeeze())
+
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm_cell', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_cell.append(data['sinr_learned'].squeeze())
+
+       BD_loc = data['BD_location'].squeeze()
+       Scatter_loc = data['Scatter_location'].squeeze()
+       test_size = BD_loc.shape[0]
+
+       CB = dft_codebook(N_tx, n_tau)
 
 
+methods = {
+    'proposed': {'color': '#d62728', 'marker': 'd'},      # Red diamonds
+    'hidden': {'color': '#1f77b4', 'marker': 'o'},      # Blue circles
+    'cell': {'color': '#ff7f0e', 'marker': 's'},  # Orange squares
+    'two_lstm': {'color': '#2ca02c', 'marker': '^'},  # Green triangles
+    'fixedSI': {'color': '#9467bd', 'marker': 'p'}  # Purple pentagons
+}
+fig, ax = plt.subplots(1, 1, figsize=(4,3))
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2_lstm], \
+       marker=methods['two_lstm']['marker'], linestyle='-',
+       color=methods['two_lstm']['color'], linewidth=1.2, markersize=6,
+       label='Two LSTM') 
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2_lstm_fixedSI], \
+       marker=methods['fixedSI']['marker'], linestyle='-',
+       color=methods['fixedSI']['color'], linewidth=1.2, markersize=6,
+       label='2 LSTM (Fixed SI)')
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_both], \
+       marker=methods['proposed']['marker'], linestyle='-', 
+       color=methods['proposed']['color'], linewidth=1.2, markersize=6,
+       label='Proposed')       
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_hidden], \
+       marker=methods['hidden']['marker'], linestyle='-', 
+       color=methods['hidden']['color'], linewidth=1.2, markersize=6)        
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_cell], \
+       marker=methods['cell']['marker'], linestyle='-',   
+       color=methods['cell']['color'], linewidth=1.2, markersize=6)
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_2_lstm_opti_sinr], \
+       marker=methods['two_lstm']['marker'], linestyle='--',
+       color=methods['two_lstm']['color'], linewidth=1.2, markersize=6)
+
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_2_lstm_fixedSI_opti_sinr], \
+       marker=methods['fixedSI']['marker'], linestyle='--',
+       color=methods['fixedSI']['color'], linewidth=1.2, markersize=6)
+
+
+ax.legend([ax.lines[0], ax.lines[1], ax.lines[2], ax.lines[3], ax.lines[4], ax.lines[5], ax.lines[6]],\
+           ['2 LSTM', '2 LSTM (Fixed SI)', '1 LSTM both', '1 Hidden State Only', '1 Cell State Only', '2 LSTM (Optimal)', '2 LSTM (Fixed SI) (Optimal)'],\
+           loc='lower right', fontsize=9, frameon=True, fancybox=True, framealpha=0.6)
+
+ax.set_xlabel('Preamble Length')
+ax.set_ylabel('Achieved SINR [dB]')
+ax.set_xticks(tau)
+# ax.set_ylim([-30, 25])
+ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
+plt.tight_layout()
+# %%

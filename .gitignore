@@ -16,6 +16,8 @@ Mo_mimo_sinr_1b/
 Mo_mimo_sinr_modelsave_*/
 Mo_mimo_sinr_modelsave/
 
+Mo_1lstm_*/
+
 *.ipynb
 plots.py 
 
