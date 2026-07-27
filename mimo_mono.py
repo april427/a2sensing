@@ -859,16 +859,16 @@ with tf.Session() as sess:
             [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
 
             # sp-based beamformer performance
-            sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-                        [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
+            # sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
+            #             [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
 
         
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
               f'Best: {best_val:8.4f}')
-        print(f'         | '
-              f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
+        # print(f'         | '
+            #   f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
               f'SINR_BD (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
               f'SINR_BD (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')

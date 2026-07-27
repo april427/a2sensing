@@ -1,10 +1,10 @@
 """
-Bi-Static MIMO with BD SINR Maximization Objective
+Mono-Static MIMO with BD SINR Maximization Objective
 
 There exist other static scatters. 
 BD alters its states to distinguish itself from other reflectors.
 
-Objective: max_v SINR_BD = P|w^H H_b v|^2 / (P|w^H (H_d+H_r) v|^2 + noise_var)
+Objective: max_v SINR_BD = P|v^H H_b v|^2 / (P|v^H (H_d+H_r) v|^2 + noise_var)
 w = v
 
 """
@@ -150,7 +150,7 @@ location_bd = None
 
 # Sensing parameters
 tau = args.tau  # Pilot length (also number of BD interactions)
-K = getattr(args, "N_symbols", 5)  # Number of OFDM symbols per BD state
+K = getattr(args, "N_symbols", 1)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
 ref_dis = 15*Wavelength
@@ -394,19 +394,16 @@ with tf.name_scope("active_sensing_agent"):
         y_noiseless2 = tf.tile(tf.complex(tf.sqrt(lay['P']), 0.0) *  tf.matmul(H_eff2, v1), [1, 1, K])  # (batch, N_rx, K)
         
         noise = tf.complex(
-            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
-            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
+            tf.random_normal([2, batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
+            tf.random_normal([2, batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
         )
 
-        y_complex1 = tf.add(y_noiseless1, noise)  # (batch, N_rx, K) Before beamforming
-        y_complex2 = tf.add(y_noiseless2, tf.complex(
-            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim),
-            tf.random_normal([batch_size, N_rx, K], mean=0.0, stddev=noiseSTD_per_dim)
-        ))  # (batch, N_rx, K) Before beamforming
+        y_complex1 = tf.add(y_noiseless1, noise[0])  # (batch, N_rx, K) Before beamforming
+        y_complex2 = tf.add(y_noiseless2, noise[1])  # (batch, N_rx, K) Before beamforming
         
 
-        Y1 = Y1 + tf.reduce_mean(x_bd_t * y_complex1 - x_bd_t * y_complex2, axis=2, keepdims=False)
-        Y2 = Y2 + tf.reduce_mean(y_complex1 + y_complex2, axis=2, keepdims=False)  # Accumulate over time steps
+        Y1 =  tf.reduce_mean(x_bd_t * y_complex1 - x_bd_t * y_complex2, axis=2, keepdims=False)
+        Y2 =  tf.reduce_mean(y_complex1 + y_complex2, axis=2, keepdims=False)  # Accumulate over time steps
         Y1_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y1, [-1, N_rx, 1])), axis=2, keepdims=False)
         Y2_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y2, [-1, N_rx, 1])), axis=2, keepdims=False)
         y_real = tf.concat([
@@ -769,16 +766,16 @@ with tf.Session() as sess:
             [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
 
             # sp-based beamformer performance
-            sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-                        [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
+            # sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
+            #             [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
 
         
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
               f'Best: {best_val:8.4f}')
-        print(f'         | '
-              f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
+        # print(f'         | '
+        #       f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
               f'SINR_BD (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
               f'SINR_BD (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
