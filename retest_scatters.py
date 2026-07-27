@@ -122,20 +122,18 @@ for i, snr in enumerate(snr_const):
               sinr_sweeping_1b.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
 
-              ##### Beam sweeping with Perfect SI Channel Estimation
-
-              bi = np.abs(np.conj(CB).T @ H_b @ CB)**2
-              metric = bi.diagonal() 
-
+              ##### Beam sweeping without BD feedback
+              numerator = np.abs(np.diag(CB.conj().T @ H_b_hat @ CB))**2
+              denominator = np.abs(np.diag(CB.conj().T @ H_I_hat @ CB))**2 + 1/Pvec
+              metric = numerator / denominator
               best_idx = np.argmax(metric)
-              theta_test = CB[:, best_idx][:, np.newaxis]
-              N_test = np.eye(N_tx) - ((H_I @ theta_test) @ np.conj(H_I @ theta_test).transpose())\
-                                                 /np.linalg.norm(H_I @ theta_test)**2
-              v_test = (N_test @ theta_test) / np.linalg.norm(N_test @ theta_test)
-              sinr_sweeping_2b_csi.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
-                                   (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
-              sinr_sweeping_1b_csi.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
-                                   (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
+              v_sp = CB[:, best_idx]
+              theta_sp = CB[:, best_idx]
+                     
+              sinr_sweeping_2b_csi.append(Pvec * np.abs(np.transpose(np.conj(v_sp)) @ H_b @ theta_sp)**2 / \
+                                   (Pvec * np.abs(np.transpose(np.conj(v_sp)) @ H_I @ theta_sp)**2 + 1))
+              sinr_sweeping_1b_csi.append(Pvec * np.abs(np.transpose(np.conj(theta_sp)) @ H_b @ theta_sp)**2 / \
+                                   (Pvec * np.abs(np.transpose(np.conj(theta_sp)) @ H_I @ theta_sp)**2 + 1))
 
 
 
@@ -235,7 +233,7 @@ ax.add_artist(legend1)
 ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(snr_const)
-ax.set_ylim([-20, 20])
+ax.set_ylim([-25, 20])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
 # plt.savefig('figs/scatter_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
