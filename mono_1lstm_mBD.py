@@ -46,9 +46,8 @@ try:
 except ImportError:
     os.system('pip install scipy')
 import scipy.io as sio
-from scipy.linalg import eig
+from scipy.linalg import eigh
 from tensorflow.keras.layers import BatchNormalization, Dense
-from manifold_optimization import solve_with_random_restarts
 from parse_args import parse_args
 from channel_functions import *
 
@@ -127,9 +126,6 @@ class LSTM_Cell(tf.keras.layers.Layer):
 # System Configuration
 #####################################################
 
-drive_save_path = 'Mo_1LSTM_3BD_results'
-os.makedirs(drive_save_path, exist_ok=True)
-
 # System parameters
 fc = args.fc
 Wavelength = 3e8 / fc
@@ -147,11 +143,13 @@ N_tx = args.N_ris
 N_rx = args.N_ris
 N_ris = N_rx       # Numbers of antennas are all the same
 
-num_users = 3  # Number of independently modulating backscatter devices
-
-
+num_users = 3#args.num_users  # Number of independently modulating BD
 if num_users < 1:
     raise ValueError("--num_users must be at least 1")
+
+drive_save_path = f'Mo_1LSTM_{num_users}BD_results'
+os.makedirs(drive_save_path, exist_ok=True)
+
 num_scatters = args.N_scatterers  # excluding BD
 Rician_factor = args.rician_factor
 location_bd = None
@@ -164,21 +162,21 @@ snr_const = np.array([snr_const])
 ref_dis = 15*Wavelength
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
-# A length-(num_users + 1) Hadamard preamble is used at every sensing step.
-# Column 0 is the common/static-channel code and columns 1..num_users are the
-# three zero-mean BD codes. Exactly one randomly selected BD transmits its code;
-# the other BDs transmit zeros.
+# An orthogonal Hadamard preamble is used at every sensing step. Column 0 is
+# the common/static-channel code and columns 1..num_users are the zero-mean BD
+# codes. Exactly one randomly selected BD transmits its code; the other BDs
+# transmit zeros.
 if tau < 1:
     raise ValueError("tau must be at least 1")
 
 def make_bd_preamble(num_devices):
+    """Return enough orthogonal Hadamard columns for any positive BD count."""
     from scipy.linalg import hadamard
-    preamble_length = num_devices + 1
-    if preamble_length & (preamble_length - 1):
-        raise ValueError(
-            "num_users + 1 must be a power of two for a Hadamard preamble"
-        )
-    return hadamard(preamble_length).astype(np.float32)
+    num_codes = num_devices + 1
+    preamble_length = 1
+    while preamble_length < num_codes:
+        preamble_length *= 2
+    return hadamard(preamble_length)[:, :num_codes].astype(np.float32)
 
 BD_preamble = make_bd_preamble(num_users)
 preamble_length = BD_preamble.shape[0]
@@ -244,17 +242,6 @@ def compute_optimal_beamformers_batch_parallel(H_b_batch, H_int_batch, noise_var
     for i in range(batch_size):
         H_b_i = H_b_batch[i]
         H_int_i = H_int_batch[i]
-        if H_b_i.shape[0] == 1:
-            try:
-                w_i, v_i, _ = solve_with_random_restarts(
-                    np.sqrt(P_val) * H_b_i[0], np.sqrt(P_val) * H_int_i,
-                    c=noise_var_val, restarts=num_restarts
-                )
-                v_opt_batch[i, :, 0] = v_i
-                w_opt_batch[i, :, 0] = w_i
-                continue
-            except Exception:
-                pass
         best_sinr = -np.inf
         for _ in range(num_restarts):
             try:
@@ -265,14 +252,18 @@ def compute_optimal_beamformers_batch_parallel(H_b_batch, H_int_batch, noise_var
                     R_sig_rx = P_val * desired_rx.T @ desired_rx.conj()
                     int_rx = H_int_i @ w
                     R_int_rx = P_val * np.outer(int_rx, int_rx.conj()) + noise_var_val * np.eye(n_rx)
-                    vals, vecs = eig(R_sig_rx, R_int_rx)
+                    vals, vecs = eigh(
+                        R_sig_rx, R_int_rx, check_finite=False
+                    )
                     v = vecs[:, np.argmax(np.real(vals))]
                     v /= np.linalg.norm(v)
                     desired_tx = np.stack([H.conj().T @ v for H in H_b_i])
                     R_sig_tx = P_val * desired_tx.T @ desired_tx.conj()
                     int_tx = H_int_i.conj().T @ v
                     R_int_tx = P_val * np.outer(int_tx, int_tx.conj()) + noise_var_val * np.eye(n_tx)
-                    vals, vecs = eig(R_sig_tx, R_int_tx)
+                    vals, vecs = eigh(
+                        R_sig_tx, R_int_tx, check_finite=False
+                    )
                     w = vecs[:, np.argmax(np.real(vals))]
                     w /= np.linalg.norm(w)
             except Exception:
@@ -482,55 +473,49 @@ with tf.name_scope("active_sensing_agent"):
             w_init_real = tf.get_variable("w_init_real", shape=(1, N_tx, 1), trainable=True)
             w_init_imag = tf.get_variable("w_init_imag", shape=(1, N_tx, 1), trainable=True)
             w_complex_init = tf.complex(w_init_real, w_init_imag)
-            w1 = w_complex_init / tf.cast(tf.norm(w_complex_init, axis=1, keepdims=True), tf.complex64)
+            w1 = w_complex_init / (tf.cast(tf.norm(w_complex_init, axis=1, keepdims=True), tf.complex64) + 1e-8)
+            w1 = tf.tile(w1, [batch_size, 1, 1])
             
             # Initialize first Rx receive beamformer v
             v_init_real = tf.get_variable("v_init_real", shape=(1, N_rx, 1), trainable=True)
             v_init_imag = tf.get_variable("v_init_imag", shape=(1, N_rx, 1), trainable=True)
             v_complex_init = tf.complex(v_init_real, v_init_imag)
-            v1 = v_complex_init / tf.cast(tf.norm(v_complex_init, axis=1, keepdims=True), tf.complex64)
+            v1 = v_complex_init / (tf.cast(tf.norm(v_complex_init, axis=1, keepdims=True), tf.complex64) + 1e-8)
+            v1 = tf.tile(v1, [batch_size, 1, 1])
         
-        # The selected BD transmits its Hadamard sequence; all others transmit
-        # zeros.
+        # The selected BD transmits its Hadamard sequence; all others transmit zeros.
         bd_chip_states = tf.expand_dims(active_mask, 1) * tf.expand_dims(bd_seq, 0)
         bd_chip_states = tf.cast(bd_chip_states, tf.complex64)
 
+        # Keep the preamble-chip dimension explicit so this graph works for
+        # every num_users/preamble_length without per-chip tensor definitions.
         H_common = H_d_placeholder + H_r_placeholder
         H_bd_chips = tf.einsum('bpu,burc->bprc', bd_chip_states, H_b_placeholder)
-        H_eff0 = H_common + H_bd_chips[:, 0, :, :]
-        H_eff1 = H_common + H_bd_chips[:, 1, :, :]
-        H_eff2 = H_common + H_bd_chips[:, 2, :, :]
-        H_eff3 = H_common + H_bd_chips[:, 3, :, :]
+        H_eff = tf.expand_dims(H_common, axis=1) + H_bd_chips
 
         sqrt_p = tf.complex(tf.sqrt(lay['P']), 0.0)
-        y_noiseless0 = tf.tile(sqrt_p * tf.matmul(H_eff0, w1), [1, 1, K])
-        y_noiseless1 = tf.tile(sqrt_p * tf.matmul(H_eff1, w1), [1, 1, K])
-        y_noiseless2 = tf.tile(sqrt_p * tf.matmul(H_eff2, w1), [1, 1, K])
-        y_noiseless3 = tf.tile(sqrt_p * tf.matmul(H_eff3, w1), [1, 1, K])
+        y_noiseless = tf.einsum(
+            'bprc,bci->bpri', H_eff, w1
+        )  # (batch, preamble_length, N_rx, 1)
+        y_noiseless = tf.tile(
+            sqrt_p * y_noiseless, [1, 1, 1, K]
+        )
 
-        def add_independent_noise(y_noiseless, chip_index):
-            noise = tf.complex(
-                tf.random_normal(
-                    [batch_size, N_rx, K], mean=0.0,
-                    stddev=noiseSTD_per_dim,
-                    name="noise_real_t{}_chip{}".format(t, chip_index)
-                ),
-                tf.random_normal(
-                    [batch_size, N_rx, K], mean=0.0,
-                    stddev=noiseSTD_per_dim,
-                    name="noise_imag_t{}_chip{}".format(t, chip_index)
-                )
+        # A single tensor draw still gives independent noise for every sample,
+        # preamble chip, receive antenna, and repeated observation.
+        noise_shape = [batch_size, preamble_length, N_rx, K]
+        noise = tf.complex(
+            tf.random_normal(
+                noise_shape, mean=0.0, stddev=noiseSTD_per_dim,
+                name="noise_real_t{}".format(t)
+            ),
+            tf.random_normal(
+                noise_shape, mean=0.0, stddev=noiseSTD_per_dim,
+                name="noise_imag_t{}".format(t)
             )
-            return y_noiseless + noise
-
-        y_complex0 = add_independent_noise(y_noiseless0, 0)
-        y_complex1 = add_independent_noise(y_noiseless1, 1)
-        y_complex2 = add_independent_noise(y_noiseless2, 2)
-        y_complex3 = add_independent_noise(y_noiseless3, 3)
-
-        y_preamble = tf.stack(
-            [y_complex0, y_complex1, y_complex2, y_complex3], axis=1
-        )  # (batch, preamble_length, N_rx, K)
+        )
+        y_preamble = y_noiseless + noise
+        # Received preamble sequence: (batch, preamble_length, N_rx, K)
         y_bd_despread = tf.einsum(
             'pu,bprk->burk', tf.cast(bd_seq, tf.complex64), y_preamble
         ) / tf.cast(preamble_length, tf.complex64)
@@ -547,8 +532,8 @@ with tf.name_scope("active_sensing_agent"):
             y_common_despread, axis=2
         )  # (batch, N_rx)
 
-        Y1 = Y1 + y_bd_before_beamforming
-        Y2 = Y2 + y_common_before_beamforming
+        Y1 =  y_bd_before_beamforming
+        Y2 =  y_common_before_beamforming
 
         # Apply the receive beamformer: Y1_after = v1^H Y1 and
         # Y2_after = v1^H Y2.
@@ -1037,8 +1022,8 @@ with tf.Session() as sess:
             [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
 
             # sp-based beamformer performance
-            sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-                        [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
+            # sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
+            #             [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
 
         
         print(f'Epoch {epoch:3d} | '
@@ -1050,8 +1035,8 @@ with tf.Session() as sess:
               f'{100 * id_accuracy_val:6.2f}% | '
               f'Val SINR Loss: {sinr_loss_val:8.4f} | '
               f'Val ID Loss: {id_loss_val:8.4f}')
-        print(f'         | '
-              f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
+        # print(f'         | '
+        #       f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
               f'SINR_active (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
               f'SINR_active (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
@@ -1142,6 +1127,12 @@ with tf.Session() as sess:
         tau=tau,
         K=K,
         num_users=num_users,
+        num_scatters=num_scatters,
+        fc=fc,
+        wavelength=Wavelength,
+        rician_factor=Rician_factor,
+        location_tx=location_tx,
+        location_rx=location_rx,
         BD_preamble=BD_preamble,
         BD_location=BD_loc,
         Scatter_location=Scatter_loc if Scatter_loc[0] is not None else [],
@@ -1175,13 +1166,6 @@ with tf.Session() as sess:
 print("\n" + "=" * 60)
 print("Beam Pattern Visualization (2D - Azimuth)")
 print("=" * 60)
-
-N_tx = 36
-N_rx = 36
-tau = 7
-K = 1
-num_scatters = 3
-snr_const = 10  # dB
 
 # Allow running this section alone (e.g., in an IDE/Jupyter cell).
 if 'np' not in globals():
@@ -1239,13 +1223,19 @@ def _pick_result_file(result_dir):
         return override_file
 
     candidate = None
-    snr_arr = np.atleast_1d(np.squeeze(np.asarray(globals()['snr_const'])))
-    snr0 = int(snr_arr[0])
-    candidate = os.path.join(
-        result_dir,
-        f"TEST_joint_sinr_id_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}_Nbd_{num_users}.mat"
+    parameter_names = (
+        'N_tx', 'N_rx', 'tau', 'snr_const', 'K',
+        'num_scatters', 'num_users'
     )
-    if not os.path.isfile(candidate):
+    if all(name in globals() for name in parameter_names):
+        snr_arr = np.atleast_1d(np.squeeze(np.asarray(snr_const)))
+        snr0 = int(snr_arr[0])
+        candidate = os.path.join(
+            result_dir,
+            f"TEST_joint_sinr_id_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}_Nbd_{num_users}.mat"
+        )
+
+    if candidate is None or not os.path.isfile(candidate):
         candidate = [
             os.path.join(result_dir, f) for f in os.listdir(result_dir)
             if f.startswith(('TEST_joint_sinr_id_', 'TEST_sinr_'))
@@ -1263,11 +1253,13 @@ def _pick_result_file(result_dir):
 required_vis_vars = [
     'w_learned', 'v_learned', 'w_optimal', 'v_optimal',
     'sinr_test', 'sinr_opt_test', 'sinr_sp_test', 'sinr_sweep_test',
-    'BD_loc', 'Scatter_loc'
+    'BD_loc', 'Scatter_loc', 'active_user_test', 'predicted_user_test'
 ]
 force_reload = bool(globals().get('force_load_visualization_data', False))
 if force_reload or any(name not in globals() for name in required_vis_vars):
-    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr_modelsave')
+    result_dir = globals().get(
+        'drive_save_path', f'Mo_1LSTM_{num_users}BD_results'
+    )
     if not os.path.isdir(result_dir):
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
     result_file = _pick_result_file(result_dir)
@@ -1280,6 +1272,22 @@ if force_reload or any(name not in globals() for name in required_vis_vars):
         N_rx = int(np.squeeze(loaded['N_rx']))
     if 'tau' in loaded:
         tau = int(np.squeeze(loaded['tau']))
+    if 'K' in loaded:
+        K = int(np.squeeze(loaded['K']))
+    if 'num_users' in loaded:
+        num_users = int(np.squeeze(loaded['num_users']))
+    if 'num_scatters' in loaded:
+        num_scatters = int(np.squeeze(loaded['num_scatters']))
+    if 'fc' in loaded:
+        fc = float(np.squeeze(loaded['fc']))
+    if 'wavelength' in loaded:
+        Wavelength = float(np.squeeze(loaded['wavelength']))
+    if 'rician_factor' in loaded:
+        Rician_factor = float(np.squeeze(loaded['rician_factor']))
+    if 'location_tx' in loaded:
+        location_tx = np.squeeze(loaded['location_tx']).astype(np.float64)
+    if 'location_rx' in loaded:
+        location_rx = np.squeeze(loaded['location_rx']).astype(np.float64)
     if 'snr_const' in loaded:
         snr_const = np.atleast_1d(np.squeeze(loaded['snr_const']))
 
@@ -1293,6 +1301,11 @@ if force_reload or any(name not in globals() for name in required_vis_vars):
     sinr_sp_test = np.squeeze(loaded.get('sinr_sp', np.full_like(np.atleast_1d(sinr_test), np.nan, dtype=np.float64)))
     sinr_sweep_test = np.squeeze(loaded.get('sinr_sweep', np.full_like(np.atleast_1d(sinr_test), np.nan, dtype=np.float64)))
 
+    active_user_test = np.squeeze(loaded.get('active_user', np.array([], dtype=np.int64)))
+    predicted_user_test = np.squeeze(loaded.get('predicted_user', np.array([], dtype=np.int64)))
+    id_probabilities_test = np.asarray(
+        loaded.get('identification_probabilities', np.array([]))
+    )
     BD_loc = _decode_saved_locations(loaded.get('BD_location', np.array([])))
     Scatter_loc = _decode_saved_locations(loaded.get('Scatter_location', np.array([])))
 
@@ -1318,13 +1331,23 @@ if v_optimal.ndim == 2:
 
 num_realizations = int(w_learned.shape[0])
 if len(BD_loc) == 0:
-    BD_loc = [np.array([0, 0, 0], dtype=np.float64) for _ in range(num_realizations)]
+    raise ValueError("No BD locations are available for the 2D scene.")
 if len(Scatter_loc) == 0:
     Scatter_loc = [None for _ in range(num_realizations)]
 if len(BD_loc) < num_realizations:
-    BD_loc += [np.array([0, 0, 0], dtype=np.float64) for _ in range(num_realizations - len(BD_loc))]
+    raise ValueError(
+        f"Only {len(BD_loc)} BD-location entries are available for "
+        f"{num_realizations} beamformer realizations."
+    )
 if len(Scatter_loc) < num_realizations:
     Scatter_loc += [None for _ in range(num_realizations - len(Scatter_loc))]
+
+active_user_test = np.asarray(active_user_test, dtype=np.int64).reshape(-1)
+predicted_user_test = np.asarray(predicted_user_test, dtype=np.int64).reshape(-1)
+if active_user_test.size < num_realizations:
+    raise ValueError("Saved active-BD labels do not cover all realizations.")
+if predicted_user_test.size < num_realizations:
+    raise ValueError("Saved identified-BD labels do not cover all realizations.")
 
 # Select one test instance for visualization (random unless beam_pattern_idx is set)
 idx_default = np.random.randint(num_realizations)
@@ -1336,9 +1359,20 @@ if bd_loc_vis.ndim == 1:
 if bd_loc_vis.ndim != 2 or bd_loc_vis.shape[-1] != 3:
     bd_loc_vis = np.asarray(bd_loc_vis).reshape(-1, 3)
 bd_locations_vis = bd_loc_vis
-# The detailed pattern annotation uses BD 1; all BD locations remain available
-# in bd_locations_vis for custom multi-target plots.
-bd_loc_vis = bd_locations_vis[0]
+num_bds_vis = bd_locations_vis.shape[0]
+active_bd_idx = int(active_user_test[idx])
+identified_bd_idx = int(predicted_user_test[idx])
+if not 0 <= active_bd_idx < num_bds_vis:
+    raise ValueError(
+        f"Active BD index {active_bd_idx} is outside the {num_bds_vis} saved BDs."
+    )
+if not 0 <= identified_bd_idx < num_bds_vis:
+    raise ValueError(
+        f"Identified BD index {identified_bd_idx} is outside the {num_bds_vis} saved BDs."
+    )
+active_bd_loc = bd_locations_vis[active_bd_idx]
+identified_bd_loc = bd_locations_vis[identified_bd_idx]
+identification_correct = active_bd_idx == identified_bd_idx
 
 # Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
 scatter_entry = Scatter_loc[idx] if idx < len(Scatter_loc) else None
@@ -1367,36 +1401,43 @@ def fold_ula_azimuth(angle_rad, sector_start=-np.pi / 2):
     return np.mod(angle_rad - sector_start, np.pi) + sector_start
 
 # Function to compute 2D beam pattern (azimuth only, elevation = 0)
-def compute_beam_pattern_2d(beamformer, N_h, num_points=360):
-    """Compute 2D beam pattern for azimuth in [-pi/2, pi/2] (elevation = 0)
-    
-    For elevation = 0:
-    - cos(el) = 1, sin(el) = 0
-    - steering_vector = exp(1j * pi * i * sin(az))
-    This simplifies to a ULA pattern in azimuth.
+def compute_beam_pattern_2d(beamformer, N_h, array_role, num_points=360):
+    """Compute a Tx or Rx response versus the physical scene bearing.
+
+    ``generate_mimo_channel`` builds a monostatic path as
+    ``a_rx(-az) @ a_tx(az).T``. Consequently, the transmit response is
+    ``|a_tx(az).T w|^2`` and the receive response is
+    ``|v.H a_rx(-az)|^2``. Keeping those conventions explicit prevents the
+    plotted lobes from being mirrored relative to the XY scene.
     """
+    if array_role not in ('tx', 'rx'):
+        raise ValueError("array_role must be 'tx' or 'rx'")
+
     azimuth = np.linspace(-np.pi / 2, np.pi / 2, num_points)
-    
     pattern = np.zeros(num_points, dtype=np.float64)
     bf = beamformer.flatten()
-    
-    # For ULA-like behavior in azimuth (elevation = 0)
-    indices = np.arange(len(bf))
-    
+    if bf.size != N_h:
+        raise ValueError(
+            f"{array_role.upper()} beamformer has {bf.size} entries; expected {N_h}."
+        )
+    indices = np.arange(N_h)
+
     for i_az in range(num_points):
         az = azimuth[i_az]
-        sin_azimuth = np.sin(az)
-        
-        # Steering vector for elevation = 0: a = exp(1j * pi * i * sin(az))
-        a = np.exp(1j * np.pi * indices * sin_azimuth)
-        pattern[i_az] = np.abs(np.dot(np.conj(bf), a)) ** 2
-    
+        a_tx = np.exp(1j * np.pi * indices * np.sin(az))
+        if array_role == 'tx':
+            response = np.dot(a_tx, bf)
+        else:
+            a_rx = np.conj(a_tx)
+            response = np.vdot(bf, a_rx)
+        pattern[i_az] = np.abs(response) ** 2
+
     # Normalize
     pattern = pattern / (np.max(pattern) + 1e-10)
     return azimuth, pattern
 
 def compute_joint_beam_pattern_2d(v_beamformer, w_beamformer, num_points=360):
-    """Compute the normalized joint response |v^H a a^T w|^2 over azimuth."""
+    """Compute ``|v.H a_rx(-az) a_tx(az).T w|^2`` over scene bearing."""
     azimuth = np.linspace(-np.pi / 2, np.pi / 2, num_points)
     pattern = np.zeros(num_points, dtype=np.float64)
 
@@ -1407,7 +1448,7 @@ def compute_joint_beam_pattern_2d(v_beamformer, w_beamformer, num_points=360):
 
     for i_az, az in enumerate(azimuth):
         sin_azimuth = np.sin(az)
-        a_rx = np.exp(1j * np.pi * rx_indices * sin_azimuth)
+        a_rx = np.exp(-1j * np.pi * rx_indices * sin_azimuth)
         a_tx = np.exp(1j * np.pi * tx_indices * sin_azimuth)
         pattern[i_az] = np.abs(np.vdot(v_vec, a_rx) * np.dot(a_tx, w_vec)) ** 2
 
@@ -1421,15 +1462,21 @@ w_optimal_vis = w_optimal[idx]  # (N_tx, 1)
 v_optimal_vis = v_optimal[idx]  # (N_rx, 1)
 
 # Compute 2D beam patterns
-az_tx_learned, pattern_tx_learned = compute_beam_pattern_2d(w_learned_vis, N_tx_h, num_points=360)
-az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_h, num_points=360)
-az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, num_points=360)
-az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, num_points=360)
+az_tx_learned, pattern_tx_learned = compute_beam_pattern_2d(w_learned_vis, N_tx_h, 'tx', num_points=360)
+az_rx_learned, pattern_rx_learned = compute_beam_pattern_2d(v_learned_vis, N_rx_h, 'rx', num_points=360)
+az_tx_optimal, pattern_tx_optimal = compute_beam_pattern_2d(w_optimal_vis, N_tx_h, 'tx', num_points=360)
+az_rx_optimal, pattern_rx_optimal = compute_beam_pattern_2d(v_optimal_vis, N_rx_h, 'rx', num_points=360)
 az_joint_learned, pattern_joint_learned = compute_joint_beam_pattern_2d(v_learned_vis, w_learned_vis, num_points=360)
 az_joint_optimal, pattern_joint_optimal = compute_joint_beam_pattern_2d(v_optimal_vis, w_optimal_vis, num_points=360)
 
-# Calculate target directions and fold to ULA-equivalent azimuth sector [-pi/2, pi/2)
-bd_azimuth = fold_ula_azimuth(np.arctan2(bd_loc_vis[1] - location_tx[1], bd_loc_vis[0] - location_tx[0]))
+# Calculate all BD directions and fold them to the ULA-equivalent azimuth
+# sector [-pi/2, pi/2). The active and identified entries index this array.
+bd_azimuths = fold_ula_azimuth(np.arctan2(
+    bd_locations_vis[:, 1] - location_tx[1],
+    bd_locations_vis[:, 0] - location_tx[0]
+))
+active_bd_azimuth = bd_azimuths[active_bd_idx]
+identified_bd_azimuth = bd_azimuths[identified_bd_idx]
 
 # Calculate azimuth for each scatterer
 scatter_azimuths = []
@@ -1448,6 +1495,33 @@ def configure_upper_half_polar_axis(ax):
     ax.set_xticklabels([r'$-\pi/2$', r'$-\pi/4$', '0', r'$\pi/4$', r'$\pi/2$'])
     ax.set_ylim([0, 1])
 
+def mark_bd_directions(ax, cartesian_degrees=False):
+    """Mark every BD, emphasizing the active and identified devices."""
+    direction_scale = 180.0 / np.pi if cartesian_degrees else 1.0
+    for device_idx, direction in enumerate(bd_azimuths):
+        if device_idx not in (active_bd_idx, identified_bd_idx):
+            ax.axvline(
+                direction * direction_scale, color='0.55', linestyle=':',
+                linewidth=1.3, alpha=0.7, label=f'BD {device_idx + 1}'
+            )
+
+    active_direction = active_bd_azimuth * direction_scale
+    if identification_correct:
+        ax.axvline(
+            active_direction, color='crimson', linestyle='--', linewidth=2.5,
+            label=f'Active & identified: BD {active_bd_idx + 1}'
+        )
+    else:
+        ax.axvline(
+            active_direction, color='crimson', linestyle='--', linewidth=2.5,
+            label=f'Active: BD {active_bd_idx + 1}'
+        )
+        ax.axvline(
+            identified_bd_azimuth * direction_scale, color='deepskyblue',
+            linestyle='-.', linewidth=2.5,
+            label=f'Identified: BD {identified_bd_idx + 1}'
+        )
+
 # Create figure with 3 rows, 3 columns
 fig = plt.figure(figsize=(18, 16))
 # --- SINR summary (for the selected idx) ---
@@ -1465,6 +1539,9 @@ sp_sinr_val = _scalar_at(sinr_sp_test, idx)
 sweep_sinr_val = _scalar_at(sinr_sweep_test, idx)
 
 sinr_text = (
+    f"Instance {idx} | Active BD: {active_bd_idx + 1} | "
+    f"Identified BD: {identified_bd_idx + 1} "
+    f"({'correct' if identification_correct else 'incorrect'})\n"
     f"Opt SINR: {10*np.log10(opt_sinr_val + 1e-12):.2f} dB   |   "
     f"Learned SINR: {10*np.log10(learned_sinr_val + 1e-12):.2f} dB   |   "
     f"SP SINR: {10*np.log10(sp_sinr_val + 1e-12):.2f} dB   |   "
@@ -1482,8 +1559,26 @@ ax1 = fig.add_subplot(3, 3, 1)
 # Plot Tx/Rx location (co-located)
 ax1.scatter(location_tx[0], location_tx[1], c='blue', marker='s', s=200, label='Tx/Rx Array', zorder=10, edgecolors='black')
 
-# Plot BD location
-ax1.scatter(bd_loc_vis[0], bd_loc_vis[1], c='red', marker='*', s=400, label='BD', zorder=10, edgecolors='black', linewidth=1.5)
+# Plot all BD locations, then overlay the active and identified markers.
+ax1.scatter(
+    bd_locations_vis[:, 0], bd_locations_vis[:, 1], c='0.75', marker='o',
+    s=150, label='Backscatter devices', zorder=7, edgecolors='0.25'
+)
+for device_idx, bd_location in enumerate(bd_locations_vis):
+    ax1.annotate(
+        f'BD {device_idx + 1}', xy=bd_location[:2], xytext=(6, 6),
+        textcoords='offset points', fontsize=9
+    )
+ax1.scatter(
+    active_bd_loc[0], active_bd_loc[1], c='crimson', marker='*', s=430,
+    label=f'Active BD {active_bd_idx + 1}', zorder=12,
+    edgecolors='black', linewidth=1.2
+)
+ax1.scatter(
+    identified_bd_loc[0], identified_bd_loc[1], facecolors='none',
+    edgecolors='deepskyblue', marker='o', s=580, linewidth=3,
+    label=f'Identified BD {identified_bd_idx + 1}', zorder=13
+)
 
 # Plot Scatter locations (multiple scatterers)
 scatter_colors = plt.cm.Oranges(np.linspace(0.4, 0.9, num_scatterers_vis))
@@ -1492,19 +1587,52 @@ for s in range(num_scatterers_vis):
     ax1.scatter(scatter_loc_vis[s, 0], scatter_loc_vis[s, 1], c=[scatter_colors[s]], marker='o', s=250, 
                 label=label, zorder=10, edgecolors='black', linewidth=1.5)
 
-# Draw lines showing signal paths
-ax1.plot([location_tx[0], bd_loc_vis[0]], [location_tx[1], bd_loc_vis[1]], 'r--', alpha=0.6, linewidth=2, label='BD path')
+# Draw lines showing BD and scatter paths.
+for device_idx, bd_location in enumerate(bd_locations_vis):
+    if device_idx == active_bd_idx:
+        color, linestyle, linewidth, label = (
+            'crimson', '--', 2.4, 'Active-BD path'
+        )
+    elif device_idx == identified_bd_idx:
+        color, linestyle, linewidth, label = (
+            'deepskyblue', '-.', 2.4, 'Identified-BD path'
+        )
+    else:
+        color, linestyle, linewidth, label = ('0.6', ':', 1.3, None)
+    ax1.plot(
+        [location_tx[0], bd_location[0]],
+        [location_tx[1], bd_location[1]],
+        color=color, linestyle=linestyle, alpha=0.75,
+        linewidth=linewidth, label=label
+    )
 for s in range(num_scatterers_vis):
     label = 'Scatter paths' if s == 0 else None
     ax1.plot([location_tx[0], scatter_loc_vis[s, 0]], [location_tx[1], scatter_loc_vis[s, 1]], 
              color=scatter_colors[s], linestyle=':', alpha=0.6, linewidth=2, label=label)
 
-# Add direction arrows
-dir_to_bd = (bd_loc_vis[:2] - location_tx[:2]) / np.linalg.norm(bd_loc_vis[:2] - location_tx[:2])
-arrow_scale = 3
-ax1.annotate('', xy=(location_tx[0] + dir_to_bd[0]*arrow_scale, location_tx[1] + dir_to_bd[1]*arrow_scale),
+# Add direction arrows, scaled to the generated scene dimensions.
+scene_points = np.vstack([bd_locations_vis[:, :2], scatter_loc_vis[:, :2]])
+scene_ranges = np.ptp(np.vstack([location_tx[:2], scene_points]), axis=0)
+arrow_scale = 0.18 * max(float(np.max(scene_ranges)), np.finfo(float).eps)
+dir_to_active = (
+    (active_bd_loc[:2] - location_tx[:2])
+    / (np.linalg.norm(active_bd_loc[:2] - location_tx[:2]) + 1e-10)
+)
+ax1.annotate('', xy=(location_tx[0] + dir_to_active[0]*arrow_scale, location_tx[1] + dir_to_active[1]*arrow_scale),
              xytext=(location_tx[0], location_tx[1]),
-             arrowprops=dict(arrowstyle='->', color='darkred', lw=2))
+             arrowprops=dict(arrowstyle='->', color='crimson', lw=2.5))
+if not identification_correct:
+    dir_to_identified = (
+        (identified_bd_loc[:2] - location_tx[:2])
+        / (np.linalg.norm(identified_bd_loc[:2] - location_tx[:2]) + 1e-10)
+    )
+    ax1.annotate(
+        '', xy=(
+            location_tx[0] + dir_to_identified[0] * arrow_scale,
+            location_tx[1] + dir_to_identified[1] * arrow_scale
+        ), xytext=(location_tx[0], location_tx[1]),
+        arrowprops=dict(arrowstyle='->', color='deepskyblue', lw=2.5)
+    )
 for s in range(num_scatterers_vis):
     dir_to_scatter = (scatter_loc_vis[s, :2] - location_tx[:2]) / (np.linalg.norm(scatter_loc_vis[s, :2] - location_tx[:2]) + 1e-10)
     ax1.annotate('', xy=(location_tx[0] + dir_to_scatter[0]*arrow_scale, location_tx[1] + dir_to_scatter[1]*arrow_scale),
@@ -1513,14 +1641,22 @@ for s in range(num_scatterers_vis):
 
 ax1.set_xlabel('X (m)', fontsize=11, fontweight='bold')
 ax1.set_ylabel('Y (m)', fontsize=11, fontweight='bold')
-ax1.set_title('2D Scene (XY Plane, Elevation = 0)', fontsize=12, fontweight='bold')
+ax1.set_title(
+    f'2D Scene — Instance {idx} '
+    f'({"correct ID" if identification_correct else "incorrect ID"})',
+    fontsize=12, fontweight='bold'
+)
 ax1.legend(loc='best', fontsize=9, framealpha=0.9)
 ax1.grid(True, alpha=0.3, linestyle='--')
 ax1.set_aspect('equal')
 
-# Build scatter azimuth text for info box
+# Build BD/scatter azimuth text for the scene information box.
+bd_az_text = '\n'.join([
+    f'BD {device_idx + 1} Az: {np.degrees(direction):.1f}°'
+    for device_idx, direction in enumerate(bd_azimuths)
+])
 scatter_az_text = '\n'.join([f'Scatter {s+1} Az: {np.degrees(scatter_azimuths[s]):.1f}°' for s in range(num_scatterers_vis)])
-ax1.text(0.02, 0.98, f'BD Az: {np.degrees(bd_azimuth):.1f}°\n{scatter_az_text}', 
+ax1.text(0.02, 0.98, f'{bd_az_text}\n{scatter_az_text}',
          transform=ax1.transAxes, fontsize=9, verticalalignment='top',
          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
 
@@ -1531,8 +1667,8 @@ ax2 = fig.add_subplot(3, 3, 2, projection='polar')
 ax2.plot(az_tx_learned, pattern_tx_learned, 'b-', linewidth=2.5, label='Tx Beam')
 ax2.fill(az_tx_learned, pattern_tx_learned, 'blue', alpha=0.2)
 
-# Mark BD direction
-ax2.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+# Mark BD directions
+mark_bd_directions(ax2)
 # Mark all scatter directions
 scatter_colors_polar = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
 for s in range(num_scatterers_vis):
@@ -1549,7 +1685,7 @@ ax3 = fig.add_subplot(3, 3, 3, projection='polar')
 ax3.plot(az_rx_learned, pattern_rx_learned, 'g-', linewidth=2.5, label='Rx Beam')
 ax3.fill(az_rx_learned, pattern_rx_learned, 'green', alpha=0.2)
 
-ax3.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+mark_bd_directions(ax3)
 for s in range(num_scatterers_vis):
     ax3.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
@@ -1561,15 +1697,15 @@ configure_upper_half_polar_axis(ax3)
 # ===== Row 2, Col 1: Learned Joint Pattern =====
 ax4 = fig.add_subplot(3, 3, 4, projection='polar')
 
-ax4.plot(az_joint_learned, pattern_joint_learned, color='purple', linewidth=2.5, label=r'$|v^H a a^T w|^2$')
+ax4.plot(az_joint_learned, pattern_joint_learned, color='purple', linewidth=2.5, label=r'$|v^H a_{\rm rx}a_{\rm tx}^T w|^2$')
 ax4.fill(az_joint_learned, pattern_joint_learned, color='purple', alpha=0.2)
 
-ax4.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+mark_bd_directions(ax4)
 for s in range(num_scatterers_vis):
     ax4.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0,
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax4.set_title(r'Learned Joint Pattern $|v^H a a^T w|^2$', fontsize=12, fontweight='bold', pad=15)
+ax4.set_title(r'Learned Joint Pattern $|v^H a_{\rm rx}a_{\rm tx}^T w|^2$', fontsize=12, fontweight='bold', pad=15)
 ax4.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax4)
 
@@ -1587,8 +1723,7 @@ ax5.plot(azimuth_deg, 10*np.log10(pattern_rx_optimal + 1e-10), 'g--', linewidth=
 ax5.plot(azimuth_deg, 10*np.log10(pattern_joint_optimal + 1e-10), color='purple', linestyle='--', linewidth=2, label='Optimal Joint', alpha=0.8)
 
 # Mark BD and scatter directions
-bd_az_deg = np.degrees(bd_azimuth)
-ax5.axvline(bd_az_deg, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'BD: {bd_az_deg:.1f}°')
+mark_bd_directions(ax5, cartesian_degrees=True)
 scatter_colors_cart = plt.cm.Oranges(np.linspace(0.5, 0.9, num_scatterers_vis))
 for s in range(num_scatterers_vis):
     scatter_az_deg = np.degrees(scatter_azimuths[s])
@@ -1609,15 +1744,15 @@ ax5.text(0.02, 0.02, f'N_tx = {N_tx}, N_rx = {N_rx}\nτ = {tau}, SNR = {snr_disp
 # ===== Row 2, Col 3: Optimal Joint Pattern =====
 ax6 = fig.add_subplot(3, 3, 6, projection='polar')
 
-ax6.plot(az_joint_optimal, pattern_joint_optimal, color='purple', linewidth=2.5, label=r'$|v^H a a^T w|^2$')
+ax6.plot(az_joint_optimal, pattern_joint_optimal, color='purple', linewidth=2.5, label=r'$|v^H a_{\rm rx}a_{\rm tx}^T w|^2$')
 ax6.fill(az_joint_optimal, pattern_joint_optimal, color='purple', alpha=0.2)
 
-ax6.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+mark_bd_directions(ax6)
 for s in range(num_scatterers_vis):
     ax6.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0,
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
 
-ax6.set_title(r'Optimal Joint Pattern $|v^H a a^T w|^2$', fontsize=12, fontweight='bold', pad=15)
+ax6.set_title(r'Optimal Joint Pattern $|v^H a_{\rm rx}a_{\rm tx}^T w|^2$', fontsize=12, fontweight='bold', pad=15)
 ax6.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
 configure_upper_half_polar_axis(ax6)
 
@@ -1627,7 +1762,7 @@ ax7 = fig.add_subplot(3, 3, 8, projection='polar')
 ax7.plot(az_tx_optimal, pattern_tx_optimal, 'b-', linewidth=2.5, label='Tx Beam')
 ax7.fill(az_tx_optimal, pattern_tx_optimal, 'blue', alpha=0.2)
 
-ax7.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+mark_bd_directions(ax7)
 for s in range(num_scatterers_vis):
     ax7.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
@@ -1642,7 +1777,7 @@ ax8 = fig.add_subplot(3, 3, 9, projection='polar')
 ax8.plot(az_rx_optimal, pattern_rx_optimal, 'g-', linewidth=2.5, label='Rx Beam')
 ax8.fill(az_rx_optimal, pattern_rx_optimal, 'green', alpha=0.2)
 
-ax8.axvline(bd_azimuth, color='red', linestyle='--', linewidth=2.5, label=f'BD: {np.degrees(bd_azimuth):.1f}°')
+mark_bd_directions(ax8)
 for s in range(num_scatterers_vis):
     ax8.axvline(scatter_azimuths[s], color=scatter_colors_polar[s], linestyle=':', linewidth=2.0, 
                 label=f'S{s+1}: {np.degrees(scatter_azimuths[s]):.1f}°')
