@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('--num_users', type=int, default=1, help='Number of users')
     parser.add_argument('--rician_factor', type=float, default=5.0, help='Rician factor')
     parser.add_argument('--fc', type=float, default=2400000000.0, help='Carrier frequency in Hz')
-    parser.add_argument('--N_scatterers', type=int, default=1, help='Number of scatterers')
+    parser.add_argument('--N_scatterers', type=int, default=5, help='Number of scatterers')
     parser.add_argument('--N_symbols', type=int, default=1, help='Number of symbols of one sample')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--learning_rate', type=float, default=3e-4, help='Initial learning rate')

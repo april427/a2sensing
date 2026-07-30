@@ -99,27 +99,46 @@ class MLPBlock(tf.keras.layers.Layer):
 
 
 class LSTM_Cell(tf.keras.layers.Layer):
-    """LSTM cell for sequential observation processing"""
+    """LSTM cell with one fused projection for all four gates.
+
+    Concatenating the observation and previous hidden state allows all input
+    and recurrent gate projections to be evaluated by one matrix
+    multiplication instead of the eight Dense calls used previously.
+    """
+
     def __init__(self, hidden_size, name):
-        super(LSTM_Cell, self).__init__()
-        self.layer_Ui = Dense(units=hidden_size, activation='linear', name='Ui' + name)
-        self.layer_Wi = Dense(units=hidden_size, activation='linear', name='Wi' + name)
-        self.layer_Uf = Dense(units=hidden_size, activation='linear', name='Uf' + name)
-        self.layer_Wf = Dense(units=hidden_size, activation='linear', name='Wf' + name)
-        self.layer_Uo = Dense(units=hidden_size, activation='linear', name='Uo' + name)
-        self.layer_Wo = Dense(units=hidden_size, activation='linear', name='Wo' + name)
-        self.layer_Uc = Dense(units=hidden_size, activation='linear', name='Uc' + name)
-        self.layer_Wc = Dense(units=hidden_size, activation='linear', name='Wc' + name)
+        super(LSTM_Cell, self).__init__(name=name)
+        self.hidden_size = hidden_size
+        self.gate_projection = Dense(
+            units=4 * hidden_size,
+            activation='linear',
+            kernel_initializer='glorot_uniform',
+            bias_initializer='zeros',
+            name='gate_projection'
+        )
 
     def call(self, inputs, **kwargs):
-        (input_x, h_old, c_old) = inputs
-        i_t = tf.sigmoid(self.layer_Ui(input_x) + self.layer_Wi(h_old))
-        f_t = tf.sigmoid(self.layer_Uf(input_x) + self.layer_Wf(h_old))
-        o_t = tf.sigmoid(self.layer_Uo(input_x) + self.layer_Wo(h_old))
-        c_t = tf.tanh(self.layer_Uc(input_x) + self.layer_Wc(h_old))
-        c = i_t * c_t + f_t * c_old
-        h_new = o_t * tf.tanh(c)
-        return h_new, c  # h is the hidden state and c is the cell state
+        input_x, h_old, c_old = inputs
+
+        # Shape: (batch, input_size + hidden_size).
+        recurrent_input = tf.concat(
+            [input_x, h_old], axis=1, name='recurrent_input'
+        )
+
+        # Gate order is input, forget, output, candidate. This is one Dense
+        # operation and therefore one matrix multiplication for all gates.
+        gate_values = self.gate_projection(recurrent_input)
+        input_gate_raw, forget_gate_raw, output_gate_raw, candidate_raw = \
+            tf.split(gate_values, num_or_size_splits=4, axis=1)
+
+        input_gate = tf.sigmoid(input_gate_raw)
+        forget_gate = tf.sigmoid(forget_gate_raw)
+        output_gate = tf.sigmoid(output_gate_raw)
+        candidate = tf.tanh(candidate_raw)
+
+        c_new = input_gate * candidate + forget_gate * c_old
+        h_new = output_gate * tf.tanh(c_new)
+        return h_new, c_new
 
 
 #####################################################
@@ -957,17 +976,23 @@ print(f"LR: {learning_rate:g}, clip_norm: {args.clip_norm:g}, warmup: {warmup_st
     f"decay_steps: {args.decay_steps}, decay_rate: {args.decay_rate:g}, hidden: {hidden_size}")
 print("=" * 60 + "\n")
 
-model_ckpt = f'{drive_save_path}/params_joint_sinr_id_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsc_{num_scatters}_Nbd_{num_users}'
+model_ckpt = (
+    f'{drive_save_path}/params_joint_sinr_id_fused_lstm_'
+    f'N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_'
+    f'Nsc_{num_scatters}_Nbd_{num_users}'
+)
 
 with tf.Session() as sess:
     if initial_run == 1:
         init.run()
+        best_val = np.inf
     else:
         saver.restore(sess, model_ckpt)
+        best_val = float(sess.run(loss, feed_dict=feed_dict_val))
+        print(f"Restored validation loss baseline: {best_val:.6f}")
         n_epochs = 5 # If continue training
     
     # Early stopping
-    best_val = 1e9
     wait = 0
     PATIENCE = args.patience if args.patience > 0 else max(20, 2 * tau)
     
@@ -1016,16 +1041,6 @@ with tf.Session() as sess:
             feed_dict=feed_dict_val
         )
 
-        # Optimal beamformer performance
-        if epoch == 0:
-            sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
-
-            # sp-based beamformer performance
-            # sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-            #             [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
-
-        
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
@@ -1035,19 +1050,15 @@ with tf.Session() as sess:
               f'{100 * id_accuracy_val:6.2f}% | '
               f'Val SINR Loss: {sinr_loss_val:8.4f} | '
               f'Val ID Loss: {id_loss_val:8.4f}')
-        # print(f'         | '
-        #       f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
-              f'SINR_active (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
-              f'SINR_active (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
+              f'SINR_active (learned): '
+              f'{10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB')
         print(f'         | '
               f'Sig_BD: {np.mean(sig_bd_val):8.4f} | '
-              f'Sig_int: {np.mean(sig_ref_val):8.4f} | '
-              f'Sig_BD_opt: {np.mean(sig_bd_opt_val):8.4f} | '
-              f'Sig_int_opt: {np.mean(sig_int_opt_val):8.4f} | ')
+              f'Sig_int: {np.mean(sig_ref_val):8.4f} | ')
         print(f'         | '
-              f'SINR_scatter: {10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB | '
-              f'SINR_scatter_opt: {10 * np.log10(np.mean(sinr_scatter_opt_val) + 1e-10):6.2f} dB')
+              f'SINR_scatter: '
+              f'{10 * np.log10(np.mean(sinr_scatter_val) + 1e-10):6.2f} dB')
         print()
         
         # Early stopping
@@ -1062,12 +1073,20 @@ with tf.Session() as sess:
             if wait == PATIENCE:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    # Test the best validation model, not the weights left in memory after
+    # the final training epoch.
+    print(f"Restoring best validation checkpoint for testing: {model_ckpt}")
+    saver.restore(sess, model_ckpt)
     
     #####################################################
-    # Testing
+    # Testing and optimal-beamformer benchmark
+    #
+    # The expensive NumPy/SciPy optimal solver is deliberately evaluated only
+    # after all gradient updates have finished. It is not needed for training.
     #####################################################
     print("\n" + "=" * 60)
-    print("Testing")
+    print("Testing (including post-training optimal benchmark)")
     print("=" * 60)
     
     # Reset seed before generating test data to ensure reproducibility across runs
@@ -1119,7 +1138,7 @@ with tf.Session() as sess:
     
     # Save results
     model_filename = os.path.join(drive_save_path, \
-            f'TEST_joint_sinr_id_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsca_{num_scatters}_Nbd_{num_users}.mat')
+            f'TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsca_{num_scatters}.mat')
     sio.savemat(model_filename, dict(
         snr_const=snr_const,
         N_tx=N_tx,
@@ -1232,7 +1251,7 @@ def _pick_result_file(result_dir):
         snr0 = int(snr_arr[0])
         candidate = os.path.join(
             result_dir,
-            f"TEST_joint_sinr_id_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}_Nbd_{num_users}.mat"
+            f"TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{snr0}_K_{K}_Nsca_{num_scatters}.mat"
         )
 
     if candidate is None or not os.path.isfile(candidate):

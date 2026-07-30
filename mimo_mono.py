@@ -806,12 +806,14 @@ model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(
 with tf.Session() as sess:
     if initial_run == 1:
         init.run()
+        best_val = np.inf
     else:
         saver.restore(sess, model_ckpt)
+        best_val = float(sess.run(loss, feed_dict=feed_dict_val))
+        print(f"Restored validation loss baseline: {best_val:.6f}")
         n_epochs = 5 # If continue training
     
     # Early stopping
-    best_val = 1e9
     wait = 0
     PATIENCE = args.patience if args.patience > 0 else max(20, 2 * tau)
     
@@ -894,6 +896,11 @@ with tf.Session() as sess:
             if wait == PATIENCE:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    # Test the best validation model, not the weights left in memory after
+    # the final training epoch.
+    print(f"Restoring best validation checkpoint for testing: {model_ckpt}")
+    saver.restore(sess, model_ckpt)
     
     #####################################################
     # Testing
