@@ -4,8 +4,8 @@
 The checkpoints used two BD states per sensing step, with one noisy sample for
 each state (K=1). During evaluation, the single BD uses the alternating code
 [-1, +1, -1, +1, ...] of length L. The received chip observations are matched
-filtered and normalized to reproduce the trained L=2 observation scale before
-they are passed to the restored recurrent network.
+filtered with the same unnormalized sum/difference convention used by the
+trained models before they are passed to the restored recurrent network.
 """
 
 # %%
@@ -45,7 +45,7 @@ trained_K = 1
 
 N_tx = args.N_ris
 N_rx = args.N_ris
-tau = 8
+tau = 16
 num_scatters = args.N_scatterers
 Rician_factor = args.rician_factor
 hidden_size = 128
@@ -320,6 +320,8 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                 [tf.shape(loc_input)[0], N_rx], dtype=tf.complex64
             )
             graph_batch_size = tf.shape(loc_input)[0]
+            sqrt_P = tf.complex(tf.sqrt(P), 0.0)
+            H_common = H_d_placeholder + H_r_placeholder
 
             for t in range(tau):
                 if t == 0:
@@ -339,9 +341,7 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                     v_init_imag = tf.get_variable("v_init_imag", shape=(1, N_rx, 1))
                     v1 = tf.complex(v_init_real, v_init_imag)
                     v1 = v1 / tf.cast(tf.norm(v1, axis=1, keepdims=True), tf.complex64)
-
-                sqrt_P = tf.complex(tf.sqrt(P), 0.0)
-                H_common = H_d_placeholder + H_r_placeholder
+                
                 y_common_clean = tf.squeeze(
                     sqrt_P * tf.matmul(H_common, w1), axis=2
                 )
@@ -730,17 +730,28 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
 #                              Beam sweeping                                        #
 #####################################################################################
 
-pilot_codebook = hadamard_codebook(N_tx, max(N_tx, tau))
-s_pilot = pilot_codebook[:, :tau]
+# Scalar ambient pilot. Each swept transmission is x_m = w_m * s_pilot.
+s_pilot = np.complex64(1.0)
 sweep_codebook = hadamard_codebook(
     N_tx, max(N_tx, 2 * tau)
 )[:, : 2 * tau]
+num_sweep_beams = sweep_codebook.shape[1]
 
-ss_h = s_pilot @ np.conj(s_pilot).T
+ss_h = sweep_codebook @ np.conj(sweep_codebook).T
 ss_h_reg = ss_h + 1e-1 * np.eye(N_tx)
-s_pilot_pinv = np.conj(
-    np.linalg.solve(ss_h_reg, s_pilot)
+sweep_beam_pinv = np.conj(
+    np.linalg.solve(ss_h_reg, sweep_codebook)
 ).T
+
+sweep_noise_rng = np.random.RandomState(seed + 30000)
+sweep_noise_shape = (test_size, num_sweep_beams, max_L, N_rx)
+sweep_noise_bank = np.empty(sweep_noise_shape, dtype=np.complex64)
+sweep_noise_bank.real = sweep_noise_rng.normal(
+    0.0, noiseSTD_per_dim, sweep_noise_shape
+).astype(np.float32)
+sweep_noise_bank.imag = sweep_noise_rng.normal(
+    0.0, noiseSTD_per_dim, sweep_noise_shape
+).astype(np.float32)
 
 sinr_sweeping = np.empty(
     (len(L_values), test_size), dtype=np.float64
@@ -748,7 +759,6 @@ sinr_sweeping = np.empty(
 
 for L_idx, L in enumerate(L_values):
     code_L = alternating_bd_code(L).astype(np.complex64)
-    matched_filter_scale = trained_L / float(L)
 
     for batch_start in range(0, test_size, batch_size):
         batch_end = min(batch_start + batch_size, test_size)
@@ -758,14 +768,16 @@ for L_idx, L in enumerate(L_values):
             H_d_test[batch_start:batch_end]
             + H_r_test[batch_start:batch_end]
         )
-        noise_batch = noise_bank[batch_start:batch_end]
+        noise_batch = sweep_noise_bank[batch_start:batch_end]
 
         Y_common_clean = np.sqrt(Pvec) * np.einsum(
-            "bij,jt->bit", H_I_batch, s_pilot
+            "bij,jm->bim", H_I_batch, sweep_codebook
         )
         Y_bd_clean = np.sqrt(Pvec) * np.einsum(
-            "bij,jt->bit", H_b_batch, s_pilot
+            "bij,jm->bim", H_b_batch, sweep_codebook
         )
+        Y_common_clean *= s_pilot
+        Y_bd_clean *= s_pilot
 
         received_chips = (
             Y_common_clean.transpose(0, 2, 1)[:, :, np.newaxis, :]
@@ -774,24 +786,22 @@ for L_idx, L in enumerate(L_values):
             + noise_batch[:, :, :L, :]
         )
 
-        Y_bd_matched = matched_filter_scale * np.einsum(
+        Y_bd_matched = np.einsum(
             "l,btlr->btr", code_L, received_chips, optimize=True
         )
-        Y_common_matched = matched_filter_scale * np.sum(
-            received_chips, axis=2
-        )
+        Y_common_matched = np.sum(received_chips, axis=2)
 
-        # Matched-filter signal terms are trained_L * sqrt(P) * H * w.
+        # Matched-filter signal terms are L * sqrt(P) * H * w.
         H_b_hat = (
-            np.matmul(Y_bd_matched.transpose(0, 2, 1), s_pilot_pinv)
-            / (trained_L * np.sqrt(Pvec))
+            np.matmul(Y_bd_matched.transpose(0, 2, 1), sweep_beam_pinv)
+            / (L * np.sqrt(Pvec) * s_pilot)
         )
         H_I_hat = (
             np.matmul(
                 Y_common_matched.transpose(0, 2, 1),
-                s_pilot_pinv,
+                sweep_beam_pinv,
             )
-            / (trained_L * np.sqrt(Pvec))
+            / (L * np.sqrt(Pvec) * s_pilot)
         )
 
         diagonal_response = np.einsum(
