@@ -157,7 +157,7 @@ tau = args.tau  # Pilot length (also number of BD interactions)
 K = getattr(args, "N_symbols", 5)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
-ref_dis = 15*Wavelength
+ref_dis = 5
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
 # BD modulation - alternating pattern
@@ -534,11 +534,17 @@ with tf.name_scope("sinr_computation"):
     sig_int = tf.squeeze(tf.abs(sig_int) ** 2) * lay['P']  # (batch,)
     
     sinr_BD = sig_BD / (sig_int + noise_var)
-    sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-5, 1e2)
+    # sinr_BD_clipped = tf.clip_by_value(sinr_BD, 1e-5, 1e2)
     
-    # Log SINR with per-sample clipping to prevent outliers from dominating
-    log_sinr_BD_raw = tf.log(sinr_BD_clipped )
-    log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -10.0, 10.0)  # ~±35 dB range
+    # # Log SINR with per-sample clipping to prevent outliers from dominating
+    # log_sinr_BD_raw = tf.log(sinr_BD_clipped )
+    # log_sinr_BD = tf.clip_by_value(log_sinr_BD_raw, -10.0, 10.0)  # ~±35 dB range
+    eps = 1e-12
+    log_sinr_BD = (
+        tf.log(sig_BD + eps)
+        - tf.log(sig_int + noise_var + eps)
+    )
+
     
     # For backward compatibility, define sig_ref as interference
     sig_ref = sig_int
