@@ -29,8 +29,8 @@ def generate_location(num_users):
     """
     location_user = np.empty([num_users, 3])
 
-    angle = np.random.uniform(-np.pi, np.pi)
-    dis = Wavelength*12
+    angle = np.random.uniform(-np.pi/2, np.pi/2)
+    dis = Wavelength*166.67
     x1 = dis * np.cos(angle)
     y1 = dis * np.sin(angle)
 
@@ -597,7 +597,7 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
                         ).astype(np.complex64)
         H_nlos = H_nlos / np.linalg.norm(H_nlos, "fro")
         H_SI = H_SI / np.linalg.norm(H_SI, 'fro') 
-        H_direct =  2e-2 * (np.sqrt(100/(1+100)) * H_SI + np.sqrt(1/(1+100)) * H_nlos)
+        H_direct =  1e-4 * (np.sqrt(100/(1+100)) * H_SI + np.sqrt(1/(1+100)) * H_nlos)
     else:
         d_tx_rx = np.linalg.norm(rx_location - tx_location)
         d_tx_rx_xy = np.linalg.norm(rx_location[0:2] - tx_location[0:2])
