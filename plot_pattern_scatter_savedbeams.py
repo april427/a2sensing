@@ -16,6 +16,8 @@ from parse_args import parse_args
 from channel_functions import generate_mimo_channel
 from manifold_optimization import solve_with_random_restarts
 
+args = parse_args()
+
 def compute_optimal_beamformers(H_b_batch, H_int_batch, noise_var_val, P_val, num_restarts=10):
     """Compute optimal beamformers for a batch - reduced restarts for 2x speedup"""
     v_opt_batch = np.zeros(( H_b_batch.shape[0], 1), dtype=np.complex64)
@@ -85,14 +87,17 @@ def joint_beam_pattern_db(v_vec, w_vec, angles):
 
 
 def extract_locations(mat_data, num_samples):
-    bd = np.asarray(mat_data.get("BD_location", np.zeros((num_samples, 3), dtype=np.float64)))
+    """Return BD locations as (samples, devices, 3) and scatterer locations."""
+    bd = np.asarray(mat_data.get("BD_location", np.zeros((num_samples, 1, 3), dtype=np.float64)))
     sca = np.asarray(mat_data.get("Scatter_location", np.zeros((num_samples, 0, 3), dtype=np.float64)))
 
     bd = np.squeeze(bd)
     if bd.ndim == 1 and bd.shape[0] == 3:
-        bd = np.tile(bd[np.newaxis, :], (num_samples, 1))
-    if bd.ndim != 2 or bd.shape[1] != 3:
-        bd = np.zeros((num_samples, 3), dtype=np.float64)
+        bd = np.tile(bd[np.newaxis, np.newaxis, :], (num_samples, 1, 1))
+    elif bd.ndim == 2 and bd.shape[1] == 3:
+        bd = bd[:, np.newaxis, :]
+    if bd.ndim != 3 or bd.shape[2] != 3:
+        bd = np.zeros((num_samples, 1, 3), dtype=np.float64)
 
     sca = np.squeeze(sca)
     if sca.size == 0:
@@ -103,13 +108,39 @@ def extract_locations(mat_data, num_samples):
         sca = np.zeros((num_samples, 0, 3), dtype=np.float64)
 
     if bd.shape[0] < num_samples:
-        pad = np.zeros((num_samples - bd.shape[0], 3), dtype=np.float64)
+        pad = np.zeros((num_samples - bd.shape[0], bd.shape[1], 3), dtype=np.float64)
         bd = np.concatenate([bd, pad], axis=0)
     if sca.shape[0] < num_samples:
         pad = np.zeros((num_samples - sca.shape[0], 0, 3), dtype=np.float64)
         sca = np.concatenate([sca, pad], axis=0)
 
     return bd, sca
+
+
+def extract_active_users(mat_data, num_samples, num_users):
+    """Return the saved zero-based active-BD index for each test sample."""
+    active_users = np.asarray(mat_data.get("active_user", np.zeros(num_samples, dtype=np.int64)))
+    active_users = np.ravel(active_users).astype(np.int64)
+    if active_users.size == 1:
+        active_users = np.full(num_samples, active_users[0], dtype=np.int64)
+    elif active_users.size < num_samples:
+        active_users = np.pad(active_users, (0, num_samples - active_users.size))
+    return np.clip(active_users[:num_samples], 0, num_users - 1)
+
+
+def plot_bd_directions(ax, bd_angles_deg, active_user, r_max):
+    """Mark every BD direction, highlighting the saved active device."""
+    for device_idx, bd_angle_deg in enumerate(bd_angles_deg):
+        if not np.isfinite(bd_angle_deg) or not -90.0 <= bd_angle_deg <= 90.0:
+            continue
+        is_active = device_idx == active_user
+        ax.plot(
+            [np.deg2rad(bd_angle_deg), np.deg2rad(bd_angle_deg)], [0, r_max],
+            color="#036221" if is_active else "#7f7f7f",
+            linestyle="--" if is_active else ":",
+            linewidth=1.8 if is_active else 1.2,
+            label=f"Active BD {device_idx + 1}" if is_active else f"BD {device_idx + 1}",
+        )
 
 
 def compute_single_sinr_db(v_vec, w_vec, h_b, h_d, h_r, p_tx, noise_var=1.0):
@@ -124,10 +155,10 @@ def compute_single_sinr_db(v_vec, w_vec, h_b, h_d, h_r, p_tx, noise_var=1.0):
 
 
 
-args = parse_args()
+
 
 n_ant = args.N_ris
-tau = 16
+tau = 10
 snr_db = 10#args.snr
 n_symbols = getattr(args, "N_symbols", 1)
 n_scatters = 5
@@ -141,13 +172,25 @@ p_tx = 10 ** (snr_db / 10) / (wavelength**4 / (4 * np.pi * ref_dis) ** 4) / n_an
 location_tx = np.array([0.0, 0.0, 0.0])
 location_rx = np.array([0.0, 0.0, 0.0])
 
-result_dir = "Mo_mimo_sinr_modelsave_one_lstm"
+result_dir = "Mo_1lstm_3BD_results"#"Mo_mimo_sinr_modelsave"
 if not os.path.isdir(result_dir):
     raise FileNotFoundError(f"Result directory not found: {result_dir}")
 
 mat_file = pick_test_mat_file(result_dir, n_ant, tau, snr_db, n_symbols, n_scatters)
 data = sio.loadmat(mat_file)
 print(f"Loaded TEST data: {mat_file}")
+
+# Prefer the saved experiment parameters so the plotter remains aligned with
+# the selected result file instead of relying on command-line defaults.
+n_ant = int(np.squeeze(data.get("N_tx", n_ant)))
+snr_db = float(np.ravel(data.get("snr_const", [snr_db]))[0])
+n_scatters = int(np.squeeze(data.get("num_scatters", n_scatters)))
+rician_factor = float(np.squeeze(data.get("rician_factor", rician_factor)))
+wavelength = float(np.squeeze(data.get("wavelength", wavelength)))
+ref_dis = 15 * wavelength
+p_tx = 10 ** (snr_db / 10) / (wavelength**4 / (4 * np.pi * ref_dis) ** 4) / n_ant / n_ant
+location_tx = np.squeeze(data.get("location_tx", location_tx)).astype(np.float64)
+location_rx = np.squeeze(data.get("location_rx", location_rx)).astype(np.float64)
 
 if "v_list_test" not in data or "w_list_test" not in data:
     raise KeyError("Missing v_list_test or w_list_test in TEST data file")
@@ -181,6 +224,8 @@ if sinr_final.size < num_samples:
     sinr_final = padded
 
 bd_locations, scatter_locations = extract_locations(data, num_samples)
+num_users = bd_locations.shape[1]
+active_users = extract_active_users(data, num_samples, num_users)
 
 angles = np.linspace(-np.pi / 2, np.pi / 2, 361)
 db_floor = -45.0
@@ -190,8 +235,14 @@ n_show = np.random.choice(num_samples, size=1, replace=False) #[1]#
 print(f"Plotting {len(n_show)} sample(s)")
 
 for sample_idx in n_show:
-    bd = bd_locations[sample_idx]
-    true_bd_angle_deg = np.degrees(np.arctan2(bd[1], bd[0])) if np.linalg.norm(bd[:2]) > 0 else np.nan
+    bd_all = bd_locations[sample_idx]
+    active_user = int(active_users[sample_idx])
+    bd = bd_all[active_user]
+    bd_angles_deg = np.array([
+        np.degrees(np.arctan2(device[1], device[0])) if np.linalg.norm(device[:2]) > 0 else np.nan
+        for device in bd_all
+    ])
+    true_bd_angle_deg = bd_angles_deg[active_user]
 
     sca = scatter_locations[sample_idx]
     scatter_angles = []
@@ -243,7 +294,7 @@ for sample_idx in n_show:
     beam_r_opt = np.clip(beam_opt, db_floor, 1.0) - db_floor
 
     n_plot = num_steps + 1
-    n_cols = 4
+    n_cols = 5
     n_rows = int(np.ceil(n_plot / n_cols))
 
     fig, axes = plt.subplots(
@@ -268,14 +319,12 @@ for sample_idx in n_show:
         ax.set_thetamin(-90)
         ax.set_thetamax(90)
         ax.set_ylim([0, r_max])
-        ax.set_thetagrids(np.arange(-90, 91, 30))
+        ax.set_thetagrids(np.arange(-90, 90, 30))
         ax.set_rticks([0, 15, 30, 45])
         ax.set_yticklabels(["-45", "-30", "-15", "0"])
         ax.plot(angles, beam_r, color="#d62728", linewidth=1.0, label="Saved beam")
 
-        if np.isfinite(true_bd_angle_deg) and -90.0 <= true_bd_angle_deg <= 90.0:
-            theta_bd = np.deg2rad(true_bd_angle_deg)
-            ax.plot([theta_bd, theta_bd], [0, r_max], color="#036221", linestyle="--", linewidth=1.8, label="BD")
+        plot_bd_directions(ax, bd_angles_deg, active_user, r_max)
 
         for s_idx, s_ang in enumerate(scatter_angles):
             if -90.0 <= s_ang <= 90.0:
@@ -290,7 +339,7 @@ for sample_idx in n_show:
                 )
         
         ax.set_title(
-            f"step={step_idx + 1}, SINR={sinr_steps_db[step_idx]:.2f} dB\n"
+            f"t={step_idx + 1}, SINR={sinr_steps_db[step_idx]:.2f} dB\n"
             f"sig={sig_steps_db[step_idx]:.2f} dB, intf={inter_steps_db[step_idx]:.2f} dB",
             fontsize=12,
             pad=1,
@@ -334,9 +383,7 @@ for sample_idx in n_show:
         label=f"Optimal ({optimal_final_sinr_db:.2f} dB)",
     )
 
-    if np.isfinite(true_bd_angle_deg) and -90.0 <= true_bd_angle_deg <= 90.0:
-        theta_bd = np.deg2rad(true_bd_angle_deg)
-        ax_cmp.plot([theta_bd, theta_bd], [0, r_max], color="#036221", linestyle="--", linewidth=1.8, label="BD")
+    plot_bd_directions(ax_cmp, bd_angles_deg, active_user, r_max)
 
     for s_idx, s_ang in enumerate(scatter_angles):
         if -90.0 <= s_ang <= 90.0:
@@ -356,7 +403,7 @@ for sample_idx in n_show:
         fontsize=12,
         pad=1,
     )
-    ax_cmp.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.03, 1.12))
+    # ax_cmp.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.03, 1.12))
 
     sinr_text = "N/A"
     if sample_idx < sinr_final.size and np.isfinite(sinr_final[sample_idx]):
@@ -371,7 +418,7 @@ for sample_idx in n_show:
     plt.show()
 
     print(
-        f"Sample {sample_idx + 1}: learned final SINR={learned_final_sinr_db:.2f} dB, "
+        f"Sample {sample_idx + 1}, active BD {active_user + 1}: learned final SINR={learned_final_sinr_db:.2f} dB, "
         f"optimal SINR={optimal_final_sinr_db:.2f} dB"
     )
 
@@ -403,9 +450,7 @@ for sample_idx in n_show:
         label=f"Optimal ({optimal_final_sinr_db:.2f} dB)",
     )
 
-    if np.isfinite(true_bd_angle_deg) and -90.0 <= true_bd_angle_deg <= 90.0:
-        theta_bd = np.deg2rad(true_bd_angle_deg)
-        ax1.plot([theta_bd, theta_bd], [0, r_max], color="#036221", linestyle="--", linewidth=1.8, label="BD")
+    plot_bd_directions(ax1, bd_angles_deg, active_user, r_max)
 
     for s_idx, s_ang in enumerate(scatter_angles):
         if -90.0 <= s_ang <= 90.0:
