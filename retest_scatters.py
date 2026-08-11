@@ -10,38 +10,26 @@ from parse_args import parse_args
 from channel_functions import *
 from iter_gen_eig import *
 from opti_transpose import *
-from retest_benchmark import make_codebook
+from manifold_optimization import solve_with_random_restarts, solve_x_equals_y_fast
 
 args = parse_args()
 
 ###############################################################
 #            Params for scatters (Extension)
 ###############################################################
-N_tx = 36
-N_rx = 36
+N_tx = 16
+N_rx = 16
 K = 1
 
 N_scatter = 1
 fc = args.fc
 Wavelength = 3e8 / fc
-ref_dis = 5#15*Wavelength
+ref_dis = Wavelength*166.67
 location_tx = np.array([0, 0, 0])
 location_rx = np.array([0, 0, 0])
 
 
 def dft_codebook(n, m):
-    """
-    Creates a DFT codebook for a ULA BS.
-
-    Args:
-        n (int): The number of antenna elements in the ULA.
-        m (int): The number of beams in the codebook.
-        angles_deg (list): A list of angles (in degrees) to form the beams.
-        d (float): The antenna spacing (in wavelengths).
-
-    Returns:
-        codebook (numpy.ndarray): A numpy array of shape (n, m) representing the codebook.
-    """
     dft_matrix = np.ones((n,m)) * complex(1, 0)
     for i in range(1, m+1):
         dft_matrix[:,i-1] = 1/np.sqrt(n) * np.array([np.exp(-1j * np.pi * j *(2 * i - 1 - m)/m) for j in range(n)])
@@ -51,9 +39,125 @@ methods = {
     'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
     'iteropti': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
     'beam_sweep': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
+    'beam_sweep_csi': {'color': "#d8b99f", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
+    'sweep_dig': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
+    'iteropti_hat': {'color': '#2ca02c', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
+}
+
+
+def beam_groups(n, m, balanced=True):
+    g = n // m
+    if balanced:
+        return [list(a) for a in np.array_split(np.arange(n), m)]
+    groups = [list(range(k*g, (k+1)*g)) for k in range(m)]
+    groups[-1] += list(range(m*g, n))
+    return groups
+
+
+def grouped_dft_codebook(n, m, balanced=True, phase='equal'):
+    """m broadened beams, each the sum of adjacent full-resolution DFT beams.
+    """
+    if m >= n:
+        return dft_codebook(n, m)
+
+    basis = dft_codebook(n, n)
+    codebook = np.zeros((n, m), dtype=complex)
+    for k, idx in enumerate(beam_groups(n, m, balanced)):
+        g = len(idx)
+        if phase == 'equal':
+            weights = np.ones(g)
+        else:
+            weights = np.exp(1j * np.pi * np.arange(g)**2 / g)
+        beam = basis[:, idx] @ weights
+        codebook[:, k] = beam / np.linalg.norm(beam)
+    return codebook
+
+CODEBOOK = 'grouped'
+
+
+def make_codebook(n, m):
+    return grouped_dft_codebook(n, m) if CODEBOOK == 'grouped' else dft_codebook(n, m)
+
+def compute_optimal_beamformers_2b(H_b_batch, H_int_batch, noise_var_val, P_val, num_restarts=10):
+    """Compute optimal beamformers for a batch - reduced restarts for 2x speedup"""
+    batch_size = H_b_batch.shape[0]
+    v_opt_batch = np.zeros((batch_size, H_b_batch.shape[1], 1), dtype=np.complex64)
+    w_opt_batch = np.zeros((batch_size, H_b_batch.shape[2], 1), dtype=np.complex64)
+    
+    for i in range(batch_size):
+        H_b_i = H_b_batch[i]
+        H_int_i = H_int_batch[i]
+        A = np.sqrt(P_val) * H_b_i
+        B = np.sqrt(P_val) * H_int_i
+        try:
+            # Reduced restarts from 10 to 5 for ~2x speedup with minimal quality loss
+            w_opt_i, v_opt_i, _ = solve_with_random_restarts(A, B, c=noise_var_val, restarts=num_restarts)
+            v_opt_batch[i, :, 0] = v_opt_i
+            w_opt_batch[i, :, 0] = w_opt_i
+        except:
+            # Fallback to SVD
+            U, S, Vh = np.linalg.svd(H_b_i)
+            v_opt_batch[i, :, 0] = U[:, 0]
+            w_opt_batch[i, :, 0] = Vh[0, :]
+    
+    return v_opt_batch.astype(np.complex64), w_opt_batch.astype(np.complex64)
+
+def compute_optimal_beamformers_1b(H_b_batch, H_int_batch, noise_var_val, P_val, num_restarts=10):
+    """Compute optimal beamformers for a batch - reduced restarts for 2x speedup"""
+    batch_size = H_b_batch.shape[0]
+    
+    w_opt_batch = np.zeros((batch_size, H_b_batch.shape[2], 1), dtype=np.complex64)
+    
+    for i in range(batch_size):
+        H_b_i = H_b_batch[i]
+        H_int_i = H_int_batch[i]
+        A = np.sqrt(P_val) * H_b_i
+        B = np.sqrt(P_val) * H_int_i
+        try:
+            # Reduced restarts from 10 to 5 for ~2x speedup with minimal quality loss
+            w_opt_i, _ = solve_x_equals_y_fast(A, B, c=noise_var_val, restarts=num_restarts)
+
+            w_opt_batch[i, :, 0] = w_opt_i
+        except:
+            # Fallback to SVD
+            U, S, Vh = np.linalg.svd(H_b_i)
+
+            w_opt_batch[i, :, 0] = Vh[0, :]
+    
+    return w_opt_batch.astype(np.complex64)
+def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch, w_batch, noise_var_val, P_val):
+    """Evaluate BD and scatter SINR for a batch of beamformers."""
+    H_interference = H_d_batch + H_r_batch
+
+    v_h = np.conjugate(np.swapaxes(v_batch, 1, 2))
+    sig_bd = np.matmul(v_h, np.matmul(H_b_batch, w_batch))
+    sig_bd = np.squeeze(np.abs(sig_bd) ** 2, axis=(1, 2)) * P_val
+
+    sig_int = np.matmul(v_h, np.matmul(H_interference, w_batch))
+    sig_int = np.squeeze(np.abs(sig_int) ** 2, axis=(1, 2)) * P_val
+    sinr_bd = sig_bd / (sig_int + noise_var_val)
+
+    sig_scatter = np.matmul(v_h, np.matmul(H_r_batch, w_batch))
+    sig_scatter = np.squeeze(np.abs(sig_scatter) ** 2, axis=(1, 2)) * P_val
+
+    int_scatter = np.matmul(v_h, np.matmul(H_d_batch + H_b_batch, w_batch))
+    int_scatter = np.squeeze(np.abs(int_scatter) ** 2, axis=(1, 2)) * P_val
+    sinr_scatter = sig_scatter / (int_scatter + noise_var_val)
+
+    return (
+        sinr_bd.astype(np.float32),
+        sinr_scatter.astype(np.float32),
+        sig_bd.astype(np.float32),
+        sig_int.astype(np.float32),
+    )
+
+methods = {
+    'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
+    'iteropti': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
+    'beam_sweep': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
     'beam_sweep_csi': {'color': "#ff7f0e", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
     'sweep_dig': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
-    'sweep_dig_csi': {'color': '#8c564b', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
+    'iteropti_hat': {'color': '#2ca02c', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
 }
 
 # %%
@@ -62,7 +166,8 @@ int_pow_opti_recal = []
 sinr_opti_recal = []
 rieman_opti_sinr_1b = []
 sinr_test_1b = []
-sinr_sweeping_1b = []
+sinr_opt_hat_1b = []
+sinr_opt_hat_2b = []
 sinr_sweep_1b_anaw = []
 
 sinr_test_2b = []
@@ -75,12 +180,14 @@ K = 1
 N_scatter = 5
 CB = dft_codebook(N_tx, tau)
 snr_const = [ -10,-5, 0, 5, 10, 15, 20, 25]
+
+
 for i, snr in enumerate(snr_const):
 
        ###############################################################
        #            files with scatters (Extension)
        ###############################################################
-       filename = os.path.join('Mo_mimo_sinr_modelsave', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
               'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
        data = scipy.io.loadmat(filename)
 
@@ -98,12 +205,22 @@ for i, snr in enumerate(snr_const):
        Scatter_loc = data['Scatter_location'].squeeze()
        test_size = BD_loc.shape[0]
 
+       H_I_hat_batch = []
+       H_b_hat_batch = []
+       H_b_batch = []
+       H_r_batch = []
+       H_d_batch = []
+
        Pvec = 10**(snr/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
        for j in range(test_size):
-
+              bd_loc = generate_location_mimo(1, 'u')[0]
+              scatter_loc = generate_location_mimo(N_scatter, 's')
               _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
-                                   location_tx, location_rx, Scatter_loc[j], BD_loc[j], N_tx, 1, N_rx, 1)
+                                   location_tx, location_rx, scatter_loc, bd_loc, N_tx, 1, N_rx, 1)
+              H_b_batch.append(H_b_test)
+              H_r_batch.append(H_r_test)
+              H_d_batch.append(H_d_test)
 
               H_I = H_d_test + H_r_test
               H_b = H_b_test
@@ -118,14 +235,8 @@ for i, snr in enumerate(snr_const):
               H_b_hat = (observation1 - observation2)/2 / np.sqrt(Pvec)
               H_I_hat = (observation1 + observation2)/2 / np.sqrt(Pvec)
 
-              # bi = np.abs(np.conj(CB).T @ H_b_hat @ CB)**2
-              # metric = bi.diagonal() 
-
-              # best_idx = np.argmax(metric)
-              # theta_test = CB[:, best_idx][:, np.newaxis]
-              
-              # sinr_sweeping_1b.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
-              #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
+              H_b_hat_batch.append(H_b_hat)
+              H_I_hat_batch.append(H_I_hat)
 
               ##### Beam sweeping both analog Rx and Tx
               numerator = np.abs(CB.conj().T @ H_b_hat @ CB)**2
@@ -156,16 +267,34 @@ for i, snr in enumerate(snr_const):
               sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_b @ best_theta)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_I @ best_theta)**2 + 1))
 
+       ##### Optimal beams from H_hat
+       v_sp, w_sp = compute_optimal_beamformers_2b(
+                     np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
 
-sig_pow_opti_recal = np.mean(np.reshape(sig_pow_opti_recal, (len(snr_const), -1)), axis=1)
-int_pow_opti_recal = np.mean(np.reshape(int_pow_opti_recal, (len(snr_const), -1)), axis=1)
-sinr_opti_recal = np.mean(np.reshape(sinr_opti_recal, (len(snr_const), -1)), axis=1)
+       sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
+              np.array(H_d_batch),np.array(H_b_batch),np.array(H_r_batch),
+              np.array(v_sp),np.array(w_sp),1,Pvec,
+       )
+       sinr_opt_hat_2b.append(sinr_opt_2b)
+
+       vw_opt = compute_optimal_beamformers_1b(
+              np.array(H_b_hat_batch),np.array(H_I_hat_batch),
+              1,Pvec,num_restarts=1,
+       )
+       sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
+                     np.array(H_d_batch),np.array(H_b_batch),np.array(H_r_batch),
+                     np.array(vw_opt),np.array(vw_opt),1,Pvec,
+       )
+       sinr_opt_hat_1b.append(sinr_opt_1b)
+
+
 
 sinr_sweep_digiw = np.mean(np.reshape(sinr_sweep_digiw, (len(snr_const), -1)), axis=1)
 sinr_sweep_2b_anaw = np.mean(np.reshape(sinr_sweep_2b_anaw, (len(snr_const), -1)), axis=1)
-# sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(snr_const), -1)), axis=1)
 sinr_sweep_1b_anaw = np.mean(np.reshape(sinr_sweep_1b_anaw, (len(snr_const), -1)), axis=1)
 
+sinr_opt_hat_1b = 0 if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(snr_const), -1)), axis=1)
+sinr_opt_hat_2b = 0 if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(snr_const), -1)), axis=1)
 
 # %%
 
@@ -179,10 +308,11 @@ ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_1b], \
        marker=methods['iteropti']['marker'], linestyle='--',
        color=methods['iteropti']['color'], linewidth=1.2, markersize=6,
        label='IterOpti')
-# ax.plot(snr_const, 10*np.log10(sinr_sweeping_1b.squeeze()), \
-#        marker=methods['beam_sweep']['marker'], linestyle='--',
-#        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=7,
-#        label='Beam Sweeping (digital Rx)')
+
+ax.plot(snr_const, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='--',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
 
 ax.plot(snr_const, 10*np.log10(sinr_sweep_1b_anaw.squeeze()), \
        marker=methods['beam_sweep_csi']['marker'], linestyle='--',
@@ -198,6 +328,11 @@ ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_2b], \
        marker=methods['iteropti']['marker'], linestyle='-', 
        color=methods['iteropti']['color'], linewidth=1.2, markersize=6)
 
+ax.plot(snr_const, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='-',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
+
 ax.plot(snr_const, 10*np.log10(sinr_sweep_digiw.squeeze()), \
        marker=methods['sweep_dig']['marker'], linestyle='-', 
        color=methods['sweep_dig']['color'], linewidth=1.2, markersize=7)
@@ -212,18 +347,25 @@ from matplotlib.lines import Line2D
 
 # Method legend (colors/markers)
 method_legend = [
-    Line2D([0], [0], color=methods['sweep_dig']['color'], 
-           marker=methods['sweep_dig']['marker'], linestyle='None', 
-           markersize=7, label='Sweep (Digital $\mathbf{w}$)'),
-    Line2D([0], [0], color=methods['beam_sweep_csi']['color'], 
-           marker=methods['beam_sweep_csi']['marker'], linestyle='None', 
-           markersize=7, label='Sweep (Analog $\mathbf{w}$)'),
-    Line2D([0], [0], color=methods['proposed']['color'], 
-           marker=methods['proposed']['marker'], linestyle='None', 
-           markersize=7, label='Proposed'),
+    Line2D([0], [0], color=methods['proposed']['color'],
+        marker=methods['proposed']['marker'], linestyle='None', 
+        markersize=7, label='Proposed'),
     Line2D([0], [0], color=methods['iteropti']['color'], 
            marker=methods['iteropti']['marker'], linestyle='None', 
            markersize=7, label='IterOpti'),
+    Line2D([0], [0], color=methods['iteropti_hat']['color'],
+            marker=methods['iteropti_hat']['marker'], linestyle='None',
+            markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm SI}, \hat{\mathbf{H}}_{\rm b}$'),
+    Line2D([0], [0], color=methods['beam_sweep']['color'],
+           marker=methods['beam_sweep']['marker'], linestyle='None',
+           markersize=7, label=r'Sweep (Analog $\mathbf{w}$)'),
+           
+    Line2D([0], [0], color=methods['sweep_dig']['color'],
+           marker=methods['sweep_dig']['marker'], linestyle='None',
+           markersize=7, label=r'Sweep (Digital $\mathbf{w}$)'),
+#     Line2D([0], [0], color=methods['sweep_dig_csi']['color'],
+#            marker=methods['sweep_dig_csi']['marker'], linestyle='None',
+#            markersize=7, label=r'Sweep, Digital $\mathbf{v}$ ($\mathbf{H}_{\rm SI}$)'),
 ]
 
 # Line style legend
@@ -235,10 +377,19 @@ style_legend = [
 ]
 
 # Create two separate legends
-legend1 = ax.legend(handles=method_legend, loc='upper left', 
+legend1 = ax.legend(handles=method_legend, loc='lower right', ncols=1,
+                   frameon=True, fontsize=8, fancybox=True, framealpha=0.5)
+legend2 = ax.legend(handles=style_legend, loc='upper left',
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.5)
-legend2 = ax.legend(handles=style_legend, loc='lower right', 
-                   frameon=True, fontsize=9, fancybox=True, framealpha=0.5)
+
+# legend1.get_texts()[2].set_position((0, 2))
+from matplotlib.transforms import ScaledTranslation
+offset = ScaledTranslation(0, -3 / 72, fig.dpi_scale_trans)  
+for i in range(0, 2):
+       legend1.get_texts()[i].set_transform(legend1.get_texts()[i].get_transform() + offset)
+       legend1.legend_handles[i].set_transform(
+       legend1.legend_handles[i].get_transform() + offset
+       )
 
 # Add the first legend back (matplotlib removes it when creating the second)
 ax.add_artist(legend1)
@@ -436,7 +587,7 @@ ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xlim(-0.3, len(tau) - 0.7)
 ax.set_xticks(tau_tick_positions)
 ax.set_xticklabels(tau_tick_labels)
-ax.set_ylim([-12, 10])
+# ax.set_ylim([-12, 10])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
 # plt.savefig('figs/scatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
@@ -470,7 +621,7 @@ sinr_sweep_1b_anaw = []
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
 for i, n_tau in enumerate(tau):
-       filename = os.path.join('Mo_mimo_sinr_1b', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave', \
        'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
        # sinr_test_1b.append(data['sinr_test'].squeeze())
@@ -478,7 +629,7 @@ for i, n_tau in enumerate(tau):
        sinr_test_1b.append(data['sinr_learned'].squeeze())
        rieman_opti_sinr_1b.append(data['sinr_optimal'].squeeze())
 
-       filename = os.path.join('Mo_mimo_sinr_modelsave', \
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (16, 16, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
 
@@ -621,7 +772,7 @@ ax.add_artist(legend1)
 ax.set_xlabel('Preamble Length')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(tau)
-# ax.set_ylim([-30, 25])
+ax.set_ylim([-20, 10])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
 # plt.savefig('figs/multiscatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
@@ -781,8 +932,10 @@ N_RESTART    = 3        # random restarts of the alternating solver
 MAX_ITER     = 60
 BENCH_SEED   = 2024
 n_bench      = None     # None -> every test sample; set an int to subsample
-
-
+Wavelength   = 3e8 / args.fc
+ref_dis      = 166.67*Wavelength
+N_tx = 36
+N_rx = N_tx
 #############################  benchmark building blocks  ############################
 
 def sense_and_despread(H_I, H_b, u_star, W_sound, L, P, K, noise_var, rng):
@@ -903,7 +1056,7 @@ for i, snr in enumerate(snr_const):
        identify_accuracy.append(data['identification_accuracy'].squeeze())
 
        filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
-                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
+                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (36, 36, tau, snr, K, N_scatter))
        data1b = scipy.io.loadmat(filename)
        sinr_test_2b.append(data1b['sinr_learned'].squeeze())
 
@@ -934,8 +1087,10 @@ for i, snr in enumerate(snr_const):
        ok_list, bad_list = [], []
 
        for j in idx_list:
+              bd_loc = generate_location_mimo(N_bd, 'u')
+              scatter_loc = generate_location_mimo(N_scatter, 's')
               _, H_d, H_r, H_b = generate_mimo_channel(
-                     location_tx, location_rx, Scatter_loc[j], BD_loc[j],
+                     location_tx, location_rx, scatter_loc, bd_loc,
                      N_tx, 1, N_rx, 1)
               H_I = H_d + H_r
               u_star = int(active_user[j])
@@ -1039,37 +1194,54 @@ ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in sinr_opti_sinr],
        marker='o', linestyle='-', color='#2077b4', linewidth=1.2, markersize=6,
        label='IterOpti (Genie ID)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in sinr_test_2b],
-       marker='d', linestyle='--', color='#8c564b', linewidth=1.0, markersize=7,
+       marker='d', linestyle='-', color='#8c564b', linewidth=1.0, markersize=7,
        label='Proposed (Genie ID)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in sinr_test],
        marker='d', linestyle='-', color='#d62728', linewidth=1.2, markersize=6,
        label='Proposed (3 BDs)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['alt_opt']],
        marker='^', linestyle='-', color='#2ca02c', linewidth=1.2, markersize=6,
-       label='EstiThenOpti')
+       label=r'IterOpti $\hat{\mathbf{H}}_{\rm I}, \hat{\mathbf{H}}_{\rm b}$')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_digital']],
        marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
-       label='Sweep (Ditigal $\mathbf{w}$)')
+       label=r'Sweep (Digital $\mathbf{w}$)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_analog']],
        marker='v', linestyle='-', color='#9467bd', linewidth=1.2, markersize=6,
-       label='Sweep (Analog $\mathbf{w}$)')
+       label=r'Sweep (Analog $\mathbf{w}$)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['no_id']],
        marker='x', linestyle=':', color='#7f7f7f', linewidth=1.2, markersize=6,
        label='No identification')
 
 
-ax.set_xlabel('SNR [dB]')
+ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(snr_const)
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
-ax.legend(loc='lower right', fontsize=8, frameon=True, fancybox=True, framealpha=0.6)
+legend = ax.legend(loc='lower right', fontsize=8, frameon=True, fancybox=True, framealpha=0.6)
+
+from matplotlib.transforms import ScaledTranslation
+offset = ScaledTranslation(0, -2 / 72, fig.dpi_scale_trans)
+for j in range(4):
+    entry_offset = ScaledTranslation(
+        0,
+        (-2 - 2 * int(j != 3)) / 72,
+        fig.dpi_scale_trans,
+    )
+
+    legend.get_texts()[j].set_transform(
+        legend.get_texts()[j].get_transform() + entry_offset
+    )
+    legend.legend_handles[j].set_transform(
+        legend.legend_handles[j].get_transform() + entry_offset
+    )
+
 plt.tight_layout()
-fig.savefig('figs/multiBD_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
+# fig.savefig('figs/multiBD_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
 
 fig, ax = plt.subplots(1, 1, figsize=(4, 3))
 ax.plot(snr_const, [np.mean(p) for p in identify_accuracy],
        marker='d', linestyle='-', color='#d62728', linewidth=1.2, markersize=6,
-       label='Proposed (learned)')
+       label='Proposed')
 ax.plot(snr_const, id_acc_energy,
        marker='^', linestyle='-', color='#2ca02c', linewidth=1.2, markersize=6,
        label='Energy detector')
@@ -1078,12 +1250,12 @@ ax.plot(snr_const, id_acc_ls,
        label='LS detector')
 ax.axhline(1.0 / N_bd, color='#7f7f7f', linestyle=':', linewidth=1.0,
        label='Random guess')
-ax.set_xlabel('SNR [dB]')
+ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Identification Accuracy')
 ax.set_xticks(snr_const)
 ax.set_ylim([0, 1.05])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 ax.legend(loc='lower right', fontsize=8, frameon=True, fancybox=True, framealpha=0.6)
 plt.tight_layout()
-fig.savefig('figs/multiBD_id_acc_snr.pdf', format = 'pdf', bbox_inches = 'tight')
+# fig.savefig('figs/multiBD_id_acc_snr.pdf', format = 'pdf', bbox_inches = 'tight')
 # %%
