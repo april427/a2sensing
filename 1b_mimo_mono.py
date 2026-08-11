@@ -8,7 +8,7 @@ Objective: max_v SINR_BD = P|v^H H_b v|^2 / (P|v^H (H_d+H_r) v|^2 + noise_var)
 w = v
 
 """
-
+#%%
 import os
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -153,7 +153,7 @@ tau = args.tau  # Pilot length (also number of BD interactions)
 K = getattr(args, "N_symbols", 1)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
-ref_dis = 5
+ref_dis = Wavelength*166.67
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
 # BD modulation - alternating pattern
@@ -269,7 +269,7 @@ class BackgroundDataGenerator:
     
     def stop(self):
         self.stopped = True
-
+# %%
 #####################################################
 # Generate ambient signal
 #####################################################
@@ -348,7 +348,7 @@ with tf.name_scope("active_sensing_agent"):
     hidden_size = 128  # Shared hidden size for both nodes
     
     LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')
-    LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
+    # LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
     
     # Tx and Rx share the same beamformer
     mlp_tx_rx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_rx], name='Receiver_receiver')
@@ -421,11 +421,11 @@ with tf.name_scope("active_sensing_agent"):
         ], axis=1)
         
         'Update shared LSTM state - both RIS and Rx can see the result'
-        h_old, c_old = LSTM1((tf.concat([y_real,  snr_normal], axis=1), h_old, c_old))
-        h_old2, c_old2 = LSTM2((tf.concat([y_real2,  snr_normal], axis=1), h_old2, c_old2))
+        h_old, c_old = LSTM1((tf.concat([y_real, y_real2, snr_normal], axis=1), h_old, c_old))
+        # h_old2, c_old2 = LSTM2((tf.concat([y_real2,  snr_normal], axis=1), h_old2, c_old2))
         
         'Rx designs receive beamformer v based on shared hidden state'
-        v_her = mlp_tx_rx(tf.concat([h_old, h_old2], axis=1))
+        v_her = mlp_tx_rx(tf.concat([h_old, c_old], axis=1))
         v_norm = tf.reshape(tf.norm(v_her, axis=1), (-1, 1))
         v_her = tf.divide(v_her, v_norm + 1e-8)
         v1 = tf.complex(v_her[:, 0:N_rx], v_her[:, N_rx:2 * N_rx])
@@ -441,7 +441,7 @@ with tf.name_scope("active_sensing_agent"):
     MLP_bf_v = MLPBlock(3, [2 * hidden_size, 2 * hidden_size, 2 * N_rx], name='MLP_bf_v')
     
     # Final eamformer v (from shared state)
-    v_tmp = MLP_bf_v(tf.concat([c_old, c_old2], axis=1))
+    v_tmp = MLP_bf_v(tf.concat([h_old, c_old], axis=1))
     v_norm = tf.reshape(tf.norm(v_tmp, axis=1), (-1, 1))
     v_tmp = tf.divide(v_tmp, v_norm + 1e-8)
     v_complex = tf.complex(v_tmp[:, 0:N_rx], v_tmp[:, N_rx:2 * N_rx])
