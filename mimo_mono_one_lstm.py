@@ -157,7 +157,7 @@ tau = args.tau  # Pilot length (also number of BD interactions)
 K = getattr(args, "N_symbols", 5)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
-ref_dis = 15*Wavelength
+ref_dis = 166.67*Wavelength
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
 # BD modulation - alternating pattern
@@ -236,6 +236,125 @@ def compute_optimal_beamformers_batch_parallel(H_b_batch, H_int_batch, noise_var
             w_opt_batch[i, :, 0] = Vh[0, :]
     
     return v_opt_batch.astype(np.complex64), w_opt_batch.astype(np.complex64)
+
+def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch, w_batch, noise_var_val, P_val):
+    """Evaluate BD and scatter SINR for a batch of beamformers."""
+    H_interference = H_d_batch + H_r_batch
+
+    v_h = np.conjugate(np.swapaxes(v_batch, 1, 2))
+    sig_bd = np.matmul(v_h, np.matmul(H_b_batch, w_batch))
+    sig_bd = np.squeeze(np.abs(sig_bd) ** 2, axis=(1, 2)) * P_val
+
+    sig_int = np.matmul(v_h, np.matmul(H_interference, w_batch))
+    sig_int = np.squeeze(np.abs(sig_int) ** 2, axis=(1, 2)) * P_val
+    sinr_bd = sig_bd / (sig_int + noise_var_val)
+
+    sig_scatter = np.matmul(v_h, np.matmul(H_r_batch, w_batch))
+    sig_scatter = np.squeeze(np.abs(sig_scatter) ** 2, axis=(1, 2)) * P_val
+
+    int_scatter = np.matmul(v_h, np.matmul(H_d_batch + H_b_batch, w_batch))
+    int_scatter = np.squeeze(np.abs(int_scatter) ** 2, axis=(1, 2)) * P_val
+    sinr_scatter = sig_scatter / (int_scatter + noise_var_val)
+
+    return (
+        sinr_bd.astype(np.float32),
+        sinr_scatter.astype(np.float32),
+        sig_bd.astype(np.float32),
+        sig_int.astype(np.float32),
+    )
+
+
+def compute_signal_processing_baselines_batch(
+    H_d_batch,
+    H_b_batch,
+    H_r_batch,
+    pilot_matrix,
+    sweep_matrix,
+    noise_std_val,
+    noise_var_val,
+    P_val,
+    num_restarts=10,
+):
+    """Compute SP and beam-sweeping baselines outside TensorFlow."""
+    sqrt_p = np.sqrt(P_val).astype(np.float32)
+    ss_h = pilot_matrix @ np.conjugate(pilot_matrix.T)
+    reg = 1e-1 * np.eye(pilot_matrix.shape[0], dtype=np.complex64)
+    s_pilot_pinv = np.conjugate(np.linalg.solve(ss_h + reg, pilot_matrix).T)
+
+    H_eff0 = -H_b_batch + H_d_batch + H_r_batch
+    Y_0_clean = np.matmul(H_eff0, pilot_matrix)
+    noise_0 = (
+        np.random.normal(0.0, noise_std_val, Y_0_clean.shape)
+        + 1j * np.random.normal(0.0, noise_std_val, Y_0_clean.shape)
+    ).astype(np.complex64)
+    H_eff_hat0 = (sqrt_p * Y_0_clean + noise_0) @ s_pilot_pinv / (sqrt_p + 1e-10)
+
+    H_eff1 = H_b_batch + H_d_batch + H_r_batch
+    Y_1_clean = np.matmul(H_eff1, pilot_matrix)
+    noise_1 = (
+        np.random.normal(0.0, noise_std_val, Y_1_clean.shape)
+        + 1j * np.random.normal(0.0, noise_std_val, Y_1_clean.shape)
+    ).astype(np.complex64)
+    H_eff_hat1 = (sqrt_p * Y_1_clean + noise_1) @ s_pilot_pinv / (sqrt_p + 1e-10)
+
+    H_int_estimated = (H_eff_hat0 + H_eff_hat1) / np.complex64(2.0)
+    H_bd_estimated = (H_eff_hat1 - H_eff_hat0) / np.complex64(2.0)
+
+    v_sp, w_sp = compute_optimal_beamformers_batch_parallel(
+        H_bd_estimated,
+        H_int_estimated,
+        noise_var_val,
+        P_val,
+        num_restarts=num_restarts,
+    )
+    sinr_bd_sp, _, _, _ = compute_beamformer_metrics_batch(
+        H_d_batch,
+        H_b_batch,
+        H_r_batch,
+        v_sp,
+        w_sp,
+        noise_var_val,
+        P_val,
+    )
+
+    Hbd_est_W = np.matmul(H_bd_estimated, sweep_matrix)
+    codebook_h = np.conjugate(sweep_matrix.T)
+    bi_matrix = np.abs(np.matmul(codebook_h[np.newaxis, :, :], Hbd_est_W)) ** 2
+    sweep_metric = np.diagonal(bi_matrix, axis1=1, axis2=2)
+    best_w_idx = np.argmax(sweep_metric, axis=1)
+
+    codebook_t = sweep_matrix.T
+    w_sweep = codebook_t[best_w_idx][:, :, np.newaxis]
+    w_sweep_norm = np.maximum(np.linalg.norm(w_sweep, axis=1, keepdims=True), 1e-10)
+    w_sweep = (w_sweep / w_sweep_norm).astype(np.complex64)
+
+    x_int_est = np.matmul(H_int_estimated, w_sweep)
+    x_norm_sq = np.sum(np.abs(x_int_est) ** 2, axis=(1, 2), keepdims=True)
+    proj_x = np.matmul(x_int_est, np.conjugate(np.swapaxes(x_int_est, 1, 2))) / (x_norm_sq + 1e-10)
+
+    eye_rx = np.broadcast_to(
+        np.eye(H_int_estimated.shape[1], dtype=np.complex64),
+        proj_x.shape,
+    )
+    null_proj = eye_rx - proj_x
+    v_seed = w_sweep if H_int_estimated.shape[1] == w_sweep.shape[1] else np.matmul(H_bd_estimated, w_sweep)
+    v_sweep_raw = np.matmul(null_proj, v_seed)
+    v_raw_norm_sq = np.sum(np.abs(v_sweep_raw) ** 2, axis=(1, 2), keepdims=True)
+    v_sweep_safe = np.where(v_raw_norm_sq > 1e-8, v_sweep_raw, v_seed)
+    v_sweep_norm = np.maximum(np.linalg.norm(v_sweep_safe, axis=1, keepdims=True), 1e-10)
+    v_sweep = (v_sweep_safe / v_sweep_norm).astype(np.complex64)
+
+    sinr_bd_sweep, _, _, _ = compute_beamformer_metrics_batch(
+        H_d_batch,
+        H_b_batch,
+        H_r_batch,
+        v_sweep,
+        w_sweep,
+        noise_var_val,
+        P_val,
+    )
+
+    return sinr_bd_sp, sinr_bd_sweep
 
 # Background data generation queue (unused - ThreadPool overhead not worth it for fast ops)
 class BackgroundDataGenerator:
@@ -786,7 +905,22 @@ feed_dict_val = {
     H_b_placeholder: H_b_val,
     H_r_placeholder: H_r_val
 }
-
+v_opt_val, w_opt_val = compute_optimal_beamformers_batch_parallel(
+    H_b_val,
+    H_d_val + H_r_val,
+    noise_var,
+    Pvec[0],
+    num_restarts=10,
+)
+sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = compute_beamformer_metrics_batch(
+    H_d_val,
+    H_b_val,
+    H_r_val,
+    v_opt_val,
+    w_opt_val,
+    noise_var,
+    Pvec[0],
+)
 
 #####################################################
 # Training Loop
@@ -854,22 +988,22 @@ with tf.Session() as sess:
             [loss, sinr_BD, sinr_scatter, sig_BD, sig_ref], feed_dict=feed_dict_val
         )
 
-        # Optimal beamformer performance
-        if epoch == 0:
-            sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
+        # # Optimal beamformer performance
+        # if epoch == 0:
+        #     sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
+        #     [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
 
-            # sp-based beamformer performance
-            sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-                        [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
+        #     # sp-based beamformer performance
+        #     sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
+        #                 [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
 
         
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
               f'Best: {best_val:8.4f}')
-        print(f'         | '
-              f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
+        # print(f'         | '
+        #       f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
               f'SINR_BD (learned): {10 * np.log10(np.mean(sinr_val) + 1e-10):6.2f} dB | '
               f'SINR_BD (optimal): {10 * np.log10(np.mean(sinr_opt_val) + 1e-10):6.2f} dB')
@@ -930,10 +1064,36 @@ with tf.Session() as sess:
         H_r_placeholder: H_r_test
     }
     
-    sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, w_learned, \
-        v_optimal, w_optimal, v_list_test, w_list_test = sess.run(
-                [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex, w_complex, \
-                v_opt, w_opt, v_list, w_list], feed_dict=feed_dict_test
+    v_optimal, w_optimal = compute_optimal_beamformers_batch_parallel(
+            H_b_test,
+            H_d_test + H_r_test,
+            noise_var,
+            Pvec[0],
+            num_restarts=10,
+        )
+    sinr_opt_test, _, _, _ = compute_beamformer_metrics_batch(
+        H_d_test,
+        H_b_test,
+        H_r_test,
+        v_optimal,
+        w_optimal,
+        noise_var,
+        Pvec[0],
+    )
+    sinr_sp_test, sinr_sweep_test = compute_signal_processing_baselines_batch(
+        H_d_test,
+        H_b_test,
+        H_r_test,
+        s_pilot,
+        sweep_codebook,
+        noiseSTD_per_dim,
+        noise_var,
+        Pvec[0],
+        num_restarts=10,
+    )
+    
+    sinr_test, sinr_scatter_test, v_learned, w_learned, v_list_test, w_list_test = sess.run(
+                [sinr_BD, sinr_scatter, v_complex, w_complex, v_list, w_list], feed_dict=feed_dict_test
     )
 
     sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)

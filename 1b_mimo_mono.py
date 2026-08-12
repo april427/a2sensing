@@ -124,7 +124,7 @@ class LSTM_Cell(tf.keras.layers.Layer):
 # System Configuration
 #####################################################
 
-drive_save_path = 'Mo_mimo_sinr_1b'
+drive_save_path = 'Mo_mimo_sinr_1b_aaT'
 os.makedirs(drive_save_path, exist_ok=True)
 
 # System parameters
@@ -357,7 +357,11 @@ learning_rate = 5e-4
 batch_per_epoch = 128
 batch_size_order = 4
 val_size_order = 20
-test_size = 800
+test_size = 2000
+# The optimal (benchmark) beamformer is expensive, so it is only computed on the
+# first opt_test_size test samples. Test data generation is sequential from a
+# fixed seed, so those samples match the first opt_test_size of any earlier run.
+opt_test_size = 800
 
 tf.reset_default_graph()
 he_init = tf.variance_scaling_initializer()
@@ -772,7 +776,9 @@ with tf.Session() as sess:
         saver.restore(sess, model_ckpt)
         best_val = float(sess.run(loss, feed_dict=feed_dict_val))
         print(f"Restored validation loss baseline: {best_val:.6f}")
-    
+        n_epochs = 10
+        print(f"Continuing training for {n_epochs} more epochs")
+
     # Early stopping
     wait = 0
     PATIENCE = 20
@@ -888,28 +894,53 @@ with tf.Session() as sess:
         [sinr_BD, sinr_scatter, v_complex], feed_dict=feed_dict_test
     )
 
-    # Optimal beamformer in NumPy, same as for the validation set above.
-    print("Computing optimal beamformer for the test set...")
-    v_optimal = compute_optimal_beamformers_batch_parallel(
-        H_b_test, H_d_test + H_r_test, noise_var, Pvec[0], num_restarts=10
-    )
-    sinr_opt_test, _, _, _ = compute_beamformer_metrics_batch(
-        H_d_test, H_b_test, H_r_test, v_optimal, noise_var, Pvec[0]
-    )
-
-    sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
-    
-    print(f"Test SINR_BD (learned):  {10 * np.log10(np.mean(sinr_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (optimal):  {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (signalprocessing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
-    print(f"Gap to optimal:          {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
-    
-    # Save results
     model_filename = os.path.join(drive_save_path, \
             f'TEST_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}_Nsca_{num_scatters}.mat')
-    sio.savemat(model_filename, dict(
+
+    # Benchmarks (optimal / signal-processing / beam sweeping) do not depend on the
+    # learned model, so they are computed once on the initial run and afterwards
+    # simply carried over from the existing result file.
+    saved_results = {}
+    n_opt = min(opt_test_size, test_size)
+    if initial_run == 1:
+        print(f"Computing optimal beamformer for the first {n_opt} test samples...")
+        v_optimal = compute_optimal_beamformers_batch_parallel(
+            H_b_test[:n_opt], H_d_test[:n_opt] + H_r_test[:n_opt], noise_var, Pvec[0], num_restarts=10
+        )
+        sinr_opt_test, _, _, _ = compute_beamformer_metrics_batch(
+            H_d_test[:n_opt], H_b_test[:n_opt], H_r_test[:n_opt], v_optimal, noise_var, Pvec[0]
+        )
+
+        sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
+    elif os.path.isfile(model_filename):
+        saved_results = {k: v for k, v in sio.loadmat(model_filename).items()
+                         if not k.startswith('__')}
+        v_optimal = saved_results['v_optimal']
+        sinr_opt_test = np.squeeze(saved_results['sinr_optimal'])
+        sinr_sp_test = np.squeeze(saved_results['sinr_sp'])
+        sinr_sweep_test = np.squeeze(saved_results['sinr_sweep'])
+        n_opt = int(np.ravel(sinr_opt_test).size)
+        print(f"Reusing benchmarks from {model_filename} ({n_opt} samples)")
+    else:
+        raise FileNotFoundError(
+            f"No existing result file to reuse benchmarks from: {model_filename}. "
+            "Run once with n_epochs > 0 (initial_run = 1) to create it."
+        )
+
+    print(f"Test SINR_BD (learned):  {10 * np.log10(np.mean(sinr_test) + 1e-10):6.2f} dB  ({test_size} samples)")
+    print(f"Test SINR_BD (optimal):  {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB  ({n_opt} samples)")
+    print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
+    # print(f"Test SINR_BD (signalprocessing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
+    # print(f"Test SINR_BD (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
+    # Compare on the common subset so the gap is not biased by the different sizes.
+    print(f"Gap to optimal:          "
+          f"{10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(np.ravel(sinr_test)[:n_opt]) + 1e-10)):6.2f} dB"
+          f"  (first {n_opt} samples)")
+
+    # Save results: start from whatever is already stored (benchmarks stay untouched)
+    # and overwrite only the learned quantities and the test-set description.
+    results = dict(saved_results)
+    results.update(dict(
         snr_const=snr_const,
         N_tx=N_tx,
         N_rx=N_rx,
@@ -917,14 +948,20 @@ with tf.Session() as sess:
         K=K,
         BD_location=BD_loc,
         Scatter_location=Scatter_loc if Scatter_loc[0] is not None else [],
+        test_size=test_size,
         sinr_learned=sinr_test,
-        sinr_optimal=sinr_opt_test,
-        sinr_sp=sinr_sp_test,
-        sinr_sweep=sinr_sweep_test,
         sinr_scatter_learned=sinr_scatter_test,
         v_learned=v_learned,
-        v_optimal=v_optimal,
     ))
+    if initial_run == 1:
+        results.update(dict(
+            opt_test_size=n_opt,
+            sinr_optimal=sinr_opt_test,
+            sinr_sp=sinr_sp_test,
+            sinr_sweep=sinr_sweep_test,
+            v_optimal=v_optimal,
+        ))
+    sio.savemat(model_filename, results)
     print(f"\nResults saved to {model_filename}")
 
 
@@ -1026,7 +1063,7 @@ required_vis_vars = [
 ]
 force_reload = bool(globals().get('force_load_visualization_data', False))
 if force_reload or any(name not in globals() for name in required_vis_vars):
-    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr_1b')
+    result_dir = globals().get('drive_save_path', 'Mo_mimo_sinr_1b_aaT')
     if not os.path.isdir(result_dir):
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
     result_file = _pick_result_file(result_dir)
@@ -1080,10 +1117,13 @@ if len(BD_loc) < num_realizations:
 if len(Scatter_loc) < num_realizations:
     Scatter_loc += [None for _ in range(num_realizations - len(Scatter_loc))]
 
-# Select one test instance for visualization (random unless beam_pattern_idx is set)
-idx_default = np.random.randint(num_realizations)
+# Select one test instance for visualization (random unless beam_pattern_idx is set).
+# The optimal beamformer is only stored for the first samples of the test set, so
+# restrict the choice to indices where both beams exist.
+num_vis_realizations = min(num_realizations, int(v_optimal.shape[0]))
+idx_default = np.random.randint(num_vis_realizations)
 idx = int(globals().get('beam_pattern_idx', idx_default))
-idx = max(0, min(idx, num_realizations - 1))
+idx = max(0, min(idx, num_vis_realizations - 1))
 bd_loc_vis = np.squeeze(np.asarray(BD_loc[idx]))
 
 # Handle multiple scatterers - ensure 2D array shape (num_scatterers, 3)
