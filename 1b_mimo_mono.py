@@ -233,6 +233,37 @@ def compute_optimal_beamformers_batch_parallel(H_b_batch, H_int_batch, noise_var
     
     return w_opt_batch.astype(np.complex64)
 
+def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch,
+                                     noise_var_val, P_val):
+    """Evaluate BD and scatter SINR for a batch of shared (monostatic) beamformers.
+
+    Mirrors the sinr_BD_opt / sinr_scatter_opt graph ops so the optimal beamformer
+    can be evaluated once in NumPy instead of through tf.py_func on every fetch.
+    """
+    H_interference = H_d_batch + H_r_batch
+    v_h = np.conjugate(np.swapaxes(v_batch, 1, 2))
+
+    sig_bd = np.matmul(v_h, np.matmul(H_b_batch, v_batch))
+    sig_bd = np.squeeze(np.abs(sig_bd) ** 2, axis=(1, 2)) * P_val
+
+    sig_int = np.matmul(v_h, np.matmul(H_interference, v_batch))
+    sig_int = np.squeeze(np.abs(sig_int) ** 2, axis=(1, 2)) * P_val
+    sinr_bd = sig_bd / (sig_int + noise_var_val + 1e-10)
+
+    sig_scatter = np.matmul(v_h, np.matmul(H_r_batch, v_batch))
+    sig_scatter = np.squeeze(np.abs(sig_scatter) ** 2, axis=(1, 2)) * P_val
+
+    int_scatter = np.matmul(v_h, np.matmul(H_d_batch + H_b_batch, v_batch))
+    int_scatter = np.squeeze(np.abs(int_scatter) ** 2, axis=(1, 2)) * P_val
+    sinr_scatter = sig_scatter / (int_scatter + noise_var_val + 1e-10)
+
+    return (
+        sinr_bd.astype(np.float32),
+        sinr_scatter.astype(np.float32),
+        sig_bd.astype(np.float32),
+        sig_int.astype(np.float32),
+    )
+
 # Background data generation queue (unused - ThreadPool overhead not worth it for fast ops)
 class BackgroundDataGenerator:
     """Pre-generates batches in background thread for smoother training"""
@@ -703,6 +734,23 @@ feed_dict_val = {
     H_r_placeholder: H_r_val
 }
 
+print("Computing optimal beamformer for the validation set...")
+v_opt_val = compute_optimal_beamformers_batch_parallel(
+    H_b_val,
+    H_d_val + H_r_val,
+    noise_var,
+    Pvec[0],
+    num_restarts=1,
+)
+sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = compute_beamformer_metrics_batch(
+    H_d_val,
+    H_b_val,
+    H_r_val,
+    v_opt_val,
+    noise_var,
+    Pvec[0],
+)
+
 
 #####################################################
 # Training Loop
@@ -767,16 +815,9 @@ with tf.Session() as sess:
             [loss, sinr_BD, sinr_scatter, sig_BD, sig_ref], feed_dict=feed_dict_val
         )
 
-        # Optimal beamformer performance
-        if epoch == 0:
-            sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = sess.run(
-            [sinr_BD_opt, sinr_scatter_opt, sig_BD_opt, sig_int_opt], feed_dict=feed_dict_val)
+        # Optimal beamformer performance is precomputed above (fixed validation set),
+        # so nothing extra is fetched here.
 
-            # sp-based beamformer performance
-            # sinr_sp_val, sig_bd_sp_val, sig_int_sp_val = sess.run(
-            #             [sinr_BD_sp, sig_BD_sp, sig_int_sp], feed_dict=feed_dict_val)
-
-        
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
@@ -843,8 +884,17 @@ with tf.Session() as sess:
         H_r_placeholder: H_r_test
     }
     
-    sinr_test, sinr_opt_test, sinr_scatter_test, v_learned, v_optimal = sess.run(
-        [sinr_BD, sinr_BD_opt, sinr_scatter, v_complex,  v_opt], feed_dict=feed_dict_test
+    sinr_test, sinr_scatter_test, v_learned = sess.run(
+        [sinr_BD, sinr_scatter, v_complex], feed_dict=feed_dict_test
+    )
+
+    # Optimal beamformer in NumPy, same as for the validation set above.
+    print("Computing optimal beamformer for the test set...")
+    v_optimal = compute_optimal_beamformers_batch_parallel(
+        H_b_test, H_d_test + H_r_test, noise_var, Pvec[0], num_restarts=10
+    )
+    sinr_opt_test, _, _, _ = compute_beamformer_metrics_batch(
+        H_d_test, H_b_test, H_r_test, v_optimal, noise_var, Pvec[0]
     )
 
     sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)

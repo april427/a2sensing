@@ -17,6 +17,54 @@ import autograd.numpy as anp
 
 import numpy as np
 
+# ---------- Complex unit sphere via pymanopt's real Sphere ----------
+#
+# pymanopt 2.x has no ComplexSphere, and Sphere(n) is a REAL manifold: for a complex
+# point it reports dim = n-1 instead of 2n-1 and its tangent projection is wrong, so
+# ConjugateGradient stalls after a couple of iterations ("min step_size reached").
+# The complex unit sphere {x in C^n : ||x||=1} is isometric to the real sphere
+# S^(2n-1) under the metric Re<.,.>, so we optimize over z = [Re(x); Im(x)] on
+# Sphere(2n) and keep every operation in real arithmetic (autograd then differentiates
+# a real function of real inputs, with no complex-conjugation convention to get wrong).
+
+def _split(z, n):
+    'z = [Re(x); Im(x)] -> (xr, xi)'
+    return z[:n], z[n:]
+
+
+def _matvec(Mr, Mi, xr, xi):
+    '(Mr + 1j*Mi) @ (xr + 1j*xi) -> (real, imag)'
+    return Mr @ xr - Mi @ xi, Mr @ xi + Mi @ xr
+
+
+def _quad_form(Mr, Mi, xr, xi):
+    'Re and Im of x^H M x'
+    ur, ui = _matvec(Mr, Mi, xr, xi)
+    return (anp.sum(xr * ur) + anp.sum(xi * ui),
+            anp.sum(xr * ui) - anp.sum(xi * ur))
+
+
+def _random_sphere_point(n):
+    z = np.random.randn(2 * n)
+    return z / np.linalg.norm(z)
+
+
+def _run_from_random_start(optimizer, problem, n):
+    """One CG run from a random point on the complex unit sphere.
+
+    pymanopt's default Hestenes-Stiefel beta rule evaluates
+    <Pnewgrad, diff> / <diff, descent_direction> with diff = newgrad - oldgrad.
+    Once the line search stops making progress diff is exactly zero, so numpy
+    computes 0.0/0.0 and emits "invalid value encountered in divide"; pymanopt's
+    own guard there only catches Python's ZeroDivisionError, which numpy never
+    raises. The resulting nan is absorbed by max(0, nan) == 0, so beta simply
+    resets to steepest descent and the run terminates normally. The warning is
+    therefore cosmetic, and is silenced only for this call.
+    """
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return optimizer.run(problem, initial_point=_random_sphere_point(n))
+
+
 def compute_phi(y, A, B, c):
     Ay = A @ y
     By = B @ y
@@ -44,36 +92,59 @@ def compute_gradient(y, A, B, c):
 
 
 def solve_with_random_restarts(A, B, c=1.0, restarts=10):
+    """
+    Maximize over y (transmit, ||y||=1) of
+
+        phi(y) = max_x |x^H A y|^2 / (|x^H B y|^2 + c ||x||^2)
+               = (Ay)^H M^-1 (Ay),   M = (By)(By)^H + c I
+
+    i.e. the receive beamformer x is the closed-form MVDR/MMSE solution for each y.
+    Only y is on the manifold. M is rank-one-plus-identity, so Sherman-Morrison
+    replaces the linear solve with
+
+        phi(y) = ( ||Ay||^2 - |<By, Ay>|^2 / (c + ||By||^2) ) / c
+
+    which is cheaper and keeps the cost differentiable in real arithmetic.
+    """
     n = A.shape[1]
-    manifold = Sphere(n)
-    best_val = -anp.inf
+    Ar, Ai = np.real(A), np.imag(A)
+    Br, Bi = np.real(B), np.imag(B)
+    manifold = Sphere(2 * n)
+    best_val = -np.inf
     best_y = None
 
-    # Define cost and gradient for pymanopt
     @pymanopt_autograd(manifold)
-    def cost(y):
-        return -compute_phi(y, A, B, c)  # negative for maximization
+    def cost(z):
+        yr, yi = _split(z, n)
+        ar, ai = _matvec(Ar, Ai, yr, yi)   # A y
+        br, bi = _matvec(Br, Bi, yr, yi)   # B y
+        a_sq = anp.sum(ar ** 2 + ai ** 2)
+        b_sq = anp.sum(br ** 2 + bi ** 2)
+        ip_re = anp.sum(br * ar + bi * ai)  # Re<By, Ay>
+        ip_im = anp.sum(br * ai - bi * ar)  # Im<By, Ay>
+        phi = (a_sq - (ip_re ** 2 + ip_im ** 2) / (c + b_sq)) / c
+        return -phi
 
     optimizer = ConjugateGradient(verbosity=0)
+    problem = Problem(manifold=manifold, cost=cost)
 
     for r in range(restarts):
-        y0 = anp.random.randn(n) + 1j * anp.random.randn(n)
-        y0 /= anp.linalg.norm(y0)
-
-        problem = Problem(manifold=manifold, cost=cost)
-        result = optimizer.run(problem, initial_point=y0)
-
+        try:
+            result = _run_from_random_start(optimizer, problem, n)
+        except Exception as e:
+            print(f"Optimization failed for restart: {e}")
+            continue
         val = -result.cost
-        if val > best_val:
+        if np.isfinite(val) and val > best_val:
+            zr, zi = _split(result.point, n)
             best_val = val
-            best_y = result.point
+            best_y = zr + 1j * zi
 
-    # Compute x* for best y
+    # Closed-form receive beamformer x* = M^-1 (A y), again via Sherman-Morrison
     Ay = A @ best_y
     By = B @ best_y
-    M = anp.outer(By, anp.conj(By)) + c * anp.eye(A.shape[0])
-    x_star = anp.linalg.solve(M, Ay)
-    x_star /= anp.linalg.norm(x_star)
+    x_star = (Ay - By * (np.vdot(By, Ay) / (c + np.vdot(By, By).real))) / c
+    x_star /= np.linalg.norm(x_star)
 
     return best_y, x_star, best_val
 
@@ -165,34 +236,33 @@ def solve_x_equals_y_fast(A, B, c=1.0, restarts=10, seed=None):
     if seed is not None:
         np.random.seed(seed)
 
-    # Symmetrize A to be exactly Hermitian (for numerical safety)
-    A = 0.5 * (A + A.conj().T)
+    # NOTE: A must NOT be Hermitian-symmetrized here. For a reciprocal round-trip
+    # channel A = a a^T is complex symmetric, and replacing it by 0.5*(A + A^H)
+    # together with Re(x^H A x)^2 optimizes a different objective than the
+    # |x^H A x|^2 that callers actually evaluate.
     n = A.shape[0]
-    manifold = Sphere(n)
+    Ar, Ai = np.real(A), np.imag(A)
+    Br, Bi = np.real(B), np.imag(B)
+    manifold = Sphere(2 * n)
 
     @pymanopt_autograd(manifold)
-    def cost(x):
-        # Convert to autograd operations for complex matrices
-        Ax = A @ x
-        Bx = B @ x
-        # For complex inner products, use explicit real/imag parts
-        a_real = anp.real(anp.sum(anp.conj(x) * Ax))  # Re(x^H A x)
-        b_complex = anp.sum(anp.conj(x) * Bx)         # x^H B x
-        denom = anp.real(b_complex) ** 2 + anp.imag(b_complex) ** 2 + c
-        return -(a_real * a_real) / denom
+    def cost(z):
+        xr, xi = _split(z, n)
+        a_re, a_im = _quad_form(Ar, Ai, xr, xi)   # x^H A x
+        b_re, b_im = _quad_form(Br, Bi, xr, xi)   # x^H B x
+        return -(a_re ** 2 + a_im ** 2) / (b_re ** 2 + b_im ** 2 + c)
 
     optimizer = ConjugateGradient(verbosity=0)
+    problem = Problem(manifold=manifold, cost=cost)
     best_val, best_x = -np.inf, None
 
     for _ in range(restarts):
-        x0 = anp.random.randn(n) + 1j * anp.random.randn(n)
-        x0 /= anp.linalg.norm(x0)
-        problem = Problem(manifold=manifold, cost=cost)
         try:
-            result = optimizer.run(problem, initial_point=x0)
+            result = _run_from_random_start(optimizer, problem, n)
             val = -result.cost
-            if val > best_val:
-                best_val, best_x = val, result.point
+            if np.isfinite(val) and val > best_val:
+                zr, zi = _split(result.point, n)
+                best_val, best_x = val, zr + 1j * zi
         except Exception as e:
             print(f"Optimization failed for restart: {e}")
             continue

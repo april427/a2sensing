@@ -68,7 +68,7 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, \
         for j in range(N_ris):
             H_SI[i, j] = 1/(rx[j] - tx[i]) * np.exp(- 1j * 2 * np.pi * (rx[j] - tx[i]) / wavelength)
     H_SI = 5e-6 * H_SI * N_ris/ np.linalg.norm(H_SI,'fro')   # Normalization
-    
+    Rician_factor = 10**(Rician_factor/10)
     for ii in range(num_samples):
         # 获取用户位置
         if user_locations is None:
@@ -113,8 +113,6 @@ def generate_irs_user_channel(user_locations, location_irs, num_samples=1, \
         # Xiyu: This is considered when the RIS is a rectangular array
         i1 = np.mod(np.arange(N_ris), irs_Nh)
         i2 = np.floor(np.arange(N_ris) / irs_Nh)
-
-        Rician_factor = 10**(Rician_factor/10)
 
         tmp = np.random.normal(loc=0, scale=np.sqrt(0.5), size=[N_ris, N_ris, num_user]) \
               + 1j * np.random.normal(loc=0, scale=np.sqrt(0.5), size=[N_ris, N_ris, num_user])
@@ -657,7 +655,8 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             pathloss_scatter_db = path_loss_r(d_tx_scatter, wavelength, d_scatter_rx, type='backscatter')
             pathloss_scatter = np.sqrt(10 ** ((-pathloss_scatter_db) / 10))
             
-            H_scatter += pathloss_scatter * (a_rx_scatter @ a_tx_scatter.T)
+            # Same reciprocity convention as the BD path below.
+            H_scatter += pathloss_scatter * (np.conj(a_rx_scatter) @ a_tx_scatter.T)
     else:
         H_scatter = np.zeros((N_rx, N_tx), dtype=complex)
     
@@ -700,7 +699,8 @@ def generate_mimo_channel(tx_location, rx_location, scatter_location, bd_locatio
             d_tx_bd, wavelength, d_bd_rx, type='backscatter'
         )
         pathloss_bd = np.sqrt(10 ** ((-pathloss_bd_db) / 10))
-        H_bd_all[device_idx] = pathloss_bd * (a_rx_bd @ a_tx_bd.T)
+
+        H_bd_all[device_idx] = pathloss_bd * (np.conj(a_rx_bd) @ a_tx_bd.T)
 
     # Preserve the original 2-D return for callers that pass one (3,) location.
     H_bd = H_bd_all[0] if single_bd_input else H_bd_all
