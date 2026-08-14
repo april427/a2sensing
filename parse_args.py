@@ -41,6 +41,11 @@ def parse_args():
     parser.add_argument('--batch_size_order', type=int, default=4, help='Batch size multiplier (batch = value * 32)')
     parser.add_argument('--hidden_size', type=int, default=128, help='LSTM hidden size')
     parser.add_argument('--patience', type=int, default=-1, help='Early stopping patience; <=0 uses default max(20, 2*tau)')
+    parser.add_argument('--curriculum_epochs', type=int, default=-1,
+                        help='Epochs spent annealing the training SNR up to --snr; '
+                             '<0 = auto (used only when --snr > 10 dB), 0 = disabled')
+    parser.add_argument('--snr_start', type=float, default=0.0,
+                        help='Starting SNR (dB) of the curriculum; ignored when the curriculum is off')
 
     args, unknown = parser.parse_known_args(filtered_argv[1:])
     return args

@@ -42,7 +42,7 @@ except ImportError:
     os.system('pip install scipy')
 import scipy.io as sio
 from scipy.linalg import eig
-from keras.layers import BatchNormalization, Dense
+from keras.layers import LayerNormalization, Dense
 from manifold_optimization import solve_x_equals_y_fast
 from parse_args import parse_args
 from channel_functions import *
@@ -80,13 +80,21 @@ print(f"Random seed set to: {seed}")
 #####################################################
 
 class MLPBlock(tf.keras.layers.Layer):
+    """Dense stack with layer normalization.
+
+    LayerNormalization replaces the previous BatchNormalization: in this TF1
+    graph the BN layers were inert (their moving statistics are never updated
+    because no UPDATE_OPS run with training_op, and the keras learning phase
+    defaults to inference), so they normalized nothing. LayerNorm needs no
+    moving statistics and behaves identically during training and evaluation.
+    """
     def __init__(self, num_layers, dims, name):
         super(MLPBlock, self).__init__()
         self.layers_list = []
         self.num_layers = num_layers
         for ii in range(num_layers - 1):
             self.layers_list.append(Dense(units=dims[ii], activation='relu', name=name + '_relu_' + str(ii)))
-            self.layers_list.append(BatchNormalization())
+            self.layers_list.append(LayerNormalization(name=name + '_ln_' + str(ii)))
         self.layers_list.append(Dense(units=dims[-1], activation='linear', name=name + '_linear'))
 
     def call(self, inputs, **kwargs):
@@ -154,7 +162,10 @@ K = getattr(args, "N_symbols", 1)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
 ref_dis = Wavelength*166.67
-Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
+# Reference power = the power that yields 0 dB SINR_const. Used to turn the raw
+# (huge, ~1e11) transmit power into an O(1) SNR feature for the network.
+P_ref = 1.0 / (Wavelength**4 / (4 * np.pi * ref_dis)**4) / N_tx / N_rx
+Pvec = 10 ** (snr_const / 10) * P_ref
 
 # BD modulation - alternating pattern
 BD_modulation = np.array([(-1) ** t for t in range(tau)])
@@ -353,15 +364,15 @@ sweep_codebook = dft_codebook(N_tx, max(N_tx, 2 * tau))[:, : (2 * tau)].copy()
 #  
 initial_run = 1 if args.n_epochs > 0 else 0
 n_epochs = args.n_epochs
-learning_rate = 5e-4
-batch_per_epoch = 128
-batch_size_order = 4
+learning_rate = args.learning_rate
+batch_per_epoch = args.batch_per_epoch
+batch_size_order = args.batch_size_order
 val_size_order = 20
 test_size = 2000
 # The optimal (benchmark) beamformer is expensive, so it is only computed on the
 # first opt_test_size test samples. Test data generation is sequential from a
 # fixed seed, so those samples match the first opt_test_size of any earlier run.
-opt_test_size = 800
+opt_test_size = 5
 
 tf.reset_default_graph()
 he_init = tf.variance_scaling_initializer()
@@ -380,19 +391,37 @@ with tf.name_scope("system_parameters"):
     bd_seq = tf.constant(BD_modulation.astype(np.float32), dtype=tf.float32)
 
 with tf.name_scope("active_sensing_agent"):
-    hidden_size = 128  # Shared hidden size for both nodes
-    
+    hidden_size = args.hidden_size  # Shared hidden size for both nodes
+
     LSTM1 = LSTM_Cell(hidden_size, name='LSTM_1')
     # LSTM2 = LSTM_Cell(hidden_size, name='LSTM_2')
-    
+
     # Tx and Rx share the same beamformer
     mlp_tx_rx = MLPBlock(3, [hidden_size * 2, hidden_size * 2, 2 * N_rx], name='Receiver_receiver')
-    
-    # SNR feature
-    snr = lay['P'] * tf.ones(shape=[tf.shape(loc_input)[0], 1], dtype=tf.float32)
+
+    # SNR feature, expressed in units of 10 dB relative to P_ref so that it is
+    # O(1) instead of 10*log10(P) ~ 120, which saturated every LSTM gate.
+    snr = lay['P'] / P_ref * tf.ones(shape=[tf.shape(loc_input)[0], 1], dtype=tf.float32)
     snr_dB = 10 * tf.log(snr) / np.log(10)
-    snr_normal = snr_dB
-    
+    snr_normal = snr_dB / 10.0
+
+    def normalize_observation(y_vec, y_after):
+        """Scale-invariant encoding of one observation branch.
+
+        The raw measurements scale with sqrt(P) (|y| ~ 1e2 at high SNR_const),
+        which saturates the LSTM. The shape of the observation is normalized to
+        unit RMS and its magnitude is passed separately in the log domain, so
+        both parts stay O(1) at any transmit power while no information is lost.
+        """
+        feat = tf.concat([
+            tf.cast(tf.real(y_vec), tf.float32),
+            tf.cast(tf.imag(y_vec), tf.float32),
+            tf.cast(tf.real(y_after), tf.float32),
+            tf.cast(tf.imag(y_after), tf.float32),
+        ], axis=1)
+        scale = tf.sqrt(tf.reduce_mean(tf.square(feat), axis=1, keepdims=True) + 1e-12)
+        return feat / (scale + 1e-8), tf.log(scale + 1e-8)
+
     # BD modulation sequence for each time step
     x_BD = [tf.tile(tf.reshape(bd_seq[t], [1, 1]), [tf.shape(loc_input)[0], 1]) for t in range(tau)]
     
@@ -417,6 +446,7 @@ with tf.name_scope("active_sensing_agent"):
             v_init_imag = tf.get_variable("v_init_imag", shape=(1, N_rx, 1), trainable=True)
             v_complex_init = tf.complex(v_init_real, v_init_imag)
             v1 = v_complex_init / tf.cast(tf.norm(v_complex_init, axis=1, keepdims=True), tf.complex64)
+            v1 = tf.tile(v1, [batch_size, 1, 1])
         
         'Construct effective channel H(t) = x_BD[t] * H_b + H_d + H_r'
         x_bd_t = tf.reshape(tf.cast(x_BD[t], tf.complex64), [-1, 1, 1])  # (batch, 1, 1)
@@ -441,22 +471,21 @@ with tf.name_scope("active_sensing_agent"):
         Y2 =  tf.reduce_mean(y_complex1 + y_complex2, axis=2, keepdims=False)  # Accumulate over time steps
         Y1_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y1, [-1, N_rx, 1])), axis=2, keepdims=False)
         Y2_after = tf.reduce_mean(tf.matmul(tf.linalg.adjoint(v1), tf.reshape(Y2, [-1, N_rx, 1])), axis=2, keepdims=False)
-        y_real = tf.concat([
-            tf.cast(tf.real(Y1), tf.float32),
-            tf.cast(tf.imag(Y1), tf.float32),
-            tf.cast(tf.real(Y1_after), tf.float32),
-            tf.cast(tf.imag(Y1_after), tf.float32),
-        ], axis=1)  # (batch, 4*N_rx + 4)
 
-        y_real2 = tf.concat([
-            tf.cast(tf.real(Y2), tf.float32),
-            tf.cast(tf.imag(Y2), tf.float32),
-            tf.cast(tf.real(Y2_after), tf.float32),
-            tf.cast(tf.imag(Y2_after), tf.float32),
+        # Scale-invariant observations: unit-RMS shape + log-magnitude.
+        y_real, log_scale1 = normalize_observation(Y1, Y1_after)
+        y_real2, log_scale2 = normalize_observation(Y2, Y2_after)
+
+        v_probe = np.sqrt(N_rx) * tf.concat([
+            tf.real(tf.squeeze(v1, axis=2)),
+            tf.imag(tf.squeeze(v1, axis=2)),
         ], axis=1)
-        
+
         'Update shared LSTM state - both RIS and Rx can see the result'
-        h_old, c_old = LSTM1((tf.concat([y_real, y_real2, snr_normal], axis=1), h_old, c_old))
+        lstm_input = tf.concat(
+            [y_real, y_real2, snr_normal], axis=1
+        )
+        h_old, c_old = LSTM1((lstm_input, h_old, c_old))
         # h_old2, c_old2 = LSTM2((tf.concat([y_real2,  snr_normal], axis=1), h_old2, c_old2))
         
         'Rx designs receive beamformer v based on shared hidden state'
@@ -656,21 +685,21 @@ loss = -tf.reduce_mean(log_sinr_BD)
 
 # Regularization
 global_step = tf.train.get_or_create_global_step()
-l2 = 1e-5
+l2 = args.l2
 reg_term = tf.add_n([tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 loss_reg = loss + l2 * reg_term
 
 
 # Add warmup and slower decay
-warmup_steps = 300
+warmup_steps = args.warmup_steps
 global_step_float = tf.cast(global_step, tf.float32)
 warmup_lr = learning_rate * tf.minimum(1.0, global_step_float / warmup_steps)
 
 decayed_lr = tf.train.exponential_decay(
-    learning_rate, 
-    global_step, 
-    decay_steps=2000,  # Slower decay
-    decay_rate=0.96,    # Gentler decay
+    learning_rate,
+    global_step,
+    decay_steps=args.decay_steps,
+    decay_rate=args.decay_rate,
     staircase=True
 )
 
@@ -692,7 +721,7 @@ for g, v in grads_vars:
         safe_grads.append(g)
         vars_list.append(v)
 
-clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], 1.0)
+clipped_grads, global_norm = tf.clip_by_global_norm([g for g in safe_grads if g is not None], args.clip_norm)
 
 final_grads = []
 clip_index = 0
@@ -760,10 +789,25 @@ sinr_opt_val, sinr_scatter_opt_val, sig_bd_opt_val, sig_int_opt_val = compute_be
 # Training Loop
 #####################################################
 
+# SNR curriculum: at high SNR_const the objective degenerates into a pure
+# interference-nulling ratio (the noise floor becomes irrelevant), which is a much
+# sharper landscape than the noise-limited regime. Starting the annealing at a low
+# SNR gives the recurrent policy an easy signal to lock onto the BD direction first.
+curriculum_epochs = args.curriculum_epochs
+if curriculum_epochs < 0:
+    curriculum_epochs = max(0, n_epochs // 3) if snr_const[0] > 10 else 0
+snr_start = min(args.snr_start, float(snr_const[0]))
+
 print("\n" + "=" * 60)
 print("BD SINR Maximization via Active Sensing")
 print("=" * 60)
 print(f"N_tx: {N_tx}, N_rx: {N_rx}, tau: {tau}, K: {K}, SNR: {snr_const[0]} dB")
+print(f"LR: {learning_rate:g}, clip_norm: {args.clip_norm:g}, warmup: {warmup_steps}, "
+      f"decay: {args.decay_steps}/{args.decay_rate:g}, l2: {l2:g}")
+print(f"hidden: {hidden_size}, batch: {batch_size_order * 32}, batches/epoch: {batch_per_epoch}, "
+      f"epochs: {n_epochs}")
+if curriculum_epochs > 0:
+    print(f"SNR curriculum: {snr_start:g} dB -> {snr_const[0]:g} dB over {curriculum_epochs} epochs")
 print("=" * 60 + "\n")
 
 model_ckpt = f'{drive_save_path}/params_sinr_N_{N_tx}_{N_rx}_tau_{tau}_snr_{int(snr_const[0])}_K_{K}'
@@ -781,13 +825,21 @@ with tf.Session() as sess:
 
     # Early stopping
     wait = 0
-    PATIENCE = 20
-    
+    PATIENCE = args.patience if args.patience > 0 else max(20, 2 * tau)
+
     for epoch in range(n_epochs):
         batch_iter = 0
         epoch_train_losses = []
         epoch_sinr_values = []
-        
+
+        # Training power for this epoch (validation always uses the target SNR,
+        # so early stopping and the saved checkpoint are selected at target SNR).
+        if curriculum_epochs > 0 and epoch < curriculum_epochs:
+            snr_epoch = snr_start + (snr_const[0] - snr_start) * (epoch / curriculum_epochs)
+        else:
+            snr_epoch = float(snr_const[0])
+        P_epoch = 10 ** (snr_epoch / 10) * P_ref
+
         for rnd_indices in range(batch_per_epoch):
             # Generate training batch using parallel processing
             num_train_samples = batch_size_order * 32
@@ -799,7 +851,7 @@ with tf.Session() as sess:
 
             feed_dict_batch = {
                 loc_input: set_location_user_train,
-                lay['P']: Pvec[0],
+                lay['P']: P_epoch,
                 H_d_placeholder: H_d_train,
                 H_b_placeholder: H_b_train,
                 H_r_placeholder: H_r_train
@@ -824,10 +876,11 @@ with tf.Session() as sess:
         # Optimal beamformer performance is precomputed above (fixed validation set),
         # so nothing extra is fetched here.
 
+        train_snr_note = '' if snr_epoch == snr_const[0] else f' (train SNR {snr_epoch:5.1f} dB)'
         print(f'Epoch {epoch:3d} | '
               f'Train Loss: {avg_train_loss:8.4f} | '
               f'Val Loss: {loss_val:8.4f} | '
-              f'Best: {best_val:8.4f}')
+              f'Best: {best_val:8.4f}{train_snr_note}')
         # print(f'         | '
         #       f'SINR_BD (sp): {10 * np.log10(np.mean(sinr_sp_val) + 1e-10):6.2f} dB | ')
         print(f'         | '
@@ -911,14 +964,14 @@ with tf.Session() as sess:
             H_d_test[:n_opt], H_b_test[:n_opt], H_r_test[:n_opt], v_optimal, noise_var, Pvec[0]
         )
 
-        sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
+        # sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
     elif os.path.isfile(model_filename):
         saved_results = {k: v for k, v in sio.loadmat(model_filename).items()
                          if not k.startswith('__')}
         v_optimal = saved_results['v_optimal']
         sinr_opt_test = np.squeeze(saved_results['sinr_optimal'])
-        sinr_sp_test = np.squeeze(saved_results['sinr_sp'])
-        sinr_sweep_test = np.squeeze(saved_results['sinr_sweep'])
+        # sinr_sp_test = np.squeeze(saved_results['sinr_sp'])
+        # sinr_sweep_test = np.squeeze(saved_results['sinr_sweep'])
         n_opt = int(np.ravel(sinr_opt_test).size)
         print(f"Reusing benchmarks from {model_filename} ({n_opt} samples)")
     else:
@@ -957,8 +1010,8 @@ with tf.Session() as sess:
         results.update(dict(
             opt_test_size=n_opt,
             sinr_optimal=sinr_opt_test,
-            sinr_sp=sinr_sp_test,
-            sinr_sweep=sinr_sweep_test,
+            # sinr_sp=sinr_sp_test,
+            # sinr_sweep=sinr_sweep_test,
             v_optimal=v_optimal,
         ))
     sio.savemat(model_filename, results)

@@ -78,6 +78,111 @@ CODEBOOK = 'grouped'
 def make_codebook(n, m):
     return grouped_dft_codebook(n, m) if CODEBOOK == 'grouped' else dft_codebook(n, m)
 
+
+def pair_sweep_size(tau):
+    """Beams per side of an analog Tx x analog Rx sweep that must fit in tau slots.
+
+    An analog receiver sees one scalar per slot, so every (v_i, w_j) pair costs a
+    slot of its own: m beams per side => m^2 slots. Under a budget of tau slots
+    the codebooks are therefore only sqrt(tau) wide, not tau wide -- unlike the
+    v = w sweep and the analog-Tx/digital-Rx sweep, which spend one slot per
+    transmit beam and can afford all tau of them.
+    """
+    return max(1, int(np.floor(np.sqrt(tau))))
+
+
+#####################  sounding + channel estimation (shared)  #######################
+
+noise_var = 1.0      # per-observation complex noise power at the Rx
+
+
+def sense_and_despread(H_I, H_b, u_star, W_sound, L, P, K, noise_var, rng):
+    """Run the tau-step sounding phase and return the time-despread observations.
+
+    Step t transmits the single beam ``W_sound[:, t]``, held constant over the
+    L chips of the preamble and over the K repeated symbols per chip:
+
+        y[t, p] = sqrt(P) * (H_I + c[p, u*] * H_b[u*]) @ w_t + n[t, p]
+
+    The Hadamard code is therefore a TIME spreading sequence, not a second spatial
+    sounding vector. Despreading in time with column u (c_u^T c_u' = L delta, and
+    c_u^T 1 = 0 for the BD columns) gives
+
+        Ybar_bd[u][:, t] = sqrt(P) * 1{u == u*} * H_b[u] @ w_t + n
+        Ybar_c[:, t]     = sqrt(P) * H_I @ w_t + n,   n ~ CN(0, noise_var/(L*K))
+
+    with noise independent across branches, because despreading is an orthogonal
+    transform. Generating these directly is exactly equivalent to simulating all
+    L chips, and L times cheaper.
+    """
+    N_rx = H_I.shape[0]
+    n_bd = H_b.shape[0]
+    n_steps = W_sound.shape[1]
+    scale = np.sqrt(noise_var / (L * K) / 2.0)
+
+    Ybar_bd = scale * (rng.standard_normal((n_bd, N_rx, n_steps))
+                       + 1j * rng.standard_normal((n_bd, N_rx, n_steps)))
+    Ybar_bd[u_star] += np.sqrt(P) * (H_b[u_star] @ W_sound)
+
+    Ybar_c = scale * (rng.standard_normal((N_rx, n_steps))
+                      + 1j * rng.standard_normal((N_rx, n_steps)))
+    Ybar_c += np.sqrt(P) * (H_I @ W_sound)
+    return Ybar_bd, Ybar_c
+
+
+def lmmse_operator(W_sound, P, sigma_h2, noise_eff):
+    """Right-multiplier M with H_hat = Ybar @ M / sqrt(P) (LMMSE).
+
+    Each row of H is modelled as CN(0, sigma_h2 * I). With
+    Ybar = sqrt(P) H W + N and N iid CN(0, noise_eff), the LMMSE estimate of a
+    row h is
+
+        h_hat^T = y^T W^H (W W^H + noise_eff/(P sigma_h2) I)^{-1} / sqrt(P),
+
+    i.e. the same shape as ridge LS but with the regularizer pinned to the
+    inverse per-antenna SNR instead of an arbitrary constant.
+    """
+    reg = noise_eff / (P * sigma_h2)
+    G = W_sound @ W_sound.conj().T + reg * np.eye(W_sound.shape[0])
+    return W_sound.conj().T @ np.linalg.inv(G)
+
+
+def ls_operator(W_sound):
+    """Right-multiplier M with H_hat = Ybar @ M / sqrt(P) (least squares).
+
+    Same shape as :func:`lmmse_operator` but with no prior: the LS fit of
+    Ybar = sqrt(P) H W + N is
+
+        H_hat = Ybar W^H (W W^H)^{-1} / sqrt(P) = Ybar W^+ / sqrt(P),
+
+    i.e. the regularizer is dropped. When the codebook has fewer beams than
+    antennas (n_tau < N_tx) W W^H is singular and the pseudo-inverse returns the
+    minimum-norm solution, leaving the unsounded subspace at zero.
+    """
+    return np.linalg.pinv(W_sound)
+
+
+def prior_channel_powers(n_tx, n_rx, n_scatter, n_bd=1, n_samples=200, seed=7):
+    """Ensemble per-entry powers (E|h_b|^2, E|h_I|^2) that the LMMSE prior needs.
+
+    The receiver is assumed to know the large-scale statistics of the channels,
+    so they are calibrated once by Monte Carlo over the same generator that
+    produces the test channels. The global RNG state is restored on exit.
+    """
+    state = np.random.get_state()
+    np.random.seed(seed)
+    p_b = p_i = 0.0
+    for _ in range(n_samples):
+        bd_loc = generate_location_mimo(n_bd, 'u')
+        scatter_loc = generate_location_mimo(n_scatter, 's')
+        _, H_d, H_r, H_b = generate_mimo_channel(
+            location_tx, location_rx, scatter_loc, bd_loc, n_tx, 1, n_rx, 1)
+        p_b += np.mean(np.abs(H_b) ** 2)
+        p_i += np.mean(np.abs(H_d + H_r) ** 2)
+    np.random.set_state(state)
+    return p_b / n_samples, p_i / n_samples
+
+
 def compute_optimal_beamformers_2b(H_b_batch, H_int_batch, noise_var_val, P_val, num_restarts=10):
     """Compute optimal beamformers for a batch - reduced restarts for 2x speedup"""
     batch_size = H_b_batch.shape[0]
@@ -150,6 +255,47 @@ def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch, w
         sig_bd.astype(np.float32),
         sig_int.astype(np.float32),
     )
+def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
+    """Codebook beam sweeping on the ESTIMATED channels (as in retest_scatters.py).
+
+    ``CB`` is the tau-wide sounding codebook used by the shared-beam and digital-Rx
+    designs. ``CB_pair`` is the sqrt(tau)-wide codebook used by the analog Tx x
+    analog Rx design, whose sweep costs one slot per beam PAIR; it defaults to a
+    codebook of ``pair_sweep_size(tau)`` beams.
+    """
+    N = CB.shape[0]
+    if CB_pair is None:
+        CB_pair = make_codebook(N, pair_sweep_size(CB.shape[1]))
+    numerator = np.abs(np.conj(CB).T @ H_b_hat @ CB)**2
+    denominator = np.abs(np.conj(CB).T @ H_SI_hat @ CB)**2 + 1/Pvec
+
+    # (a) analog Tx and analog Rx sharing one beam: only the diagonal is reachable
+    metric_same = np.diag(numerator) / np.diag(denominator)
+    best_same = int(np.argmax(np.diag(numerator)))
+    w_same = CB[:, best_same][:, np.newaxis]
+
+    # (b) analog Tx beam + digital (LMMSE) receive combining.
+    # For a Tx beam w the best digital Rx attains, with a = H_b_hat w, b = H_SI_hat w,
+    #   SINR(w) = Pvec a^H (Pvec b b^H + I)^-1 a
+    #           = Pvec (|a|^2 - |b^H a|^2 * Pvec / (1 + Pvec |b|^2))   [Sherman-Morrison]
+    a = H_b_hat @ w_same
+    b = H_SI_hat @ w_same
+    v_dig = np.linalg.solve(Pvec*(b) @ np.conj(b).T + np.eye(N), Pvec*a)
+    v_dig = v_dig / np.linalg.norm(v_dig)
+
+    # (c) analog Tx and analog Rx picked independently from the codebook.
+    # One slot per beam PAIR, so this sweep runs on the sqrt(tau)-wide codebook.
+    num_pair = np.abs(np.conj(CB_pair).T @ H_b_hat @ CB_pair)**2
+    den_pair = np.abs(np.conj(CB_pair).T @ H_SI_hat @ CB_pair)**2 + 1/Pvec
+    best_rx, best_tx = np.unravel_index(np.argmax(num_pair / den_pair), num_pair.shape)
+    w_ana = CB_pair[:, best_tx][:, np.newaxis]
+    v_ana = CB_pair[:, best_rx][:, np.newaxis]
+
+    return (w_same, w_same), (w_same, v_dig), (w_ana, v_ana)
+def sweep_sinr(w, v, H_b, H_SI, Pvec):
+    """SINR actually delivered by the pair (w, v) on the TRUE channels."""
+    sig = Pvec * np.abs(np.transpose(np.conj(v)) @ H_b @ w)**2
+    return sig / (Pvec * np.abs(np.transpose(np.conj(v)) @ H_SI @ w)**2 + 1)
 
 methods = {
     'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
@@ -169,18 +315,26 @@ sinr_test_1b = []
 sinr_opt_hat_1b = []
 sinr_opt_hat_2b = []
 sinr_sweep_1b_anaw = []
-
+# N_tx = 36
+# N_rx = 36
 sinr_test_2b = []
 rieman_opti_sinr_2b = []
 sinr_sweep_digiw = []
 sinr_sweep_2b_anaw = []
 iterative_generalized_eig = []
-tau = 16
+tau = 10
 K = 1
 N_scatter = 5
-CB = dft_codebook(N_tx, tau)
-snr_const = [ -10,-5, 0, 5, 10, 15, 20, 25]
+CB = make_codebook(N_tx, tau)
+CB_pair = make_codebook(N_tx, pair_sweep_size(tau))   # sqrt(tau) per side -> tau slots
+snr_const = [-10, -5, 0, 5, 10, 15]
+n_opt = 50 # samples taken for optimal beamforming
 
+# Single BD whose index is known, sounded with a length-2 BD code (+/-),
+# so the despread branches carry noise of power noise_var / (L_PRE * K).
+L_PRE = 2
+# The LS estimator uses no channel prior, so no prior_channel_powers() calibration.
+rng = np.random.default_rng(2024)
 
 for i, snr in enumerate(snr_const):
 
@@ -188,14 +342,14 @@ for i, snr in enumerate(snr_const):
        #            files with scatters (Extension)
        ###############################################################
        filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
-              'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
+              'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (16,16,10, snr, K, N_scatter))
        data = scipy.io.loadmat(filename)
 
        sinr_test_2b.append(data['sinr_learned'].squeeze())
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
 
-       filename = os.path.join('Mo_mimo_sinr_1b', \
+       filename = os.path.join('Mo_mimo_sinr_1b_aaT', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
        data1b = scipy.io.loadmat(filename)
        sinr_test_1b.append(data1b['sinr_learned'].squeeze())
@@ -213,7 +367,10 @@ for i, snr in enumerate(snr_const):
 
        Pvec = 10**(snr/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
-       for j in range(test_size):
+       M_b = ls_operator(CB)
+       M_i = ls_operator(CB)
+
+       for j in range(2000):
               bd_loc = generate_location_mimo(1, 'u')[0]
               scatter_loc = generate_location_mimo(N_scatter, 's')
               _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
@@ -226,17 +383,16 @@ for i, snr in enumerate(snr_const):
               H_b = H_b_test
 
               ### Lower Bound Beam Sweeping
+              # tau-step codebook sounding + despreading, then LS; the BD is
+              # unique and its index is known, hence n_bd = 1 and u_star = 0.
+              Ybar_bd, Ybar_c = sense_and_despread(
+                     H_I, H_b[None], 0, CB, L_PRE, Pvec, K, noise_var, rng)
+              H_b_hat = (Ybar_bd[0] @ M_b) / np.sqrt(Pvec)
+              H_I_hat = (Ybar_c @ M_i) / np.sqrt(Pvec)
 
-              observation1 = np.sqrt(Pvec)* (H_I + H_b) + \
-                                          1/np.sqrt(2) *(np.random.randn(*H_I.shape) \
-                                                               + 1j * np.random.randn(*H_I.shape))
-              observation2 = np.sqrt(Pvec)*(H_I - H_b) + 1/np.sqrt(2) *(np.random.randn(*H_I.shape) \
-                                                               + 1j * np.random.randn(*H_I.shape))
-              H_b_hat = (observation1 - observation2)/2 / np.sqrt(Pvec)
-              H_I_hat = (observation1 + observation2)/2 / np.sqrt(Pvec)
-
-              H_b_hat_batch.append(H_b_hat)
-              H_I_hat_batch.append(H_I_hat)
+              if j < n_opt:
+                     H_b_hat_batch.append(H_b_hat)
+                     H_I_hat_batch.append(H_I_hat)
 
               ##### Beam sweeping both analog Rx and Tx
               numerator = np.abs(CB.conj().T @ H_b_hat @ CB)**2
@@ -260,10 +416,14 @@ for i, snr in enumerate(snr_const):
               sinr_sweep_digiw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
 
-              metric_2b = numerator / denominator
+              ##### Analog Tx x analog Rx: one slot per beam PAIR, so the two
+              ##### codebooks are only sqrt(tau) wide to keep the sweep at tau slots.
+              num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
+              den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              metric_2b = num_2b / den_2b
               best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
-              best_theta = CB[:, best_jdx]
-              best_v = CB[:, best_idx]       
+              best_v = CB_pair[:, best_idx]        # row index -> Rx beam
+              best_theta = CB_pair[:, best_jdx]    # column index -> Tx beam
               sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_b @ best_theta)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_I @ best_theta)**2 + 1))
 
@@ -272,7 +432,7 @@ for i, snr in enumerate(snr_const):
                      np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
 
        sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
-              np.array(H_d_batch),np.array(H_b_batch),np.array(H_r_batch),
+              np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.array(H_r_batch[:n_opt]),
               np.array(v_sp),np.array(w_sp),1,Pvec,
        )
        sinr_opt_hat_2b.append(sinr_opt_2b)
@@ -282,7 +442,7 @@ for i, snr in enumerate(snr_const):
               1,Pvec,num_restarts=1,
        )
        sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
-                     np.array(H_d_batch),np.array(H_b_batch),np.array(H_r_batch),
+                     np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.array(H_r_batch[:n_opt]),
                      np.array(vw_opt),np.array(vw_opt),1,Pvec,
        )
        sinr_opt_hat_1b.append(sinr_opt_1b)
@@ -355,7 +515,7 @@ method_legend = [
            markersize=7, label='IterOpti'),
     Line2D([0], [0], color=methods['iteropti_hat']['color'],
             marker=methods['iteropti_hat']['marker'], linestyle='None',
-            markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm SI}, \hat{\mathbf{H}}_{\rm b}$'),
+            markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm I}, \hat{\mathbf{H}}_{\rm b}$'),
     Line2D([0], [0], color=methods['beam_sweep']['color'],
            marker=methods['beam_sweep']['marker'], linestyle='None',
            markersize=7, label=r'Sweep (Analog $\mathbf{w}$)'),
@@ -365,7 +525,7 @@ method_legend = [
            markersize=7, label=r'Sweep (Digital $\mathbf{w}$)'),
 #     Line2D([0], [0], color=methods['sweep_dig_csi']['color'],
 #            marker=methods['sweep_dig_csi']['marker'], linestyle='None',
-#            markersize=7, label=r'Sweep, Digital $\mathbf{v}$ ($\mathbf{H}_{\rm SI}$)'),
+#            markersize=7, label=r'Sweep, Digital $\mathbf{v}$ ($\mathbf{H}_{\rm I}$)'),
 ]
 
 # Line style legend
@@ -397,10 +557,10 @@ ax.add_artist(legend1)
 ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(snr_const)
-ax.set_ylim([-40, 26])
+ax.set_ylim([-40, 15])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
-# plt.savefig('figs/scatter_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
+# plt.savefig('figs/scatter_sinr_snr_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 
 
 # %%
@@ -552,10 +712,10 @@ from matplotlib.lines import Line2D
 method_legend = [
     Line2D([0], [0], color=methods['beam_sweep']['color'], 
            marker=methods['beam_sweep']['marker'], linestyle='None', 
-           markersize=7, label='Sweep ($\hat{\mathbf{H}}_{{SI}}$)'),
+           markersize=7, label='Sweep ($\hat{\mathbf{H}}_{{I}}$)'),
     Line2D([0], [0], color=methods['beam_sweep_csi']['color'], 
            marker=methods['beam_sweep_csi']['marker'], linestyle='None', 
-           markersize=7, label='Sweep ($\mathbf{H}_{{SI}}$)'),
+           markersize=7, label='Sweep ($\mathbf{H}_{{I}}$)'),
     Line2D([0], [0], color=methods['proposed']['color'], 
            marker=methods['proposed']['marker'], linestyle='None', 
            markersize=7, label='Proposed'),
@@ -620,8 +780,14 @@ sinr_sweeping_1b = []
 sinr_sweep_1b_anaw = []
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
+# Single BD whose index is known, sounded with a length-2 BD code (+/-),
+# so the despread branches carry noise of power noise_var / (L_PRE * K).
+L_PRE = 2
+# The LS estimator uses no channel prior, so no prior_channel_powers() calibration.
+rng = np.random.default_rng(2024)
+
 for i, n_tau in enumerate(tau):
-       filename = os.path.join('Mo_mimo_sinr_modelsave', \
+       filename = os.path.join('Mo_mimo_sinr_1b_aaT', \
        'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
        # sinr_test_1b.append(data['sinr_test'].squeeze())
@@ -644,53 +810,63 @@ for i, n_tau in enumerate(tau):
        test_size = BD_loc.shape[0]
 
        CB = make_codebook(N_tx, n_tau)
+       CB_pair = make_codebook(N_tx, pair_sweep_size(n_tau))  # sqrt(tau) per side
+       M_b = ls_operator(CB)
+       M_i = ls_operator(CB)
 
        for j in range(test_size):
 
               _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
                      location_tx, location_rx, Scatter_loc[j], BD_loc[j], N_tx, 1, N_rx, 1)
-            
+
               H_I = H_d_test + H_r_test
               H_b = H_b_test
 
               ### Lower Bound Beam Sweeping
+              # n_tau-step codebook sounding + despreading, then LS; the BD is
+              # unique and its index is known, hence n_bd = 1 and u_star = 0.
+              Ybar_bd, Ybar_c = sense_and_despread(
+                     H_I, H_b[None], 0, CB, L_PRE, Pvec, K, noise_var, rng)
+              H_b_hat = (Ybar_bd[0] @ M_b) / np.sqrt(Pvec)
+              H_I_hat = (Ybar_c @ M_i) / np.sqrt(Pvec)
 
-              observation1 = np.sqrt(Pvec)* (H_I + H_b) + \
-                                          1/np.sqrt(2) *(np.random.randn(*H_I.shape) \
-                                                               + 1j * np.random.randn(*H_I.shape))
-              observation2 = np.sqrt(Pvec)*(H_I - H_b) + 1/np.sqrt(2) *(np.random.randn(*H_I.shape) \
-                                                               + 1j * np.random.randn(*H_I.shape))
-              H_b_hat = (observation1 - observation2)/2 / np.sqrt(Pvec)
-              H_I_hat = (observation1 + observation2)/2 / np.sqrt(Pvec)
+              (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
+                              sweep_designs(H_b_hat, H_I_hat, CB, Pvec, CB_pair)
               
-              #  digital Rx 
-              numerator = np.abs(CB.conj().T @ H_b_hat @ CB)**2
-              denominator = np.abs(CB.conj().T @ H_I_hat @ CB)**2 + 1/Pvec
-              metric_1b = np.diagonal(numerator) / np.diagonal(denominator)
-              best_idx = np.argmax(metric_1b)
-              theta_test = CB[:, best_idx][:, np.newaxis]
-              # N_test = np.eye(N_tx) - ((H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).transpose())\
-              #                                    /np.linalg.norm(H_I_hat @ theta_test)**2
-              # v_test = (N_test @ theta_test) / np.linalg.norm(N_test @ theta_test)
-              v_test = np.linalg.solve(Pvec*(H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).T + np.eye(N_tx), Pvec*H_b_hat @ theta_test)
-              v_test = v_test / np.linalg.norm(v_test)
-              
-              sinr_sweep_digiw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
-                                   (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
-              sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
-                                   (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
-              
-              ### Analog Tx and Rx       
-              
-              metric_2b = numerator / (denominator)
-              best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
-              theta_test = CB[:, best_idx][:, np.newaxis]
-              v_test = CB[:, best_jdx][:, np.newaxis]
+              sinr_sweep_1b_anaw.append(sweep_sinr(w_same, v_same, H_b, H_I, Pvec))
+              sinr_sweep_digiw.append(sweep_sinr(w_dig, v_dig, H_b, H_I, Pvec))
+              sinr_sweep_2b_anaw.append(sweep_sinr(w_ana, v_ana, H_b, H_I, Pvec))
 
-              sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
-                                   (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              # #  digital Rx
+              # numerator = np.abs(CB.conj().T @ H_b_hat @ CB)**2
+              # denominator = np.abs(CB.conj().T @ H_I_hat @ CB)**2 + 1/Pvec
+              # metric_1b = np.diagonal(numerator) / np.diagonal(denominator)
+              # best_idx = np.argmax(metric_1b)
+              # theta_test = CB[:, best_idx][:, np.newaxis]
+              # # N_test = np.eye(N_tx) - ((H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).transpose())\
+              # #                                    /np.linalg.norm(H_I_hat @ theta_test)**2
+              # # v_test = (N_test @ theta_test) / np.linalg.norm(N_test @ theta_test)
+              # v_test = np.linalg.solve(Pvec*(H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).T + np.eye(N_tx), Pvec*H_b_hat @ theta_test)
+              # v_test = v_test / np.linalg.norm(v_test)
+              
+              # sinr_sweep_digiw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
+              #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
               # sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
               #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
+              
+              # ### Analog Tx and Rx
+              # # One slot per beam PAIR, so both codebooks are sqrt(tau) wide.
+              # num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
+              # den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              # metric_2b = num_2b / den_2b
+              # best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
+              # v_test = CB_pair[:, best_idx][:, np.newaxis]      # row index -> Rx beam
+              # theta_test = CB_pair[:, best_jdx][:, np.newaxis]  # column index -> Tx beam
+
+              # sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
+              #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              # # sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
+              # #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
 
 
 sinr_sweep_digiw = np.mean(np.reshape(sinr_sweep_digiw, (len(tau), -1)), axis=1)
@@ -758,24 +934,24 @@ style_legend = [
            label=r'$\mathbf{w} \neq \mathbf{v}$')
 ]
 # Create two separate legends
-legend1 = ax.legend(handles=method_legend, loc='lower left', ncols =2,
+legend1 = ax.legend(handles=method_legend, loc='center left', ncols =2,
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.6
                      )
                      
-legend2 = ax.legend(handles=style_legend, loc='center left', 
+legend2 = ax.legend(handles=style_legend, loc='lower right', 
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.6
                      )
-legend2.set_bbox_to_anchor((0.0, 0.35))
+legend1.set_bbox_to_anchor((0.0, 0.4))
 
 ax.add_artist(legend1)
 
 ax.set_xlabel('Preamble Length')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(tau)
-ax.set_ylim([-20, 10])
+# ax.set_ylim([-20, 10])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
-# plt.savefig('figs/multiscatter_sinr_tau.pdf', format = 'pdf', bbox_inches = 'tight')
+# plt.savefig('figs/multiscatter_sinr_tau_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 
 # %%
 #####################################################################################
@@ -909,7 +1085,7 @@ plt.tight_layout()
 #   tau non-adaptive DFT sounding beams (this IS the beam sweep)
 #     -> despread in time into one branch per BD (+ one common branch)
 #     -> detector decides which BD is awake
-#     -> ridge-LS estimate of that BD's channel and of the static interference
+#     -> LS estimate of that BD's channel and of the static interference
 #     -> beamformer design (alternating generalized eigenvector, or codebook sweep)
 #     -> SINR evaluated on the TRUE channels, for the TRUE awake BD.
 #
@@ -920,63 +1096,22 @@ plt.tight_layout()
 from iter_gen_eig import alternating_xy
 
 RESULT_DIR   = 'Mo_1LSTM_3BD_results'
-tau          = 16
+tau          = 10
 K            = 1
 N_scatter    = 5
 N_bd         = 3
 snr_const    = [-10, -5, 0, 5, 10, 15]
 
 noise_var    = 1.0      # matches mono_1lstm_mBD.py (2 * noiseSTD_per_dim**2)
-LS_REG       = 1e-1     # ridge on W W^H, as in the sp_beamformer scope
 N_RESTART    = 3        # random restarts of the alternating solver
 MAX_ITER     = 60
 BENCH_SEED   = 2024
 n_bench      = None     # None -> every test sample; set an int to subsample
 Wavelength   = 3e8 / args.fc
 ref_dis      = 166.67*Wavelength
-N_tx = 36
+N_tx = 16
 N_rx = N_tx
 #############################  benchmark building blocks  ############################
-
-def sense_and_despread(H_I, H_b, u_star, W_sound, L, P, K, noise_var, rng):
-    """Run the tau-step sounding phase and return the time-despread observations.
-
-    Step t transmits the single beam ``W_sound[:, t]``, held constant over the
-    L chips of the preamble and over the K repeated symbols per chip:
-
-        y[t, p] = sqrt(P) * (H_I + c[p, u*] * H_b[u*]) @ w_t + n[t, p]
-
-    The Hadamard code is therefore a TIME spreading sequence, not a second spatial
-    sounding vector. Despreading in time with column u (c_u^T c_u' = L delta, and
-    c_u^T 1 = 0 for the BD columns) gives
-
-        Ybar_bd[u][:, t] = sqrt(P) * 1{u == u*} * H_b[u] @ w_t + n
-        Ybar_c[:, t]     = sqrt(P) * H_I @ w_t + n,   n ~ CN(0, noise_var/(L*K))
-
-    with noise independent across branches, because despreading is an orthogonal
-    transform. Generating these directly is exactly equivalent to simulating all
-    L chips, and L times cheaper.
-    """
-    N_rx = H_I.shape[0]
-    n_bd = H_b.shape[0]
-    n_steps = W_sound.shape[1]
-    scale = np.sqrt(noise_var / (L * K) / 2.0)
-
-    Ybar_bd = scale * (rng.standard_normal((n_bd, N_rx, n_steps))
-                       + 1j * rng.standard_normal((n_bd, N_rx, n_steps)))
-    Ybar_bd[u_star] += np.sqrt(P) * (H_b[u_star] @ W_sound)
-
-    Ybar_c = scale * (rng.standard_normal((N_rx, n_steps))
-                      + 1j * rng.standard_normal((N_rx, n_steps)))
-    Ybar_c += np.sqrt(P) * (H_I @ W_sound)
-    return Ybar_bd, Ybar_c
-
-
-def ls_operator(W_sound, reg):
-    """Right-multiplier M with H_hat = Ybar @ M / sqrt(P) (ridge LS)."""
-    G = W_sound @ W_sound.conj().T + reg * np.eye(W_sound.shape[0])
-    return W_sound.conj().T @ np.linalg.inv(G)
-
 
 def design_alt_opt(H_b_hat, H_I_hat, P, restarts, max_iter):
     """Alternating generalized-eigenvector design on the ESTIMATED channels.
@@ -995,7 +1130,11 @@ def design_alt_opt(H_b_hat, H_I_hat, P, restarts, max_iter):
 
 
 def design_sweep_analog(H_b_hat, H_I_hat, CB, P):
-    """Exhaustive analog Tx x Rx codebook sweep on the estimated channels."""
+    """Exhaustive analog Tx x Rx codebook sweep on the estimated channels.
+
+    ``CB`` must be the sqrt(tau)-wide pair codebook, not the tau-wide sounding
+    codebook: an analog receiver resolves one (v_i, w_j) pair per slot.
+    """
     num = np.abs(CB.conj().T @ H_b_hat @ CB) ** 2
     den = np.abs(CB.conj().T @ H_I_hat @ CB) ** 2 + noise_var / P
     i, j = np.unravel_index(np.argmax(num / den), num.shape)
@@ -1075,7 +1214,9 @@ for i, snr in enumerate(snr_const):
        # This single sweep serves every baseline -- it is both the beam sweep and
        # the pilot phase for the LS estimate.
        CB   = dft_codebook(N_tx, tau)
-       M_ls = ls_operator(CB, LS_REG)
+       CB_pair = dft_codebook(N_tx, pair_sweep_size(tau))  # sqrt(tau) per side
+       M_b  = ls_operator(CB)
+       M_i  = ls_operator(CB)
 
        rng = np.random.default_rng(BENCH_SEED + i)
        np.random.seed(BENCH_SEED + i)   # alternating_xy uses the legacy global RNG
@@ -1100,12 +1241,12 @@ for i, snr in enumerate(snr_const):
               Ybar_bd, Ybar_c = sense_and_despread(
                      H_I, H_b, u_star, CB, L, P, K_file, noise_var, rng)
 
-              # ---------------- ridge-LS channel estimates ----------------
-              Hb_hat = np.stack([Ybar_bd[u] @ M_ls for u in range(n_bd_file)]) / np.sqrt(P)
-              HI_hat = (Ybar_c @ M_ls) / np.sqrt(P)
+              # ---------------- LS channel estimates ----------------
+              Hb_hat = np.stack([Ybar_bd[u] @ M_b for u in range(n_bd_file)]) / np.sqrt(P)
+              HI_hat = (Ybar_c @ M_i) / np.sqrt(P)
 
               # ---------------- identification ----------------
-              # (a) Non-coherent energy detector 
+              # (a) Non-coherent energy detector
               T_energy = np.sum(np.abs(Ybar_bd) ** 2, axis=(1, 2))
               # (b) LS detector
               T_ls = np.sum(np.abs(Hb_hat) ** 2, axis=(1, 2))
@@ -1133,7 +1274,7 @@ for i, snr in enumerate(snr_const):
               run['no_id'].append(true_sinr(v, w, H_b_true, H_I, P))
 
               # ------------- beam sweeping over the swept codebook -------------
-              v, w = design_sweep_analog(Hb_sel, HI_hat, CB, P)
+              v, w = design_sweep_analog(Hb_sel, HI_hat, CB_pair, P)
               run['sweep_analog'].append(true_sinr(v, w, H_b_true, H_I, P))
 
               v, w = design_sweep_digital(Hb_sel, HI_hat, CB, P)

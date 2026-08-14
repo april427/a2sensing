@@ -16,7 +16,7 @@ from manifold_optimization import solve_with_random_restarts, solve_x_equals_y_f
 
 N_ris = 16
 tau = 10  
-snr_const = [-10,-5, 0, 5, 10, 15, 20,25]
+snr_const = [-10,-5, 0, 5, 10, 15]
 
 Wavelength = 3e8/(10e9)
 ref_dis = Wavelength*166.67
@@ -91,16 +91,34 @@ def make_codebook(n, m):
     return grouped_dft_codebook(n, m) if CODEBOOK == 'grouped' else dft_codebook(n, m)
 
 
-def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, digital_tx='diag'):
+def pair_sweep_size(tau):
+    """Beams per side of an analog Tx x analog Rx sweep that must fit in tau slots.
+
+    An analog receiver sees one scalar per slot, so every (v_i, w_j) pair costs a
+    slot of its own: m beams per side => m^2 slots. Under a budget of tau slots
+    the two codebooks are therefore only sqrt(tau) wide, unlike designs (a) and
+    (b) below, which spend one slot per transmit beam and can afford all tau.
+    """
+    return max(1, int(np.floor(np.sqrt(tau))))
+
+
+def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
     """Codebook beam sweeping on the ESTIMATED channels (as in retest_scatters.py).
+
+    ``CB`` is the tau-wide sounding codebook used by the shared-beam and digital-Rx
+    designs. ``CB_pair`` is the sqrt(tau)-wide codebook used by the analog Tx x
+    analog Rx design, whose sweep costs one slot per beam PAIR; it defaults to a
+    codebook of ``pair_sweep_size(tau)`` beams.
     """
     N = CB.shape[0]
+    if CB_pair is None:
+        CB_pair = make_codebook(N, pair_sweep_size(CB.shape[1]))
     numerator = np.abs(np.conj(CB).T @ H_b_hat @ CB)**2
     denominator = np.abs(np.conj(CB).T @ H_SI_hat @ CB)**2 + 1/Pvec
 
     # (a) analog Tx and analog Rx sharing one beam: only the diagonal is reachable
     metric_same = np.diag(numerator) / np.diag(denominator)
-    best_same = int(np.argmax(np.diag(numerator)))
+    best_same = int(np.argmax(np.diag(numerator))) #.  np.argmax(metric_same)
     w_same = CB[:, best_same][:, np.newaxis]
 
     # (b) analog Tx beam + digital (LMMSE) receive combining.
@@ -112,10 +130,13 @@ def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, digital_tx='diag'):
     v_dig = np.linalg.solve(Pvec*(b) @ np.conj(b).T + np.eye(N), Pvec*a)
     v_dig = v_dig / np.linalg.norm(v_dig)
 
-    # (c) analog Tx and analog Rx picked independently from the codebook
-    best_rx, best_tx = np.unravel_index(np.argmax(numerator / denominator), numerator.shape)
-    w_ana = CB[:, best_tx][:, np.newaxis]
-    v_ana = CB[:, best_rx][:, np.newaxis]
+    # (c) analog Tx and analog Rx picked independently from the codebook.
+    # One slot per beam PAIR, so this sweep runs on the sqrt(tau)-wide codebook.
+    num_pair = np.abs(np.conj(CB_pair).T @ H_b_hat @ CB_pair)**2
+    den_pair = np.abs(np.conj(CB_pair).T @ H_SI_hat @ CB_pair)**2 + 1/Pvec
+    best_rx, best_tx = np.unravel_index(np.argmax(num_pair / den_pair), num_pair.shape)
+    w_ana = CB_pair[:, best_tx][:, np.newaxis]
+    v_ana = CB_pair[:, best_rx][:, np.newaxis]
 
     return (w_same, w_same), (w_same, v_dig), (w_ana, v_ana)
 
@@ -251,15 +272,21 @@ for i, snr in enumerate(snr_const):
 
             ### Lower Bound Beam Sweeping with Imperfect SI Channel Estimation
             CB = make_codebook(N_ris, tau)
-            H_SI_hat =   H_SI + (np.random.randn(*H_SI.shape) + 1j * np.random.randn(*H_SI.shape))/np.sqrt(2*Pvec)
-            observation = np.sqrt(Pvec)*channel_true_val[1][j].squeeze() + 1/np.sqrt(2) *(np.random.randn(*channel_true_val[1][j].squeeze().shape) + 1j * np.random.randn(*channel_true_val[1][j].squeeze().shape))
-            H_b_hat = (observation - H_SI_hat*np.sqrt(Pvec)) / np.sqrt(Pvec)
+            CB_pair = make_codebook(N_ris, pair_sweep_size(tau))   # sqrt(tau) per side
+            Y_observe_SI = np.sqrt(Pvec)*(H_SI)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
+
+            H_SI_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe_SI.T, rcond=None)[0].T 
+
+            Y_observe = np.sqrt(Pvec)*(H_SI+H_b)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
+            H_2_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe.T, rcond=None)[0].T
+            
+            H_b_hat = H_2_hat - H_SI_hat
 
             H_b_hat_batch.append(H_b_hat)
             H_I_hat_batch.append(H_SI_hat)            
 
             (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                sweep_designs(H_b_hat, H_SI_hat, CB, Pvec)
+                sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair)
 
             sinr_sweeping_1b.append(sweep_sinr(w_same, v_same, H_b, H_SI, Pvec))
             sinr_sweeping_2b.append(sweep_sinr(w_dig, v_dig, H_b, H_SI, Pvec))
@@ -267,42 +294,42 @@ for i, snr in enumerate(snr_const):
 
 
               ##### Beam sweeping with Perfect SI Channel Estimation
-            H_b_hat = (observation - H_SI*np.sqrt(Pvec)) / np.sqrt(Pvec)
+            # H_b_hat = (observation - H_SI*np.sqrt(Pvec)) / np.sqrt(Pvec)
 
-            (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                sweep_designs(H_b_hat, H_SI, CB, Pvec)
+            # (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
+            #     sweep_designs(H_b_hat, H_SI, CB, Pvec, CB_pair)
 
-            sinr_sweeping_1b_csi.append(sweep_sinr(w_same, v_same, H_b, H_SI, Pvec))
-            sinr_sweeping_2b_csi.append(sweep_sinr(w_dig, v_dig, H_b, H_SI, Pvec))
-            sinr_sweeping_2b_ana_csi.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
+            # sinr_sweeping_1b_csi.append(sweep_sinr(w_same, v_same, H_b, H_SI, Pvec))
+            # sinr_sweeping_2b_csi.append(sweep_sinr(w_dig, v_dig, H_b, H_SI, Pvec))
+            # sinr_sweeping_2b_ana_csi.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
 
 
         ##### Optimal beams from H_hat
-        v_sp, w_sp = compute_optimal_beamformers_2b(
-                             np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
+        # v_sp, w_sp = compute_optimal_beamformers_2b(
+        #                      np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
         
-        sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
-                np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
-                np.array(v_sp),np.array(w_sp),1,Pvec,
-        )
-        sinr_opt_hat_2b.append(sinr_opt_2b)
+        # sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
+        #         np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
+        #         np.array(v_sp),np.array(w_sp),1,Pvec,
+        # )
+        # sinr_opt_hat_2b.append(sinr_opt_2b)
 
-        vw_opt = compute_optimal_beamformers_1b(
-                np.array(H_b_hat_batch),np.array(H_I_hat_batch),
-                1,Pvec,num_restarts=1,
-        )
-        sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
-                        np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
-                        np.array(vw_opt),np.array(vw_opt),1,Pvec,
-        )
-        sinr_opt_hat_1b.append(sinr_opt_1b)
+        # vw_opt = compute_optimal_beamformers_1b(
+        #         np.array(H_b_hat_batch),np.array(H_I_hat_batch),
+        #         1,Pvec,num_restarts=1,
+        # )
+        # sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
+        #                 np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
+        #                 np.array(vw_opt),np.array(vw_opt),1,Pvec,
+        # )
+        # sinr_opt_hat_1b.append(sinr_opt_1b)
 
 sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(snr_const), -1)), axis=1)
 sinr_sweeping_2b = np.mean(np.reshape(sinr_sweeping_2b, (len(snr_const), -1)), axis=1)
 sinr_sweeping_2b_ana = np.mean(np.reshape(sinr_sweeping_2b_ana, (len(snr_const), -1)), axis=1)
-sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(snr_const), -1)), axis=1)
-sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(snr_const), -1)), axis=1)
-sinr_sweeping_2b_ana_csi = np.mean(np.reshape(sinr_sweeping_2b_ana_csi, (len(snr_const), -1)), axis=1)
+# sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(snr_const), -1)), axis=1)
+# sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(snr_const), -1)), axis=1)
+# sinr_sweeping_2b_ana_csi = np.mean(np.reshape(sinr_sweeping_2b_ana_csi, (len(snr_const), -1)), axis=1)
 
 sinr_opt_hat_1b = 0 if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(snr_const), -1)), axis=1)
 sinr_opt_hat_2b = 0 if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(snr_const), -1)), axis=1)
@@ -416,10 +443,10 @@ ax.add_artist(legend1)
 ax.set_xlabel('Effective SNR [dB]')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(snr_const)
-ax.set_ylim([-40, 26])
+ax.set_ylim([-40, 15])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
-# plt.savefig('figs/sinr_snr_1BD.pdf', format = 'pdf', bbox_inches = 'tight')
+# plt.savefig('figs/sinr_snr_1BD_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 
 
 #####################################################################################
@@ -435,8 +462,8 @@ sinr_test_1b = []
 sinr_sweeping_1b = []          # analog Tx = analog Rx (w = v), estimated SI
 sinr_sweeping_1b_csi = []      # analog Tx = analog Rx (w = v), perfect SI
 
-# sinr_opt_hat_1b = []
-# sinr_opt_hat_2b = []
+sinr_opt_hat_1b = []
+sinr_opt_hat_2b = []
 
 sinr_test_2b = []
 rieman_opti_sinr_2b = []
@@ -461,12 +488,15 @@ for i, n_tau in enumerate(tau):
 
 
         channel_true_val, loc_true = generate_irs_user_channel(
-                                None, location_ris_1, num_samples=5000, Rician_factor=Rician_factor)   
+                                None, location_ris_1, num_samples=7000, Rician_factor=Rician_factor)   
 
         H_I_hat_batch = []
         H_b_hat_batch = []
         H_b_batch = []
         H_d_batch = []
+
+        CB = make_codebook(N_ris, n_tau)
+        CB_pair = make_codebook(N_ris, pair_sweep_size(n_tau))  # sqrt(tau) per side
 
         for j in range(len(loc_true)):
             loc = loc_true[j].squeeze()
@@ -490,32 +520,42 @@ for i, n_tau in enumerate(tau):
             # sinr_opti_recal.append(sig_pow_opti_recal[-1] / (int_pow_opti_recal[-1] + 1))
 
             ### Lower Bound Beam Sweeping with Imperfect SI Channel Estimation
-            CB = make_codebook(N_ris, n_tau)
-            H_SI_hat =   H_SI + (np.random.randn(*H_SI.shape) + 1j * np.random.randn(*H_SI.shape))/np.sqrt(2*Pvec)
-            observation = np.sqrt(Pvec)*channel_true_val[1][j].squeeze() + \
-                     1/np.sqrt(2) *(np.random.randn(*channel_true_val[1][j].squeeze().shape) \
-                                    + 1j * np.random.randn(*channel_true_val[1][j].squeeze().shape))
-            H_b_hat = (observation - H_SI_hat*np.sqrt(Pvec)) / np.sqrt(Pvec)
+            
+            Y_observe_SI = np.sqrt(Pvec)*(H_SI)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
+            
+            H_SI_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe_SI.T, rcond=None)[0].T 
+
+            Y_observe = np.sqrt(Pvec)*(H_SI+H_b)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
+            H_2_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe.T, rcond=None)[0].T
+            # numerator = np.linalg.norm(Y_observe - np.sqrt(Pvec)*H_SI_hat@CB, axis=0)**2
+            # denominator = np.linalg.norm(H_SI_hat@CB, axis=0)**2 * Pvec
+            # inx = np.argmax(numerator/(denominator+1))
+            # w_same = CB[:, inx][:, np.newaxis]
+            # v_same = w_same
+
+            # a = H_b_hat @ w_same
+            # b = H_SI_hat @ w_same
+            # v_dig = np.linalg.solve(Pvec*(b) @ np.conj(b).T + np.eye(CB.shape[0]), Pvec*a)
+            # v_dig = v_dig / np.linalg.norm(v_dig)
+
+            # Y_observe_pair = np.sqrt(Pvec)*(H_SI+H_b)@CB_pair + \
+            #                 np.sqrt(1/2)*(np.random.randn(*CB_pair.shape) + 1j * np.random.randn(*CB_pair.shape))
+            # num_pair = np.abs(np.conj(CB_pair).T @ (Y_observe_pair - np.sqrt(Pvec)*H_SI_hat @ CB_pair)**2)
+            # den_pair = np.abs(np.conj(CB_pair).T @ H_SI_hat @ CB_pair)**2 + 1/Pvec
+            # best_rx, best_tx = np.unravel_index(np.argmax(num_pair / den_pair), num_pair.shape)
+            # w_ana = CB_pair[:, best_tx][:, np.newaxis]
+            # v_ana = CB_pair[:, best_rx][:, np.newaxis]
+            
+            H_b_hat = H_2_hat - H_SI_hat
             H_b_hat_batch.append(H_b_hat)
             H_I_hat_batch.append(H_SI_hat)     
 
             (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                sweep_designs(H_b_hat, H_SI_hat, CB, Pvec)
+                sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair)
 
             sinr_sweeping_1b.append(sweep_sinr(w_same, v_same, H_b, H_SI, Pvec))
             sinr_sweeping_2b.append(sweep_sinr(w_dig, v_dig, H_b, H_SI, Pvec))
             sinr_sweeping_2b_ana.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
-
-            ### Beam Sweeping with Perfect SI Channel Estimation
-
-            H_b_hat = (observation - H_SI*np.sqrt(Pvec)) / np.sqrt(Pvec)
-
-            (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                sweep_designs(H_b_hat, H_SI, CB, Pvec)
-
-            sinr_sweeping_1b_csi.append(sweep_sinr(w_same, v_same, H_b, H_SI, Pvec))
-            sinr_sweeping_2b_csi.append(sweep_sinr(w_dig, v_dig, H_b, H_SI, Pvec))
-            sinr_sweeping_2b_ana_csi.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
 
         ##### Optimal beams from H_hat
         # v_sp, w_sp = compute_optimal_beamformers_2b(
@@ -546,8 +586,8 @@ sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(tau), -1)),
 sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(tau), -1)), axis=1)
 sinr_sweeping_2b_ana_csi = np.mean(np.reshape(sinr_sweeping_2b_ana_csi, (len(tau), -1)), axis=1)
 
-sinr_opt_hat_1b = 0 if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(tau), -1)), axis=1)
-sinr_opt_hat_2b = 0 if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(tau), -1)), axis=1)
+sinr_opt_hat_1b = [] if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(tau), -1)), axis=1)
+sinr_opt_hat_2b = [] if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(tau), -1)), axis=1)
 
 
 # %%
@@ -566,10 +606,10 @@ ax.plot(tau, 10*np.log10(sinr_sweeping_1b.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='--', 
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6,
        label='Beam Sweeping')
-ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
-       marker=methods['iteropti_hat']['marker'], linestyle='--',
-       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-       label='IterOpti_hat')
+# ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
+#        marker=methods['iteropti_hat']['marker'], linestyle='--',
+#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+#        label='IterOpti_hat')
 
 ### w ≠ v (solid lines)
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
@@ -581,10 +621,10 @@ ax.plot(tau, [np.mean(p) for p in rieman_opti_sinr_2b], \
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b_ana.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='-',
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6)
-ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
-       marker=methods['iteropti_hat']['marker'], linestyle='-',
-       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-       label='IterOpti_hat')
+# ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
+#        marker=methods['iteropti_hat']['marker'], linestyle='-',
+#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+#        label='IterOpti_hat')
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b.squeeze()), \
        marker=methods['sweep_dig']['marker'], linestyle='-',
        color=methods['sweep_dig']['color'], linewidth=1.2, markersize=6)
@@ -644,5 +684,5 @@ ax.set_xticks(tau)
 # ax.set_ylim([-25, 25])
 ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 plt.tight_layout()
-# plt.savefig('figs/sinr_tau_1BD.pdf', format = 'pdf', bbox_inches = 'tight')
+# plt.savefig('figs/sinr_tau_1BD_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 # %%
