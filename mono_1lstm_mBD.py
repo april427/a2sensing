@@ -178,7 +178,7 @@ tau = args.tau  # Pilot length (also number of BD interactions)
 K = getattr(args, "N_symbols", 5)  # Number of OFDM symbols per BD state
 snr_const = args.snr
 snr_const = np.array([snr_const])
-ref_dis = 15*Wavelength
+ref_dis = Wavelength*166.67
 Pvec = 10 ** (snr_const / 10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4)  / N_tx / N_rx
 
 # An orthogonal Hadamard preamble is used at every sensing step. Column 0 is
@@ -810,7 +810,7 @@ with tf.name_scope("sp_beamformer"):
     
     # # Compute SINR with signal processing beamformers
     sp_bd_amp = tf.einsum('bri,buri->bu', tf.math.conj(v_sp), tf.einsum('burc,bci->buri', H_b_placeholder, w_sp))
-    sig_BD_sp = tf.reduce_sum(tf.abs(sp_bd_amp) ** 2, axis=1) * lay['P']
+    sig_BD_sp = tf.reduce_sum(tf.abs(sp_bd_amp) ** 2 * active_mask, axis=1) * lay['P']
     
     sig_int_sp = tf.matmul(tf.linalg.adjoint(v_sp), tf.matmul(H_interference, w_sp))
     sig_int_sp = tf.squeeze(tf.abs(sig_int_sp) ** 2) * lay['P']
@@ -855,9 +855,10 @@ with tf.name_scope("sp_beamformer"):
     v_sweep_safe = tf.where(v_valid_mask, v_sweep_raw, v_seed)
     v_sweep = v_sweep_safe / tf.cast(tf.norm(v_sweep_safe, axis=1, keepdims=True) + 1e-10, tf.complex64)
     
-    # Compute final SINR using selected beams on TRUE channels
+    # Compute final SINR using selected beams on TRUE channels.
+    # As above, only the awake BD counts towards the numerator.
     sweep_bd_amp = tf.einsum('bri,buri->bu', tf.math.conj(v_sweep), tf.einsum('burc,bci->buri', H_b_placeholder, w_sweep))
-    sig_BD_sweep = tf.reduce_sum(tf.abs(sweep_bd_amp) ** 2, axis=1) * lay['P']
+    sig_BD_sweep = tf.reduce_sum(tf.abs(sweep_bd_amp) ** 2 * active_mask, axis=1) * lay['P']
     
     sig_int_sweep = tf.matmul(tf.linalg.adjoint(v_sweep), tf.matmul(H_interference, w_sweep))
     sig_int_sweep = tf.squeeze(tf.abs(sig_int_sweep) ** 2) * lay['P']
@@ -1111,19 +1112,21 @@ with tf.Session() as sess:
         H_r_placeholder: H_r_test
     }
     
+    # active_user is a tf.random_uniform op, so it is redrawn on every
+    # sess.run call.
     sinr_test, sinr_sum_test, sinr_per_device_test, sinr_opt_test, \
         sinr_scatter_test, v_learned, w_learned, v_optimal, w_optimal, \
         v_list_test, w_list_test, active_user_test, predicted_user_test, \
-        id_probabilities_test, id_accuracy_test, id_loss_test = sess.run(
+        id_probabilities_test, id_accuracy_test, id_loss_test, \
+        sinr_sp_test, sinr_sweep_test = sess.run(
             [sinr_active, sinr_BD, sinr_BD_per_device, sinr_BD_opt,
              sinr_scatter, v_complex, w_complex, v_opt, w_opt, v_list,
              w_list, active_user, predicted_user, id_probabilities,
-             identification_accuracy, identification_loss],
+             identification_accuracy, identification_loss,
+             sinr_BD_sp, sinr_BD_sweep],
             feed_dict=feed_dict_test
     )
 
-    sinr_sp_test, sinr_sweep_test = sess.run([sinr_BD_sp, sinr_BD_sweep], feed_dict=feed_dict_test)
-    
     print(f"Test active-BD identification accuracy: {100 * id_accuracy_test:6.2f}%")
     print(f"Test identification loss: {id_loss_test:8.4f}")
     print(f"Test SINR_active (learned): {10 * np.log10(np.mean(sinr_test) + 1e-10):6.2f} dB")
@@ -1132,8 +1135,8 @@ with tf.Session() as sess:
         print(f"  BD {device_idx + 1}: {10 * np.log10(np.mean(sinr_per_device_test[:, device_idx]) + 1e-10):6.2f} dB")
     print(f"Test SINR_active (optimal): {10 * np.log10(np.mean(sinr_opt_test) + 1e-10):6.2f} dB")
     print(f"Test SINR_scatter (learned):       {10 * np.log10(np.mean(sinr_scatter_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (signalprocessing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
-    print(f"Test SINR_BD (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
+    print(f"Test SINR_active (signal processing): {10 * np.log10(np.mean(sinr_sp_test) + 1e-10):6.2f} dB")
+    print(f"Test SINR_active (sweeping): {10 * np.log10(np.mean(sinr_sweep_test) + 1e-10):6.2f} dB")
     print(f"Active-SINR gap to optimal: {10 * np.log10((np.mean(sinr_opt_test) + 1e-10) / (np.mean(sinr_test) + 1e-10)):6.2f} dB")
     
     # Save results
@@ -1185,7 +1188,7 @@ with tf.Session() as sess:
 print("\n" + "=" * 60)
 print("Beam Pattern Visualization (2D - Azimuth)")
 print("=" * 60)
-
+num_users = 3
 # Allow running this section alone (e.g., in an IDE/Jupyter cell).
 if 'np' not in globals():
     import numpy as np
@@ -1196,7 +1199,7 @@ if 'sio' not in globals():
 if 'os' not in globals():
     import os
 if 'num_users' not in globals():
-    num_users = 1
+    num_users = 3
 
 # This section can run standalone by loading a saved .mat result file.
 def _decode_saved_locations(raw):
