@@ -104,11 +104,6 @@ def pair_sweep_size(tau):
 
 def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
     """Codebook beam sweeping on the ESTIMATED channels (as in retest_scatters.py).
-
-    ``CB`` is the tau-wide sounding codebook used by the shared-beam and digital-Rx
-    designs. ``CB_pair`` is the sqrt(tau)-wide codebook used by the analog Tx x
-    analog Rx design, whose sweep costs one slot per beam PAIR; it defaults to a
-    codebook of ``pair_sweep_size(tau)`` beams.
     """
     N = CB.shape[0]
     if CB_pair is None:
@@ -455,6 +450,7 @@ plt.tight_layout()
 # %%
 snr = 10  
 tau = [4,6,8,10,12,14,16]
+n_opt = 40
 
 sinr_opti_recal = []
 rieman_opti_sinr_1b = []
@@ -523,10 +519,10 @@ for i, n_tau in enumerate(tau):
             
             Y_observe_SI = np.sqrt(Pvec)*(H_SI)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
             
-            H_SI_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe_SI.T, rcond=None)[0].T 
+            H_SI_hat = Y_observe_SI @ np.linalg.pinv(CB) / np.sqrt(Pvec)
 
             Y_observe = np.sqrt(Pvec)*(H_SI+H_b)@CB + np.sqrt(1/2)*(np.random.randn(*CB.shape) + 1j * np.random.randn(*CB.shape))
-            H_2_hat = np.linalg.lstsq(np.sqrt(Pvec)*CB.T, Y_observe.T, rcond=None)[0].T
+            H_2_hat = Y_observe @ np.linalg.pinv(CB)/ np.sqrt(Pvec)
             # numerator = np.linalg.norm(Y_observe - np.sqrt(Pvec)*H_SI_hat@CB, axis=0)**2
             # denominator = np.linalg.norm(H_SI_hat@CB, axis=0)**2 * Pvec
             # inx = np.argmax(numerator/(denominator+1))
@@ -547,8 +543,9 @@ for i, n_tau in enumerate(tau):
             # v_ana = CB_pair[:, best_rx][:, np.newaxis]
             
             H_b_hat = H_2_hat - H_SI_hat
-            H_b_hat_batch.append(H_b_hat)
-            H_I_hat_batch.append(H_SI_hat)     
+            if j < n_opt:
+                H_b_hat_batch.append(H_b_hat)
+                H_I_hat_batch.append(H_SI_hat)     
 
             (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
                 sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair)
@@ -558,33 +555,33 @@ for i, n_tau in enumerate(tau):
             sinr_sweeping_2b_ana.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
 
         ##### Optimal beams from H_hat
-        # v_sp, w_sp = compute_optimal_beamformers_2b(
-        #                         np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
+        v_sp, w_sp = compute_optimal_beamformers_2b(
+                                np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=3)
         
-        # sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
-        #         np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
-        #         np.array(v_sp),np.array(w_sp),1,Pvec,
-        # )
-        # sinr_opt_hat_2b.append(sinr_opt_2b)
+        sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
+                np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
+                np.array(v_sp),np.array(w_sp),1,Pvec,
+        )
+        sinr_opt_hat_2b.append(sinr_opt_2b)
 
-        # vw_opt = compute_optimal_beamformers_1b(
-        #         np.array(H_b_hat_batch),np.array(H_I_hat_batch),
-        #         1,Pvec,num_restarts=1,
-        # )
-        # sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
-        #                 np.array(H_d_batch),np.array(H_b_batch),np.zeros_like(H_b_batch),
-        #                 np.array(vw_opt),np.array(vw_opt),1,Pvec,
-        # )
-        # sinr_opt_hat_1b.append(sinr_opt_1b)
+        vw_opt = compute_optimal_beamformers_1b(
+                np.array(H_b_hat_batch),np.array(H_I_hat_batch),
+                1,Pvec,num_restarts=3,
+        )
+        sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
+                        np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
+                        np.array(vw_opt),np.array(vw_opt),1,Pvec,
+        )
+        sinr_opt_hat_1b.append(sinr_opt_1b)
 
 
 
 sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(tau), -1)), axis=1)
 sinr_sweeping_2b = np.mean(np.reshape(sinr_sweeping_2b, (len(tau), -1)), axis=1)
 sinr_sweeping_2b_ana = np.mean(np.reshape(sinr_sweeping_2b_ana, (len(tau), -1)), axis=1)
-sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(tau), -1)), axis=1)
-sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(tau), -1)), axis=1)
-sinr_sweeping_2b_ana_csi = np.mean(np.reshape(sinr_sweeping_2b_ana_csi, (len(tau), -1)), axis=1)
+# sinr_sweeping_1b_csi = np.mean(np.reshape(sinr_sweeping_1b_csi, (len(tau), -1)), axis=1)
+# sinr_sweeping_2b_csi = np.mean(np.reshape(sinr_sweeping_2b_csi, (len(tau), -1)), axis=1)
+# sinr_sweeping_2b_ana_csi = np.mean(np.reshape(sinr_sweeping_2b_ana_csi, (len(tau), -1)), axis=1)
 
 sinr_opt_hat_1b = [] if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(tau), -1)), axis=1)
 sinr_opt_hat_2b = [] if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(tau), -1)), axis=1)
@@ -606,10 +603,10 @@ ax.plot(tau, 10*np.log10(sinr_sweeping_1b.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='--', 
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6,
        label='Beam Sweeping')
-# ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
-#        marker=methods['iteropti_hat']['marker'], linestyle='--',
-#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-#        label='IterOpti_hat')
+ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='--',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
 
 ### w ≠ v (solid lines)
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
@@ -621,16 +618,14 @@ ax.plot(tau, [np.mean(p) for p in rieman_opti_sinr_2b], \
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b_ana.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='-',
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6)
-# ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
-#        marker=methods['iteropti_hat']['marker'], linestyle='-',
-#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-#        label='IterOpti_hat')
+ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='-',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b.squeeze()), \
        marker=methods['sweep_dig']['marker'], linestyle='-',
        color=methods['sweep_dig']['color'], linewidth=1.2, markersize=6)
-# ax.plot(tau, 10*np.log10(sinr_sweeping_2b_csi.squeeze()), \
-#        marker=methods['sweep_dig_csi']['marker'], linestyle='-',
-#        color=methods['sweep_dig_csi']['color'], linewidth=1.2, markersize=7)
+
 # Create custom legend
 from matplotlib.lines import Line2D
 # Method legend (colors/markers)
@@ -678,7 +673,7 @@ legend1.legend_handles[2].set_transform(
 
 ax.add_artist(legend1)
 
-ax.set_xlabel('Preamble Length')
+ax.set_xlabel('Preamble Length $T$')
 ax.set_ylabel('Achieved SINR [dB]')
 ax.set_xticks(tau)
 # ax.set_ylim([-25, 25])

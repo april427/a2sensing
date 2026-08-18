@@ -256,13 +256,7 @@ def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch, w
         sig_int.astype(np.float32),
     )
 def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
-    """Codebook beam sweeping on the ESTIMATED channels (as in retest_scatters.py).
 
-    ``CB`` is the tau-wide sounding codebook used by the shared-beam and digital-Rx
-    designs. ``CB_pair`` is the sqrt(tau)-wide codebook used by the analog Tx x
-    analog Rx design, whose sweep costs one slot per beam PAIR; it defaults to a
-    codebook of ``pair_sweep_size(tau)`` beams.
-    """
     N = CB.shape[0]
     if CB_pair is None:
         CB_pair = make_codebook(N, pair_sweep_size(CB.shape[1]))
@@ -754,7 +748,7 @@ plt.tight_layout()
 
 # %%
 #####################################################################################
-# ----------------------------- Multiple Scatters --------------------------------- #
+# ------------------------ Multiple Scatters SINR vs tau---------------------------- #
 #####################################################################################
 
 snr_const = 10 
@@ -773,25 +767,25 @@ sinr_test_2b = []
 rieman_opti_sinr_2b = []
 sinr_sweep_digiw = []
 sinr_sweep_2b_anaw = []
+sinr_opt_hat_2b = []
 
 sinr_test_1b = []
 rieman_opti_sinr_1b = []
 sinr_sweeping_1b = []
 sinr_sweep_1b_anaw = []
+sinr_opt_hat_1b = []
+
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
-# Single BD whose index is known, sounded with a length-2 BD code (+/-),
-# so the despread branches carry noise of power noise_var / (L_PRE * K).
 L_PRE = 2
-# The LS estimator uses no channel prior, so no prior_channel_powers() calibration.
 rng = np.random.default_rng(2024)
+n_opt = 600
 
 for i, n_tau in enumerate(tau):
        filename = os.path.join('Mo_mimo_sinr_1b_aaT', \
        'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
        data = scipy.io.loadmat(filename)
-       # sinr_test_1b.append(data['sinr_test'].squeeze())
-       # rieman_opti_sinr_1b.append(data['rieman_opti_sinr'].squeeze())
+
        sinr_test_1b.append(data['sinr_learned'].squeeze())
        rieman_opti_sinr_1b.append(data['sinr_optimal'].squeeze())
 
@@ -803,8 +797,6 @@ for i, n_tau in enumerate(tau):
 
        rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
 
-       
-
        BD_loc = data['BD_location'].squeeze()
        Scatter_loc = data['Scatter_location'].squeeze()
        test_size = BD_loc.shape[0]
@@ -813,12 +805,19 @@ for i, n_tau in enumerate(tau):
        CB_pair = make_codebook(N_tx, pair_sweep_size(n_tau))  # sqrt(tau) per side
        M_b = ls_operator(CB)
        M_i = ls_operator(CB)
+       H_b_hat_batch = []
+       H_I_hat_batch = []
+       H_b_batch = []
+       H_r_batch = []
+       H_d_batch = []
 
        for j in range(test_size):
 
               _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
                      location_tx, location_rx, Scatter_loc[j], BD_loc[j], N_tx, 1, N_rx, 1)
-
+              H_b_batch.append(H_b_test)
+              H_r_batch.append(H_r_test)
+              H_d_batch.append(H_d_test)
               H_I = H_d_test + H_r_test
               H_b = H_b_test
 
@@ -829,6 +828,10 @@ for i, n_tau in enumerate(tau):
                      H_I, H_b[None], 0, CB, L_PRE, Pvec, K, noise_var, rng)
               H_b_hat = (Ybar_bd[0] @ M_b) / np.sqrt(Pvec)
               H_I_hat = (Ybar_c @ M_i) / np.sqrt(Pvec)
+   
+              if j < n_opt:
+                     H_b_hat_batch.append(H_b_hat)
+                     H_I_hat_batch.append(H_I_hat)
 
               (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
                               sweep_designs(H_b_hat, H_I_hat, CB, Pvec, CB_pair)
@@ -868,11 +871,33 @@ for i, n_tau in enumerate(tau):
               # # sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
               # #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
 
+       ##### Optimal beams from H_hat
+       v_sp, w_sp = compute_optimal_beamformers_2b(
+                     np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=1)
+
+       sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
+              np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.array(H_r_batch[:n_opt]),
+              np.array(v_sp),np.array(w_sp),1,Pvec,
+       )
+       sinr_opt_hat_2b.append(sinr_opt_2b)
+
+       vw_opt = compute_optimal_beamformers_1b(
+              np.array(H_b_hat_batch),np.array(H_I_hat_batch),
+              1,Pvec,num_restarts=1,
+       )
+       sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
+                     np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.array(H_r_batch[:n_opt]),
+                     np.array(vw_opt),np.array(vw_opt),1,Pvec,
+       )
+       sinr_opt_hat_1b.append(sinr_opt_1b)
 
 sinr_sweep_digiw = np.mean(np.reshape(sinr_sweep_digiw, (len(tau), -1)), axis=1)
 sinr_sweep_2b_anaw = np.mean(np.reshape(sinr_sweep_2b_anaw, (len(tau), -1)), axis=1)
-# sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(tau), -1)), axis=1)
 sinr_sweep_1b_anaw = np.mean(np.reshape(sinr_sweep_1b_anaw, (len(tau), -1)), axis=1)
+
+sinr_opt_hat_1b = 0 if len(sinr_opt_hat_1b) == 0 else np.mean(np.reshape(sinr_opt_hat_1b, (len(tau), -1)), axis=1)
+sinr_opt_hat_2b = 0 if len(sinr_opt_hat_2b) == 0 else np.mean(np.reshape(sinr_opt_hat_2b, (len(tau), -1)), axis=1)
+
 
 # %%
 
@@ -887,10 +912,10 @@ ax.plot(tau, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_1b], \
        marker=methods['iteropti']['marker'], linestyle='--', 
        color=methods['iteropti']['color'], linewidth=1.2, markersize=6,
        label='IterOpti')    
-# ax.plot(tau, 10*np.log10(sinr_sweeping_1b.squeeze()), \
-#        marker=methods['beam_sweep']['marker'], linestyle='--', 
-#        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6,
-#        label='Beam Sweeping')
+ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='--',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
 ax.plot(tau, 10*np.log10(sinr_sweep_1b_anaw.squeeze()), \
        marker=methods['beam_sweep_csi']['marker'], linestyle='--', 
        color=methods['beam_sweep_csi']['color'], linewidth=1.2, markersize=6,
@@ -902,6 +927,10 @@ ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_2b], \
        marker=methods['iteropti']['marker'], linestyle='-', 
        color=methods['iteropti']['color'], linewidth=1.2, markersize=6)
+ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
+       marker=methods['iteropti_hat']['marker'], linestyle='-',
+       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+       label='IterOpti_hat')
 ax.plot(tau, 10*np.log10(sinr_sweep_digiw.squeeze()), \
        marker=methods['sweep_dig']['marker'], linestyle='-', 
        color=methods['sweep_dig']['color'], linewidth=1.2, markersize=7)
@@ -913,18 +942,21 @@ ax.plot(tau, 10*np.log10(sinr_sweep_2b_anaw.squeeze()), \
 from matplotlib.lines import Line2D
 # Method legend (colors/markers)
 method_legend = [
-    Line2D([0], [0], color=methods['sweep_dig']['color'], 
-           marker=methods['sweep_dig']['marker'], linestyle='None', 
-           markersize=7, label='Sweep (Digital $\mathbf{w})$'),
-    Line2D([0], [0], color=methods['beam_sweep_csi']['color'], 
-           marker=methods['beam_sweep_csi']['marker'], linestyle='None', 
-           markersize=7, label='Sweep (Analog $\mathbf{w}$)'),
     Line2D([0], [0], color=methods['proposed']['color'], 
            marker=methods['proposed']['marker'], linestyle='None', 
            markersize=7, label='Proposed'),
     Line2D([0], [0], color=methods['iteropti']['color'], 
            marker=methods['iteropti']['marker'], linestyle='None', 
            markersize=7, label='IterOpti'),
+    Line2D([0], [0], color=methods['iteropti_hat']['color'],
+            marker=methods['iteropti_hat']['marker'], linestyle='None',
+            markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm I}, \hat{\mathbf{H}}_{\rm b}$'),
+    Line2D([0], [0], color=methods['sweep_dig']['color'], 
+               marker=methods['sweep_dig']['marker'], linestyle='None', 
+               markersize=7, label='Sweep (Digital $\mathbf{w})$'),
+    Line2D([0], [0], color=methods['beam_sweep_csi']['color'], 
+       marker=methods['beam_sweep_csi']['marker'], linestyle='None', 
+       markersize=7, label='Sweep (Analog $\mathbf{w}$)'),
 ]
 # Line style legend
 style_legend = [
@@ -935,13 +967,20 @@ style_legend = [
 ]
 # Create two separate legends
 legend1 = ax.legend(handles=method_legend, loc='center left', ncols =2,
-                   frameon=True, fontsize=9, fancybox=True, framealpha=0.6
+                   frameon=True, fontsize=9, fancybox=True, framealpha=0.5
                      )
                      
 legend2 = ax.legend(handles=style_legend, loc='lower right', 
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.6
                      )
 legend1.set_bbox_to_anchor((0.0, 0.4))
+from matplotlib.transforms import ScaledTranslation
+offset = ScaledTranslation(0, -3 / 72, fig.dpi_scale_trans)  
+for i in range(0, 2):
+       legend1.get_texts()[i].set_transform(legend1.get_texts()[i].get_transform() + offset)
+       legend1.legend_handles[i].set_transform(
+       legend1.legend_handles[i].get_transform() + offset
+       )
 
 ax.add_artist(legend1)
 
@@ -1068,30 +1107,7 @@ plt.tight_layout()
 # %%
 ######################################################################################
 #
-#------------------  Multi-BD: non-learning (benchmark) methods  ------------------- #
-#
-# Loads the results saved by mono_1lstm_mBD.py and re-runs the classical pipeline on
-# exactly the same test geometries and the same awake-BD labels.
-#
-# Signal model (identical to mono_1lstm_mBD.py). The Hadamard code lives in TIME,
-# not in space. Sounding step t uses ONE transmit vector w_t, taken from the DFT
-# codebook and held constant over the whole length-L preamble; the awake BD keys its
-# own Hadamard column chip by chip while the other BDs stay silent:
-#
-#     y[t, p] = sqrt(P) * ( H_I + c[p, u*] * H_b[u*] ) @ w_t + n[t, p],
-#     p = 0 ... L-1 chips,  each chip repeated K symbols.
-#
-# Pipeline:
-#   tau non-adaptive DFT sounding beams (this IS the beam sweep)
-#     -> despread in time into one branch per BD (+ one common branch)
-#     -> detector decides which BD is awake
-#     -> LS estimate of that BD's channel and of the static interference
-#     -> beamformer design (alternating generalized eigenvector, or codebook sweep)
-#     -> SINR evaluated on the TRUE channels, for the TRUE awake BD.
-#
-# Sensing cost is identical to the learned scheme: tau steps x L chips x K symbols.
-# The only difference is that w_t is a fixed codebook column here, whereas the
-# learned scheme steers w_t adaptively from the recurrent state.
+#------------------  Multi-BD: with identification  ------------------- #
 ######################################################################################
 from iter_gen_eig import alternating_xy
 
@@ -1100,7 +1116,7 @@ tau          = 10
 K            = 1
 N_scatter    = 5
 N_bd         = 3
-snr_const    = [-10, -5, 0, 5, 10, 15]
+snr_const    = [-10, -5, 0, 5, 10,15]
 
 noise_var    = 1.0      # matches mono_1lstm_mBD.py (2 * noiseSTD_per_dim**2)
 N_RESTART    = 3        # random restarts of the alternating solver
@@ -1114,61 +1130,49 @@ N_rx = N_tx
 #############################  benchmark building blocks  ############################
 
 def design_alt_opt(H_b_hat, H_I_hat, P, restarts, max_iter):
-    """Alternating generalized-eigenvector design on the ESTIMATED channels.
+       """Alternating generalized-eigenvector design on the ESTIMATED channels.
 
-    Maximises P|v^H H_b w|^2 / (P|v^H H_I w|^2 + noise_var); the restart is picked
-    by the objective the receiver can actually see, i.e. the estimated one.
-    """
-    best_v, best_w, best_obj = None, None, -np.inf
-    A = np.sqrt(P) * H_b_hat
-    B = np.sqrt(P) * H_I_hat
-    for _ in range(restarts):
-        v, w, obj = alternating_xy(A, B, c=noise_var, max_iter=max_iter)
-        if obj > best_obj:
-            best_v, best_w, best_obj = v, w, obj
-    return best_v, best_w
+       Maximises P|v^H H_b w|^2 / (P|v^H H_I w|^2 + noise_var); the restart is picked
+       by the objective the receiver can actually see, i.e. the estimated one.
+       """
+       best_v, best_w, best_obj = None, None, -np.inf
+       A = np.sqrt(P) * H_b_hat
+       B = np.sqrt(P) * H_I_hat
+       for _ in range(restarts):
+              v, w, obj = alternating_xy(A, B, c=noise_var, max_iter=max_iter)
+              if obj > best_obj:
+                     best_v, best_w, best_obj = v, w, obj
+       return best_v, best_w
 
 
 def design_sweep_analog(H_b_hat, H_I_hat, CB, P):
-    """Exhaustive analog Tx x Rx codebook sweep on the estimated channels.
-
-    ``CB`` must be the sqrt(tau)-wide pair codebook, not the tau-wide sounding
-    codebook: an analog receiver resolves one (v_i, w_j) pair per slot.
-    """
-    num = np.abs(CB.conj().T @ H_b_hat @ CB) ** 2
-    den = np.abs(CB.conj().T @ H_I_hat @ CB) ** 2 + noise_var / P
-    i, j = np.unravel_index(np.argmax(num / den), num.shape)
-    return CB[:, i], CB[:, j]
+       num = np.abs(CB.conj().T @ H_b_hat @ CB) ** 2
+       den = np.abs(CB.conj().T @ H_I_hat @ CB) ** 2 + noise_var / P
+       i, j = np.unravel_index(np.argmax(num / den), num.shape)
+       return CB[:, i], CB[:, j]
 
 
 def design_sweep_digital(H_b_hat, H_I_hat, CB, P):
-    """Analog Tx codebook sweep + LMMSE digital Rx combining.
-
-    For a candidate Tx beam w the best digital receiver attains
-    SINR(w) = P a^H (P b b^H + noise_var I)^{-1} a with a = H_b_hat w,
-    b = H_I_hat w, which Sherman-Morrison reduces to a closed form. The Tx beam is
-    picked by that score and the matching v is the LMMSE combiner.
-    """
-    A = H_b_hat @ CB                                  # (N_rx, n_beams)
-    B = H_I_hat @ CB
-    bHa = np.sum(B.conj() * A, axis=0)
-    b_n2 = np.sum(np.abs(B) ** 2, axis=0)
-    a_n2 = np.sum(np.abs(A) ** 2, axis=0)
-    coef = P / (noise_var + P * b_n2)
-    score = (P / noise_var) * (a_n2 - np.abs(bHa) ** 2 * coef)
-    k = int(np.argmax(score))
-    v = A[:, k] - B[:, k] * (bHa[k] * coef[k])
-    v = v / (np.linalg.norm(v) + 1e-12)
-    return v, CB[:, k]
+    
+       A = np.abs(np.conj(CB).T @ H_b_hat @ CB)**2                                 # (N_rx, n_beams)
+       #     B = np.abs(np.conj(CB).T @ H_I_hat @ CB)**2 + 1/Pvec
+       best_same = int(np.argmax(np.diag(A)))
+       w = CB[:, best_same][:, np.newaxis]
+       a = H_b_hat @ w
+       b = H_I_hat @ w
+       N = H_b_hat.shape[0]
+       w = np.linalg.solve(Pvec*(b) @ np.conj(b).T + np.eye(N), Pvec*a)
+       w = w / np.linalg.norm(w) 
+       return v, w
 
 
 def true_sinr(v, w, H_b_active, H_I, P):
-    """SINR actually delivered to the awake BD, on the true channels."""
-    v = v.reshape(-1)
-    w = w.reshape(-1)
-    sig = P * np.abs(np.vdot(v, H_b_active @ w)) ** 2
-    inter = P * np.abs(np.vdot(v, H_I @ w)) ** 2 + noise_var
-    return sig / inter
+       """SINR actually delivered to the awake BD, on the true channels."""
+       v = v.reshape(-1)
+       w = w.reshape(-1)
+       sig = P * np.abs(np.vdot(v, H_b_active @ w)) ** 2
+       inter = P * np.abs(np.vdot(v, H_I @ w)) ** 2 + noise_var
+       return sig / inter
 
 
 #################################  benchmark sweep  ##################################
@@ -1188,14 +1192,14 @@ sinr_when_id_bad  = []
 for i, snr in enumerate(snr_const):
        filename = os.path.join(RESULT_DIR,
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat'
-              % (N_tx, N_rx, tau, snr, K, N_scatter))
+              % (36,36,16, snr, K, N_scatter))
        data = scipy.io.loadmat(filename)
        sinr_test.append(data['sinr_learned'].squeeze())
        sinr_opti_sinr.append(data['sinr_optimal'].squeeze())
        identify_accuracy.append(data['identification_accuracy'].squeeze())
 
        filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
-                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (36, 36, tau, snr, K, N_scatter))
+                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (16, 16, tau, snr, K, N_scatter))
        data1b = scipy.io.loadmat(filename)
        sinr_test_2b.append(data1b['sinr_learned'].squeeze())
 
@@ -1274,11 +1278,14 @@ for i, snr in enumerate(snr_const):
               run['no_id'].append(true_sinr(v, w, H_b_true, H_I, P))
 
               # ------------- beam sweeping over the swept codebook -------------
-              v, w = design_sweep_analog(Hb_sel, HI_hat, CB_pair, P)
-              run['sweep_analog'].append(true_sinr(v, w, H_b_true, H_I, P))
+              # v, w = design_sweep_analog(Hb_sel, HI_hat, CB_pair, P)
+              # run['sweep_analog'].append(true_sinr(v, w, H_b_true, H_I, P))
 
-              v, w = design_sweep_digital(Hb_sel, HI_hat, CB, P)
-              run['sweep_digital'].append(true_sinr(v, w, H_b_true, H_I, P))
+              # v, w = design_sweep_digital(Hb_sel, HI_hat, CB, P)
+              # run['sweep_digital'].append(true_sinr(v, w, H_b_true, H_I, P))
+              (_,_), (w, v_dig), (w_ana, v_ana) = sweep_designs(Hb_sel, HI_hat, CB, P, CB_pair)
+              run['sweep_analog'].append(true_sinr(v_ana, w_ana, H_b_true, H_I, P))
+              run['sweep_digital'].append(true_sinr(v_dig, w, H_b_true, H_I, P))
 
        n_run = len(idx_list)
        for k in bench:
@@ -1344,10 +1351,10 @@ ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['alt_opt']],
        marker='^', linestyle='-', color='#2ca02c', linewidth=1.2, markersize=6,
        label=r'IterOpti $\hat{\mathbf{H}}_{\rm I}, \hat{\mathbf{H}}_{\rm b}$')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_digital']],
-       marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
+       marker='v', linestyle='-', color='#9467bd', linewidth=1.2, markersize=6,
        label=r'Sweep (Digital $\mathbf{w}$)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_analog']],
-       marker='v', linestyle='-', color='#9467bd', linewidth=1.2, markersize=6,
+       marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
        label=r'Sweep (Analog $\mathbf{w}$)')
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['no_id']],
        marker='x', linestyle=':', color='#7f7f7f', linewidth=1.2, markersize=6,
@@ -1386,9 +1393,9 @@ ax.plot(snr_const, [np.mean(p) for p in identify_accuracy],
 ax.plot(snr_const, id_acc_energy,
        marker='^', linestyle='-', color='#2ca02c', linewidth=1.2, markersize=6,
        label='Energy detector')
-ax.plot(snr_const, id_acc_ls,
-       marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
-       label='LS detector')
+# ax.plot(snr_const, id_acc_ls,
+#        marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
+#        label='LS detector')
 ax.axhline(1.0 / N_bd, color='#7f7f7f', linestyle=':', linewidth=1.0,
        label='Random guess')
 ax.set_xlabel('Effective SNR [dB]')
@@ -1399,4 +1406,188 @@ ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
 ax.legend(loc='lower right', fontsize=8, frameon=True, fancybox=True, framealpha=0.6)
 plt.tight_layout()
 # fig.savefig('figs/multiBD_id_acc_snr.pdf', format = 'pdf', bbox_inches = 'tight')
+# %%
+
+
+#####################################################################################
+# ----------------------------- Low SNR, SINR vs tau  ------------------------------ #
+#####################################################################################
+
+snr_const = 0 
+# tau = [8,12,16,20,24]  
+tau = [10,14,18,22,26,30]
+K = 1
+
+sig_pow_opti_recal = []
+int_pow_opti_recal = []
+sinr_opti_recal = []
+num_scatters = 5
+N_tx = 16
+N_rx = 16
+
+sinr_test_2b = []
+rieman_opti_sinr_2b = []
+sinr_sweep_digiw = []
+sinr_sweep_2b_anaw = []
+
+sinr_test_1b = []
+rieman_opti_sinr_1b = []
+sinr_sweeping_1b = []
+sinr_sweep_1b_anaw = []
+Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
+
+# Single BD whose index is known, sounded with a length-2 BD code (+/-),
+# so the despread branches carry noise of power noise_var / (L_PRE * K).
+L_PRE = 2
+# The LS estimator uses no channel prior, so no prior_channel_powers() calibration.
+rng = np.random.default_rng(2024)
+
+for i, n_tau in enumerate(tau):
+
+       filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
+            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (16, 16, n_tau, snr_const, K, num_scatters))
+       data = scipy.io.loadmat(filename)
+
+       sinr_test_2b.append(data['sinr_learned'].squeeze())
+
+       rieman_opti_sinr_2b.append(data['sinr_optimal'].squeeze())
+
+       
+
+       BD_loc = data['BD_location'].squeeze()
+       Scatter_loc = data['Scatter_location'].squeeze()
+       test_size = BD_loc.shape[0]
+
+       CB = make_codebook(N_tx, n_tau)
+       CB_pair = make_codebook(N_tx, pair_sweep_size(n_tau))  # sqrt(tau) per side
+       M_b = ls_operator(CB)
+       M_i = ls_operator(CB)
+
+       for j in range(test_size):
+
+              _, H_d_test, H_r_test, H_b_test = generate_mimo_channel(
+                     location_tx, location_rx, Scatter_loc[j], BD_loc[j], N_tx, 1, N_rx, 1)
+
+              H_I = H_d_test + H_r_test
+              H_b = H_b_test
+
+              ### Lower Bound Beam Sweeping
+              # n_tau-step codebook sounding + despreading, then LS; the BD is
+              # unique and its index is known, hence n_bd = 1 and u_star = 0.
+              Ybar_bd, Ybar_c = sense_and_despread(
+                     H_I, H_b[None], 0, CB, L_PRE, Pvec, K, noise_var, rng)
+              H_b_hat = (Ybar_bd[0] @ M_b) / np.sqrt(Pvec)
+              H_I_hat = (Ybar_c @ M_i) / np.sqrt(Pvec)
+
+              (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
+                              sweep_designs(H_b_hat, H_I_hat, CB, Pvec, CB_pair)
+              
+              sinr_sweep_1b_anaw.append(sweep_sinr(w_same, v_same, H_b, H_I, Pvec))
+              sinr_sweep_digiw.append(sweep_sinr(w_dig, v_dig, H_b, H_I, Pvec))
+              sinr_sweep_2b_anaw.append(sweep_sinr(w_ana, v_ana, H_b, H_I, Pvec))
+
+              # #  digital Rx
+              # numerator = np.abs(CB.conj().T @ H_b_hat @ CB)**2
+              # denominator = np.abs(CB.conj().T @ H_I_hat @ CB)**2 + 1/Pvec
+              # metric_1b = np.diagonal(numerator) / np.diagonal(denominator)
+              # best_idx = np.argmax(metric_1b)
+              # theta_test = CB[:, best_idx][:, np.newaxis]
+              # # N_test = np.eye(N_tx) - ((H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).transpose())\
+              # #                                    /np.linalg.norm(H_I_hat @ theta_test)**2
+              # # v_test = (N_test @ theta_test) / np.linalg.norm(N_test @ theta_test)
+              # v_test = np.linalg.solve(Pvec*(H_I_hat @ theta_test) @ np.conj(H_I_hat @ theta_test).T + np.eye(N_tx), Pvec*H_b_hat @ theta_test)
+              # v_test = v_test / np.linalg.norm(v_test)
+              
+              # sinr_sweep_digiw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
+              #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              # sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
+              #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
+              
+              # ### Analog Tx and Rx
+              # # One slot per beam PAIR, so both codebooks are sqrt(tau) wide.
+              # num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
+              # den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              # metric_2b = num_2b / den_2b
+              # best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
+              # v_test = CB_pair[:, best_idx][:, np.newaxis]      # row index -> Rx beam
+              # theta_test = CB_pair[:, best_jdx][:, np.newaxis]  # column index -> Tx beam
+
+              # sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
+              #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
+              # # sinr_sweep_1b_anaw.append(Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_b @ theta_test)**2 / \
+              # #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
+
+
+sinr_sweep_digiw = np.mean(np.reshape(sinr_sweep_digiw, (len(tau), -1)), axis=1)
+sinr_sweep_2b_anaw = np.mean(np.reshape(sinr_sweep_2b_anaw, (len(tau), -1)), axis=1)
+# sinr_sweeping_1b = np.mean(np.reshape(sinr_sweeping_1b, (len(tau), -1)), axis=1)
+sinr_sweep_1b_anaw = np.mean(np.reshape(sinr_sweep_1b_anaw, (len(tau), -1)), axis=1)
+
+# %%
+
+fig, ax = plt.subplots(1, 1, figsize=(4,3))
+rieman_opti_sinr_2b[0] = rieman_opti_sinr_2b[1]
+### w = v (dashed lines)
+         
+ax.plot(tau, 10*np.log10(sinr_sweep_1b_anaw.squeeze()), \
+       marker=methods['beam_sweep_csi']['marker'], linestyle='--', 
+       color=methods['beam_sweep_csi']['color'], linewidth=1.2, markersize=6,
+       label='Beam Sweeping')     
+### w ≠ v (solid lines)
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
+       marker=methods['proposed']['marker'], linestyle='-', 
+       color=methods['proposed']['color'], linewidth=1.2, markersize=6)        
+ax.plot(tau, [10*np.log10(np.mean(p)) for p in rieman_opti_sinr_2b], \
+       marker=methods['iteropti']['marker'], linestyle='-', 
+       color=methods['iteropti']['color'], linewidth=1.2, markersize=6)
+ax.plot(tau, 10*np.log10(sinr_sweep_digiw.squeeze()), \
+       marker=methods['sweep_dig']['marker'], linestyle='-', 
+       color=methods['sweep_dig']['color'], linewidth=1.2, markersize=7)
+ax.plot(tau, 10*np.log10(sinr_sweep_2b_anaw.squeeze()), \
+       marker=methods['beam_sweep_csi']['marker'], linestyle='-', 
+       color=methods['beam_sweep_csi']['color'], linewidth=1.2, markersize=6,
+       label='Beam Sweeping')
+# Create custom legend
+from matplotlib.lines import Line2D
+# Method legend (colors/markers)
+method_legend = [
+    Line2D([0], [0], color=methods['sweep_dig']['color'], 
+           marker=methods['sweep_dig']['marker'], linestyle='None', 
+           markersize=7, label='Sweep (Digital $\mathbf{w})$'),
+    Line2D([0], [0], color=methods['beam_sweep_csi']['color'], 
+           marker=methods['beam_sweep_csi']['marker'], linestyle='None', 
+           markersize=7, label='Sweep (Analog $\mathbf{w}$)'),
+    Line2D([0], [0], color=methods['proposed']['color'], 
+           marker=methods['proposed']['marker'], linestyle='None', 
+           markersize=7, label='Proposed'),
+    Line2D([0], [0], color=methods['iteropti']['color'], 
+           marker=methods['iteropti']['marker'], linestyle='None', 
+           markersize=7, label='IterOpti'),
+]
+# Line style legend
+style_legend = [
+    Line2D([0], [0], color='grey', linestyle='--', linewidth=1.2, 
+           label=r'$\mathbf{w} = \mathbf{v}$'), 
+    Line2D([0], [0], color='grey', linestyle='-', linewidth=1.2, 
+           label=r'$\mathbf{w} \neq \mathbf{v}$')
+]
+# Create two separate legends
+legend1 = ax.legend(handles=method_legend, loc='center left', ncols =2,
+                   frameon=True, fontsize=9, fancybox=True, framealpha=0.6
+                     )
+                     
+legend2 = ax.legend(handles=style_legend, loc='lower right', 
+                   frameon=True, fontsize=9, fancybox=True, framealpha=0.6
+                     )
+legend1.set_bbox_to_anchor((0.0, 0.4))
+
+ax.add_artist(legend1)
+
+ax.set_xlabel('Preamble Length')
+ax.set_ylabel('Achieved SINR [dB]')
+ax.set_xticks(tau)
+# ax.set_ylim([-20, 10])
+ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
+plt.tight_layout()
+# plt.savefig('figs/multiscatter_sinr_tau_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 # %%
