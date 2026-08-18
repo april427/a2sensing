@@ -483,7 +483,7 @@ with tf.name_scope("active_sensing_agent"):
 
         'Update shared LSTM state - both RIS and Rx can see the result'
         lstm_input = tf.concat(
-            [y_real, y_real2, snr_normal], axis=1
+            [y_real, y_real2], axis=1
         )
         h_old, c_old = LSTM1((lstm_input, h_old, c_old))
         # h_old2, c_old2 = LSTM2((tf.concat([y_real2,  snr_normal], axis=1), h_old2, c_old2))

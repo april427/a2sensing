@@ -588,7 +588,7 @@ with tf.name_scope("active_sensing_agent"):
         ], axis=1)
         
         'Update one fused LSTM state from concatenated Y1/Y2 statistics'
-        fused_obs = tf.concat([y_real, y_real2, snr_normal], axis=1)
+        fused_obs = tf.concat([y_real, y_real2], axis=1)
         h_old, c_old = LSTM1((fused_obs, h_old, c_old))
         
         'RIS designs transmit beamformer w based on the fused hidden state'
