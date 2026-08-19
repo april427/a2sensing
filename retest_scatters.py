@@ -1166,6 +1166,87 @@ def design_sweep_digital(H_b_hat, H_I_hat, CB, P):
        return v, w
 
 
+def sense_and_despread_pairs(H_I, H_b, u_star, W_tx, V_rx, L, P, K, noise_var, rng):
+       """Analog Tx x analog Rx sweep: one despread scalar per (v_j, w_i) pair.
+
+       An analog receiver collapses each slot to the single scalar v_j^H y, so a
+       pair cannot be re-read from another slot's samples: every pair is measured
+       in its OWN slot and carries its own noise realisation. This is the only
+       difference from :func:`sense_and_despread`, where one slot feeds every
+       receive direction at once. With m = floor(sqrt(tau)) beams per side the
+       m^2 pairs x L chips x K symbols match the tau*L*K spent by the digital
+       sounding, so the two sweeps are compared under one slot budget.
+
+              Zbd[u, j, i] = sqrt(P) * 1{u == u*} * v_j^H H_b[u] w_i + n
+              Zc [j, i]    = sqrt(P) * v_j^H H_I w_i + n,  n ~ CN(0, noise_var/(L*K))
+       """
+       n_bd = H_b.shape[0]
+       m_rx = V_rx.shape[1]
+       m_tx = W_tx.shape[1]
+       scale = np.sqrt(noise_var / (L * K) / 2.0)
+
+       Zbd = scale * (rng.standard_normal((n_bd, m_rx, m_tx))
+                      + 1j * rng.standard_normal((n_bd, m_rx, m_tx)))
+       Zbd[u_star] += np.sqrt(P) * (V_rx.conj().T @ H_b[u_star] @ W_tx)
+
+       Zc = scale * (rng.standard_normal((m_rx, m_tx))
+                     + 1j * rng.standard_normal((m_rx, m_tx)))
+       Zc += np.sqrt(P) * (V_rx.conj().T @ H_I @ W_tx)
+       return Zbd, Zc
+
+
+def design_sweep_blind_analog(Zbd, Zc, W_tx, V_rx):
+       """Beam pair AND awake-BD identity, both read off the sweep itself.
+
+       During initial access the AP does not know which BD is awake, so it cannot
+       be handed that BD's channel estimate before sweeping. Here it sweeps the
+       pairs, despreads each one against every BD code, and decides both things
+       from those scalars alone: the zero-mean BD codes strip the interference
+       out of Zbd, while the common code leaves it in Zc, so numerator and
+       denominator of the selection metric are BOTH measured quantities.
+
+       Identity accumulates over the whole sweep (all m^2 pairs) rather than
+       riding on the single pair that happens to win, which decouples the
+       identity decision from the much noisier beam decision.
+       """
+       u_hat = int(np.argmax(np.sum(np.abs(Zbd) ** 2, axis=(1, 2))))
+       metric = np.abs(Zbd[u_hat]) ** 2 / (np.abs(Zc) ** 2 + noise_var)
+       j, i = np.unravel_index(np.argmax(metric), metric.shape)
+       return V_rx[:, j], W_tx[:, i], u_hat
+
+
+def design_sweep_blind_digital(Ybar_bd, Ybar_c, W_sound):
+       """Analog Tx sweep + digital combining, identity again decided blind.
+
+       One slot per transmit beam, so the whole N_rx despread vector survives and
+       the receive beam is synthesised instead of swept. The combiner is the LMMSE
+       solution against the single measured interference direction, written in
+       Sherman-Morrison form so no per-beam solve is needed:
+
+              (c c^H + noise_var I)^-1 a  ~  a - c (c^H a) / (noise_var + |c|^2)
+
+       The sweep is self-contained: it spends its own T slots and decides the
+       identity from its own measurements, exactly as the analog sweep does.
+       Sweeping and estimate-then-optimize are alternative schemes rather than
+       stages of one scheme, so each is given the same budget independently --
+       reusing the estimator's sounding here would tie this baseline's identity
+       decision to the energy detector's and hide its true error rate.
+       """
+       u_hat = int(np.argmax(np.sum(np.abs(Ybar_bd) ** 2, axis=(1, 2))))
+       A = Ybar_bd[u_hat]                                  # ~ sqrt(P) H_b[u_hat] w_t
+       C = Ybar_c                                          # ~ sqrt(P) H_I w_t
+
+       cHa = np.sum(C.conj() * A, axis=0)
+       cc = np.sum(np.abs(C) ** 2, axis=0)
+       V = A - C * (cHa / (noise_var + cc))
+       V = V / (np.linalg.norm(V, axis=0, keepdims=True) + 1e-12)
+
+       sig = np.abs(np.sum(V.conj() * A, axis=0)) ** 2
+       itf = np.abs(np.sum(V.conj() * C, axis=0)) ** 2
+       t = int(np.argmax(sig / (itf + noise_var)))
+       return V[:, t], W_sound[:, t], u_hat
+
+
 def true_sinr(v, w, H_b_active, H_I, P):
        """SINR actually delivered to the awake BD, on the true channels."""
        v = v.reshape(-1)
@@ -1186,20 +1267,22 @@ bench = {k: [] for k in ('alt_opt', 'alt_opt_genie', 'sweep_analog',
                          'sweep_digital', 'no_id')}
 id_acc_energy = []   # energy detector on the despread branches (drives the designs)
 id_acc_ls     = []   # LS detector on the beam-deconvolved channel estimates
+id_acc_sweep_ana = []  # identity decided from the analog pair sweep alone
+id_acc_sweep_dig = []  # identity decided from the digital sweep alone
 sinr_when_id_ok   = []
 sinr_when_id_bad  = []
 
 for i, snr in enumerate(snr_const):
        filename = os.path.join(RESULT_DIR,
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat'
-              % (36,36,16, snr, K, N_scatter))
+              % (N_tx, N_rx, tau, snr, K, N_scatter))
        data = scipy.io.loadmat(filename)
        sinr_test.append(data['sinr_learned'].squeeze())
        sinr_opti_sinr.append(data['sinr_optimal'].squeeze())
        identify_accuracy.append(data['identification_accuracy'].squeeze())
 
        filename = os.path.join('Mo_mimo_sinr_modelsave_one_lstm', \
-                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (16, 16, tau, snr, K, N_scatter))
+                     'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, tau, snr, K, N_scatter))
        data1b = scipy.io.loadmat(filename)
        sinr_test_2b.append(data1b['sinr_learned'].squeeze())
 
@@ -1219,6 +1302,7 @@ for i, snr in enumerate(snr_const):
        # the pilot phase for the LS estimate.
        CB   = dft_codebook(N_tx, tau)
        CB_pair = dft_codebook(N_tx, pair_sweep_size(tau))  # sqrt(tau) per side
+       CB_pair_rx = dft_codebook(N_rx, pair_sweep_size(tau))  # analog Rx side
        M_b  = ls_operator(CB)
        M_i  = ls_operator(CB)
 
@@ -1228,6 +1312,7 @@ for i, snr in enumerate(snr_const):
        idx_list = list(range(test_size)) if n_bench is None \
               else list(range(min(n_bench, test_size)))
        acc_e = acc_l = 0
+       acc_sw_a = acc_sw_d = 0
        run = {k: [] for k in bench}
        ok_list, bad_list = [], []
 
@@ -1277,28 +1362,42 @@ for i, snr in enumerate(snr_const):
               v, w = design_alt_opt(Hb_hat.sum(axis=0), HI_hat, P, N_RESTART, MAX_ITER)
               run['no_id'].append(true_sinr(v, w, H_b_true, H_I, P))
 
-              # ------------- beam sweeping over the swept codebook -------------
-              # v, w = design_sweep_analog(Hb_sel, HI_hat, CB_pair, P)
-              # run['sweep_analog'].append(true_sinr(v, w, H_b_true, H_I, P))
-
-              # v, w = design_sweep_digital(Hb_sel, HI_hat, CB, P)
-              # run['sweep_digital'].append(true_sinr(v, w, H_b_true, H_I, P))
-              (_,_), (w, v_dig), (w_ana, v_ana) = sweep_designs(Hb_sel, HI_hat, CB, P, CB_pair)
+              # ------------- beam sweeping without knowing the BD identity -------------
+              Zbd, Zc = sense_and_despread_pairs(
+                     H_I, H_b, u_star, CB_pair, CB_pair_rx, L, P, K_file,
+                     noise_var, rng)
+              v_ana, w_ana, u_hat_sw_a = design_sweep_blind_analog(
+                     Zbd, Zc, CB_pair, CB_pair_rx)
               run['sweep_analog'].append(true_sinr(v_ana, w_ana, H_b_true, H_I, P))
-              run['sweep_digital'].append(true_sinr(v_dig, w, H_b_true, H_I, P))
+              acc_sw_a += (u_hat_sw_a == u_star)
+
+              # Ybar_bd_sw, Ybar_c_sw = sense_and_despread(
+              #        H_I, H_b, u_hat_sw_a, CB, L, P, K_file, noise_var, rng)
+              # v_dig, _, u_hat_sw_d = design_sweep_blind_digital(
+              #        Ybar_bd_sw, Ybar_c_sw, CB)
+              aa = H_I @ w_ana + np.sqrt(noise_var/L/P) *np.random.randn(N_rx)
+              bb = (u_star == u_hat_sw_a) * H_b_true @ w_ana + np.sqrt(noise_var/L/P) *np.random.randn(N_rx)
+              v_dig = np.linalg.solve(P*aa @ np.conj(aa).T + np.eye(N_rx), P*bb)
+              v_dig = v_dig / np.linalg.norm(v_dig)
+              run['sweep_digital'].append(true_sinr(v_dig, w_ana, H_b_true, H_I, P))
+              # acc_sw_d += (u_hat_sw_d == u_star)
 
        n_run = len(idx_list)
        for k in bench:
               bench[k].append(np.asarray(run[k]))
        id_acc_energy.append(acc_e / n_run)
        id_acc_ls.append(acc_l / n_run)
+       id_acc_sweep_ana.append(acc_sw_a / n_run)
+       id_acc_sweep_dig.append(acc_sw_a / n_run)
        sinr_when_id_ok.append(np.asarray(ok_list))
        sinr_when_id_bad.append(np.asarray(bad_list))
 
-       print('SNR %+3d dB | ID acc  learned %.3f  energy %.3f  LS %.3f | '
+       print('SNR %+3d dB | ID acc  learned %.3f  energy %.3f  LS %.3f  '
+             'sweep-ana %.3f  sweep-dig %.3f | '
              'SINR [dB]  learned %6.2f  genie-CSI %6.2f  est+opt %6.2f  '
              '(genie-ID %6.2f)  sweep-dig %6.2f  sweep-ana %6.2f  no-ID %6.2f'
              % (snr, float(identify_accuracy[i]), id_acc_energy[i], id_acc_ls[i],
+                id_acc_sweep_ana[i], id_acc_sweep_dig[i],
                 10 * np.log10(np.mean(sinr_test[i])),
                 10 * np.log10(np.mean(sinr_opti_sinr[i])),
                 10 * np.log10(np.mean(bench['alt_opt'][i])),
@@ -1330,6 +1429,8 @@ scipy.io.savemat(bench_file, dict(
        id_acc_learned=np.asarray([float(p) for p in identify_accuracy]),
        id_acc_energy=np.asarray(id_acc_energy),
        id_acc_ls=np.asarray(id_acc_ls),
+       id_acc_sweep_ana=np.asarray(id_acc_sweep_ana),
+       id_acc_sweep_dig=np.asarray(id_acc_sweep_dig),
        **{('sinr_' + k): np.stack(v) for k, v in bench.items()}
 ))
 print('\nBenchmark cached to %s' % bench_file)
@@ -1384,7 +1485,7 @@ for j in range(4):
     )
 
 plt.tight_layout()
-# fig.savefig('figs/multiBD_sinr_snr.pdf', format = 'pdf', bbox_inches = 'tight')
+# fig.savefig('figs/multiBD_sinr_snr_v2.pdf', format = 'pdf', bbox_inches = 'tight')
 
 fig, ax = plt.subplots(1, 1, figsize=(4, 3))
 ax.plot(snr_const, [np.mean(p) for p in identify_accuracy],
@@ -1393,9 +1494,12 @@ ax.plot(snr_const, [np.mean(p) for p in identify_accuracy],
 ax.plot(snr_const, id_acc_energy,
        marker='^', linestyle='-', color='#2ca02c', linewidth=1.2, markersize=6,
        label='Energy detector')
-# ax.plot(snr_const, id_acc_ls,
+# ax.plot(snr_const, id_acc_sweep_ana,
+#        marker='s', linestyle='--', color='#ff7f0e', linewidth=1.2, markersize=6,
+#        label='Sweep (Analog $\\mathbf{w}$)')
+# ax.plot(snr_const, id_acc_sweep_dig,
 #        marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
-#        label='LS detector')
+#        label='Sweep (Digital $\\mathbf{w}$)')
 ax.axhline(1.0 / N_bd, color='#7f7f7f', linestyle=':', linewidth=1.0,
        label='Random guess')
 ax.set_xlabel('Effective SNR [dB]')

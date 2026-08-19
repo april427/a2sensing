@@ -47,7 +47,7 @@ FIG_DIR = "figs"
 NUM_USERS = 3          # BDs in the scene (1 active + 2 idle)
 NUM_SCATTERS = 5       # passive scatterers
 TAU = 10
-SNR_DB = 0
+SNR_DB = 10
 N_SYMBOLS = getattr(args, "N_symbols", 1)
 
 # Test-set replay settings, must mirror mono_1lstm_mBD.py
@@ -60,19 +60,19 @@ NOISE_VAR = 1.0           # 2 * noiseSTD_per_dim**2 with noiseSTD_per_dim = sqrt
 NUM_RESTARTS = 10         # random restarts of the optimal beamformer
 
 SAMPLES_TO_PLOT = 1       # number of test samples to visualize
-SAMPLE_INDICES = None     # e.g. [12, 57]; None picks at random
+SAMPLE_INDICES = [165]    # e.g. [12, 57]; None picks at random
 SELECTION_SEED = None     # seed of the random sample pick; None = different every run
-SAVE_FIGS = True
+SAVE_FIGS = False
 
 DB_FLOOR = -45.0
 R_MAX = 46.0
 
 COLOR_LEARNED = "#d62728"
-COLOR_OPTIMAL = "#0E8E36"
-COLOR_ACTIVE_BD = "#036221"
-COLOR_IDLE_BD = "#7f7f7f"
+COLOR_OPTIMAL = "#2077b4"
+COLOR_ACTIVE_BD = "#00c68dff"
+COLOR_IDLE_BD = "#22493eff"
 COLOR_PRED_BD = "#1f77b4"
-COLOR_SCATTER = "#696969"
+COLOR_SCATTER = "#573F3F"
 
 
 #####################################################
@@ -324,21 +324,31 @@ def setup_polar_axis(ax):
     ax.set_thetamin(-90)
     ax.set_thetamax(90)
     ax.set_ylim([0, R_MAX])
-    ax.set_thetagrids(np.arange(-90, 91, 30))
+    # Angular axis labelled in radians: -pi/2 ... pi/2.
+    ax.set_thetagrids(
+        [-90, -45, 0, 45, 90],
+        labels=[r"$-\frac{\pi}{2}$", r"$-\frac{\pi}{4}$", r"$0$", r"$\frac{\pi}{4}$", r"$\frac{\pi}{2}$"],
+    )
     ax.set_rticks([0, 15, 30, 45])
     ax.set_yticklabels(["-45", "-30", "-15", "0"])
+    ax.tick_params(axis="x", labelsize=14)   # angular (radian) labels
+    ax.tick_params(axis="y", labelsize=11)    # radial (gain) labels
     ax.grid(alpha=0.25)
 
 
 def mark_scene(ax, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
-               annotate_labels=True):
+               annotate_labels=True, show_predicted=True, label_predicted=None):
     """Draw the active BD, the idle BDs, the inferred BD and the scatterers.
 
-    The BD inferred by the LSTM classifier is always marked with a star at the
-    outer radius, so a correct decision shows up as a star sitting on the
-    active-BD line and a wrong one as a star on an idle-BD line.
+    The BD inferred by the LSTM classifier is marked with a star at the outer
+    radius, so a correct decision shows up as a star sitting on the active-BD
+    line and a wrong one as a star on an idle-BD line. The decision is only
+    available once all sensing steps are done, so ``show_predicted`` allows
+    hiding it on the intermediate panels.
     """
     correct = predicted_idx == active_idx
+    if label_predicted is None:
+        label_predicted = annotate_labels
     idle_labelled = False
     for device_idx, angle_deg in enumerate(bd_angles_deg):
         if not np.isfinite(angle_deg):
@@ -354,9 +364,10 @@ def mark_scene(ax, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
                 label = "Idle BDs"
                 idle_labelled = True
             ax.plot([theta, theta], [0, R_MAX], color=COLOR_IDLE_BD,
-                    linestyle="--", linewidth=1.2, alpha=0.9, zorder=2, label=label)
+                    linestyle="--", linewidth=1.4, alpha=0.9, zorder=2, label=label)
 
-    if predicted_idx is not None and 0 <= predicted_idx < len(bd_angles_deg):
+    if (show_predicted and predicted_idx is not None
+            and 0 <= predicted_idx < len(bd_angles_deg)):
         theta = np.deg2rad(bd_angles_deg[predicted_idx])
         if not correct:
             # Highlight the whole wrong bearing, not just its tip.
@@ -369,7 +380,7 @@ def mark_scene(ax, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
                 label=(
                     f"Inferred BD {predicted_idx + 1} "
                     f"({'correct' if correct else 'wrong'})"
-                    if annotate_labels else None
+                    if label_predicted else None
                 ))
 
     for s_idx, angle_deg in enumerate(scatter_angles_deg):
@@ -377,7 +388,7 @@ def mark_scene(ax, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
             continue
         theta = np.deg2rad(angle_deg)
         ax.plot([theta, theta], [0, R_MAX], color=COLOR_SCATTER,
-                linestyle=":", linewidth=1.6, zorder=1,
+                linestyle=":", linewidth=1.8, zorder=1,
                 label=("Scatterers" if (annotate_labels and s_idx == 0) else None))
 
 
@@ -553,13 +564,13 @@ for sample_idx in show_indices:
     # Figure 1: pattern evolution over the sensing steps
     #################################################
     n_plot = num_steps + 1
-    n_cols = 5
+    n_cols = 4
     n_rows = int(np.ceil(n_plot / n_cols))
     fig, axes = plt.subplots(
         n_rows, n_cols,
-        figsize=(3.0 * n_cols, 3.0 * n_rows),
+        figsize=(4 * n_cols, 3.0 * n_rows),
         subplot_kw={"projection": "polar"},
-        gridspec_kw={"wspace": 0.24, "hspace": 0.45},
+        gridspec_kw={"wspace": 0.18, "hspace": -0.1},
     )
     axes = np.atleast_1d(axes).reshape(-1)
     for empty_idx in range(n_plot, len(axes)):
@@ -571,18 +582,15 @@ for sample_idx in show_indices:
         ax.plot(angles, beam_r_steps[step_idx], color=COLOR_LEARNED,
                 linewidth=1.0, label="Learned beam")
         mark_scene(ax, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
-                   annotate_labels=(step_idx == 0))
-        step_label = f"t={step_idx + 1}" if step_idx < num_steps - 1 else "final"
+                   annotate_labels=False, show_predicted=False)
+        step_label = f"t={step_idx + 1}" if step_idx < num_steps - 1 else "Final"
         ax.set_title(
-            f"{step_label}, SINR$_{{act}}$={sinr_active_db[step_idx]:.2f} dB\n"
-            f"idle max={np.max(np.delete(sinr_idle_db[step_idx], active_idx)):.2f} dB, "
-            f"intf={inter_db[step_idx]:.2f} dB",
-            fontsize=10, pad=2,
+            f"{step_label}, SINR={sinr_active_db[step_idx]:.2f} dB\n"
+            f"Idle BD={np.max(np.delete(sinr_idle_db[step_idx], active_idx)):.2f} dB, "
+            f"Intf={inter_db[step_idx]:.2f} dB",
+            fontsize=10, pad=-19,
         )
-        if step_idx == 0:
-            ax.set_ylabel("Joint gain (dB)", labelpad=18)
-            ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, 0.02),
-                      ncol=2, frameon=True)
+        # ax.set_ylabel("Joint gain (dB)", labelpad=18)
 
     ax_cmp = axes[num_steps]
     setup_polar_axis(ax_cmp)
@@ -591,14 +599,20 @@ for sample_idx in show_indices:
     ax_cmp.plot(angles, beam_r_opt, color=COLOR_OPTIMAL, linewidth=1.0, linestyle="-.",
                 label=f"Optimal ({optimal_db:.2f} dB)")
     mark_scene(ax_cmp, bd_angles_deg, scatter_angles_deg, active_idx, predicted_idx,
-               annotate_labels=False)
-    ax_cmp.set_title(f"Learned vs optimal, gap={optimal_db - learned_final_db:.2f} dB\n"
-                     f"inferred BD {predicted_idx + 1} of {active_idx + 1} ({id_flag_short})",
-                     fontsize=10, pad=2)
-    ax_cmp.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, 0.02), frameon=True)
+               annotate_labels=True, label_predicted=True)
+    ax_cmp.set_title(f"Comparison. Gap={optimal_db - learned_final_db:.2f} dB",
+                    #  f"inferred BD {predicted_idx + 1} of {active_idx + 1} ({id_flag_short})",
+                     fontsize=10, pad=-19)
+    # Single legend for the whole figure, kept on the final panel and in one row.
+    cmp_handles, cmp_labels = ax_cmp.get_legend_handles_labels()
+    ax_cmp.legend(cmp_handles, cmp_labels, fontsize=9, loc="upper center",
+                  bbox_to_anchor=(-0.4, 0.1), ncol=len(cmp_handles), frameon=True,
+                  columnspacing=1.0, handlelength=1.6, handletextpad=0.4,
+                  borderaxespad=0.0)
 
-    fig.subplots_adjust(left=0.035, right=0.98, bottom=0.04, top=0.92)
-    if SAVE_FIGS:
+    fig.subplots_adjust(left=0.035, right=0.98, bottom=0.06, top=0.94,
+                        wspace=0.16, hspace=0.02)
+    if True:
         fig.savefig(os.path.join(FIG_DIR, f"beam_pattern_evolving_{num_users}BD_s{sample_idx}.pdf"),
                     format="pdf", bbox_inches="tight")
     plt.show()
@@ -616,7 +630,7 @@ for sample_idx in show_indices:
     ax2.set_title(f"Active BD {active_idx + 1}, inferred BD {predicted_idx + 1} "
                   f"({id_flag_short})", fontsize=10, pad=12)
     ax2.set_ylabel("Joint gain (dB)", labelpad=16)
-    ax2.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+    ax2.legend(fontsize=9, loc="upper left", bbox_to_anchor=(1.02, 1.0))
     fig2.tight_layout()
     if SAVE_FIGS:
         fig2.savefig(os.path.join(FIG_DIR, f"beam_pattern_compare_{num_users}BD_s{sample_idx}.pdf"),
@@ -649,7 +663,7 @@ for sample_idx in show_indices:
     ax3.set_xlabel("Sensing step $t$")
     ax3.set_ylabel("SINR (dB)")
     ax3.set_xticks(steps_axis)
-    ax3.set_xticklabels([str(t) for t in steps_axis[:-1]] + ["final"])
+    ax3.set_xticklabels([str(t) for t in steps_axis[:-1]] + ["Final"])
     ax3.grid(alpha=0.3)
     ax3.legend(fontsize=7, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.18),
                frameon=False)

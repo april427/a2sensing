@@ -555,24 +555,24 @@ for i, n_tau in enumerate(tau):
             sinr_sweeping_2b_ana.append(sweep_sinr(w_ana, v_ana, H_b, H_SI, Pvec))
 
         ##### Optimal beams from H_hat
-        v_sp, w_sp = compute_optimal_beamformers_2b(
-                                np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=3)
+        # v_sp, w_sp = compute_optimal_beamformers_2b(
+        #                         np.array(H_b_hat_batch), np.array(H_I_hat_batch),1, Pvec, num_restarts=3)
         
-        sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
-                np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
-                np.array(v_sp),np.array(w_sp),1,Pvec,
-        )
-        sinr_opt_hat_2b.append(sinr_opt_2b)
+        # sinr_opt_2b, _, _, _ = compute_beamformer_metrics_batch(
+        #         np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
+        #         np.array(v_sp),np.array(w_sp),1,Pvec,
+        # )
+        # sinr_opt_hat_2b.append(sinr_opt_2b)
 
-        vw_opt = compute_optimal_beamformers_1b(
-                np.array(H_b_hat_batch),np.array(H_I_hat_batch),
-                1,Pvec,num_restarts=3,
-        )
-        sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
-                        np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
-                        np.array(vw_opt),np.array(vw_opt),1,Pvec,
-        )
-        sinr_opt_hat_1b.append(sinr_opt_1b)
+        # vw_opt = compute_optimal_beamformers_1b(
+        #         np.array(H_b_hat_batch),np.array(H_I_hat_batch),
+        #         1,Pvec,num_restarts=3,
+        # )
+        # sinr_opt_1b, _, _, _ = compute_beamformer_metrics_batch(
+        #                 np.array(H_d_batch[:n_opt]),np.array(H_b_batch[:n_opt]),np.zeros_like(H_b_batch[:n_opt]),
+        #                 np.array(vw_opt),np.array(vw_opt),1,Pvec,
+        # )
+        # sinr_opt_hat_1b.append(sinr_opt_1b)
 
 
 
@@ -603,10 +603,10 @@ ax.plot(tau, 10*np.log10(sinr_sweeping_1b.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='--', 
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6,
        label='Beam Sweeping')
-ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
-       marker=methods['iteropti_hat']['marker'], linestyle='--',
-       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-       label='IterOpti_hat')
+# ax.plot(tau, 10*np.log10(sinr_opt_hat_1b.squeeze()), \
+#        marker=methods['iteropti_hat']['marker'], linestyle='--',
+#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+#        label='IterOpti_hat')
 
 ### w ≠ v (solid lines)
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2b], \
@@ -618,10 +618,10 @@ ax.plot(tau, [np.mean(p) for p in rieman_opti_sinr_2b], \
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b_ana.squeeze()), \
        marker=methods['beam_sweep']['marker'], linestyle='-',
        color=methods['beam_sweep']['color'], linewidth=1.2, markersize=6)
-ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
-       marker=methods['iteropti_hat']['marker'], linestyle='-',
-       color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
-       label='IterOpti_hat')
+# ax.plot(tau, 10*np.log10(sinr_opt_hat_2b.squeeze()), \
+#        marker=methods['iteropti_hat']['marker'], linestyle='-',
+#        color=methods['iteropti_hat']['color'], linewidth=1.2, markersize=6,
+#        label='IterOpti_hat')
 ax.plot(tau, 10*np.log10(sinr_sweeping_2b.squeeze()), \
        marker=methods['sweep_dig']['marker'], linestyle='-',
        color=methods['sweep_dig']['color'], linewidth=1.2, markersize=6)
@@ -636,9 +636,9 @@ method_legend = [
         Line2D([0], [0], color=methods['iteropti']['color'], 
                marker=methods['iteropti']['marker'], linestyle='None', 
                markersize=7, label='IterOpti'),
-        Line2D([0], [0], color=methods['iteropti_hat']['color'],
-                marker=methods['iteropti_hat']['marker'], linestyle='None',
-                markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm SI}, \hat{\mathbf{H}}_{\rm b}$'),
+        # Line2D([0], [0], color=methods['iteropti_hat']['color'],
+        #         marker=methods['iteropti_hat']['marker'], linestyle='None',
+        #         markersize=7, label=r'IterOpti $\hat{\mathbf{H}}_{\rm SI}, \hat{\mathbf{H}}_{\rm b}$'),
         Line2D([0], [0], color=methods['beam_sweep']['color'],
                marker=methods['beam_sweep']['marker'], linestyle='None',
                markersize=7, label=r'Sweep (Analog $\mathbf{w}$)'),  
@@ -664,12 +664,12 @@ legend2 = ax.legend(handles=style_legend, loc='lower right',
                    frameon=True, fontsize=9, fancybox=True, framealpha=0.6
                      )
 legend1.set_bbox_to_anchor((0.0, 0.57))
-from matplotlib.transforms import ScaledTranslation
-offset = ScaledTranslation(0, 3 / 72, fig.dpi_scale_trans)  # 2 points upward
-legend1.get_texts()[2].set_transform(legend1.get_texts()[2].get_transform() + offset)
-legend1.legend_handles[2].set_transform(
-    legend1.legend_handles[2].get_transform() + offset
-)
+# from matplotlib.transforms import ScaledTranslation
+# offset = ScaledTranslation(0, 3 / 72, fig.dpi_scale_trans)  # 2 points upward
+# legend1.get_texts()[2].set_transform(legend1.get_texts()[2].get_transform() + offset)
+# legend1.legend_handles[2].set_transform(
+#     legend1.legend_handles[2].get_transform() + offset
+# )
 
 ax.add_artist(legend1)
 
