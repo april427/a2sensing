@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.linalg import hadamard
 import tensorflow.compat.v1 as tf
-from tensorflow.keras.layers import BatchNormalization, Dense
+from tensorflow.keras.layers import BatchNormalization, Dense, LayerNormalization
 
 tf.logging.set_verbosity(tf.logging.ERROR)
 tf.disable_v2_behavior()
@@ -38,17 +38,17 @@ args = parse_args()
 
 ROOT = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 
-snr_value = 10
+snr_value = args.snr
 L_values = [2, 4, 8, 16, 32]
 trained_L = 2
 trained_K = 1
 
 N_tx = args.N_ris
 N_rx = args.N_ris
-tau = 16
+tau = 10
 num_scatters = args.N_scatterers
 Rician_factor = args.rician_factor
-hidden_size = 128
+hidden_size = args.hidden_size
 
 test_size = 800
 batch_size = 100
@@ -56,7 +56,7 @@ seed = 42
 
 fc = args.fc
 Wavelength = 3e8 / fc
-ref_dis = 15 * Wavelength
+ref_dis = 5
 noiseSTD_per_dim = np.sqrt(0.5)
 noise_var = 2 * noiseSTD_per_dim**2
 
@@ -76,30 +76,21 @@ np.random.seed(seed + 10000)
 #####################################################################################
 #                     Network definitions from trained models                      #
 #####################################################################################
-
 class MLPBlock(tf.keras.layers.Layer):
     def __init__(self, num_layers, dims, name):
         super(MLPBlock, self).__init__()
         self.layers_list = []
+        self.num_layers = num_layers
         for ii in range(num_layers - 1):
-            self.layers_list.append(
-                Dense(
-                    units=dims[ii],
-                    activation="relu",
-                    name=name + "_relu_" + str(ii),
-                )
-            )
+            self.layers_list.append(Dense(units=dims[ii], activation='relu', name=name + '_relu_' + str(ii)))
             self.layers_list.append(BatchNormalization())
-        self.layers_list.append(
-            Dense(units=dims[-1], activation="linear", name=name + "_linear")
-        )
+        self.layers_list.append(Dense(units=dims[-1], activation='linear', name=name + '_linear'))
 
     def call(self, inputs, **kwargs):
         x = inputs
-        for layer in self.layers_list:
-            x = layer(x)
+        for ii in range(len(self.layers_list)):
+            x = self.layers_list[ii](x)
         return x
-
 
 class LSTM_Cell(tf.keras.layers.Layer):
     def __init__(self, hidden_size, name):
@@ -148,6 +139,34 @@ def alternating_bd_code(length):
     return np.where(np.arange(length) % 2 == 0, -1.0, 1.0).astype(
         np.float32
     )
+
+
+def checkpoint_normalization_type(checkpoint_path):
+    """Read the saved graph and return the MLP normalization it used."""
+    meta_path = checkpoint_path + ".meta"
+    if not Path(meta_path).is_file():
+        raise FileNotFoundError(f"Checkpoint graph not found: {meta_path}")
+
+    meta_graph = tf.MetaGraphDef()
+    with tf.gfile.GFile(meta_path, "rb") as meta_file:
+        meta_graph.ParseFromString(meta_file.read())
+
+    node_names = [node.name for node in meta_graph.graph_def.node]
+    uses_layer_norm = any(
+        "/layer_normalization" in node_name for node_name in node_names
+    )
+    uses_batch_norm = any(
+        "/batch_normalization" in node_name for node_name in node_names
+    )
+
+    if uses_layer_norm == uses_batch_norm:
+        raise ValueError(
+            "Could not uniquely determine checkpoint normalization from "
+            f"{meta_path}: layer_norm={uses_layer_norm}, "
+            f"batch_norm={uses_batch_norm}."
+        )
+
+    return "layer" if uses_layer_norm else "batch"
 
 
 for L in L_values:
@@ -251,6 +270,19 @@ model_settings = [
 sinr_results = {}
 
 for model_key, model_label, fused_lstm, model_dir in model_settings:
+    checkpoint_name = (
+        f"params_sinr_N_{N_tx}_{N_rx}_tau_{tau}"
+        f"_snr_{snr_value}_K_{trained_K}_Nsc_{num_scatters}"
+    )
+    checkpoint_path = str(model_dir / checkpoint_name)
+
+    if not Path(checkpoint_path + ".index").is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}.index"
+        )
+
+    normalization_type = checkpoint_normalization_type(checkpoint_path)
+
     tf.keras.backend.clear_session()
     model_graph = tf.Graph()
 
@@ -301,11 +333,13 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                 3,
                 [2 * hidden_size, 2 * hidden_size, 2 * N_tx],
                 name="RIS_transmitter",
+                # normalization_type=normalization_type,
             )
             mlp_rx_rx = MLPBlock(
                 3,
                 [2 * hidden_size, 2 * hidden_size, 2 * N_rx],
                 name="Receiver_receiver",
+                # normalization_type=normalization_type,
             )
 
             snr = P * tf.ones(
@@ -455,11 +489,13 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                 3,
                 [2 * hidden_size, 2 * hidden_size, 2 * N_tx],
                 name="MLP_bf_w",
+                # normalization_type=normalization_type,
             )
             MLP_bf_v = MLPBlock(
                 3,
                 [2 * hidden_size, 2 * hidden_size, 2 * N_rx],
                 name="MLP_bf_v",
+                # normalization_type=normalization_type,
             )
 
             if fused_lstm:
@@ -555,7 +591,7 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                 mlp_layer.layers_list[2],
                 mlp_layer.layers_list[4],
             ]
-            batch_norm_layers = [
+            normalization_layers = [
                 mlp_layer.layers_list[1],
                 mlp_layer.layers_list[3],
             ]
@@ -569,7 +605,7 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                     f"{checkpoint_prefix}/bias{suffix}"
                 ] = layer.bias
 
-            for layer_idx, layer in enumerate(batch_norm_layers):
+            for layer_idx, layer in enumerate(normalization_layers):
                 suffix = "" if layer_idx == 0 else f"_{layer_idx}"
                 restore_map[
                     f"{checkpoint_prefix}/gamma{suffix}"
@@ -577,23 +613,13 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
                 restore_map[
                     f"{checkpoint_prefix}/beta{suffix}"
                 ] = layer.beta
-                restore_map[
-                    f"{checkpoint_prefix}/moving_mean{suffix}"
-                ] = layer.moving_mean
-                restore_map[
-                    f"{checkpoint_prefix}/moving_variance{suffix}"
-                ] = layer.moving_variance
-
-        checkpoint_name = (
-            f"params_sinr_N_{N_tx}_{N_rx}_tau_{tau}"
-            f"_snr_{snr_value}_K_{trained_K}_Nsc_{num_scatters}"
-        )
-        checkpoint_path = str(model_dir / checkpoint_name)
-
-        if not Path(checkpoint_path + ".index").is_file():
-            raise FileNotFoundError(
-                f"Checkpoint not found: {checkpoint_path}.index"
-            )
+                if normalization_type == "batch":
+                    restore_map[
+                        f"{checkpoint_prefix}/moving_mean{suffix}"
+                    ] = layer.moving_mean
+                    restore_map[
+                        f"{checkpoint_prefix}/moving_variance{suffix}"
+                    ] = layer.moving_variance
 
         checkpoint_variables = dict(
             tf.train.list_variables(checkpoint_path)
@@ -664,7 +690,8 @@ for model_key, model_label, fused_lstm, model_dir in model_settings:
 
     print(
         f"\nRestoring {model_label}: "
-        f"{len(matched_variables)}/{graph_variable_count} variables"
+        f"{len(matched_variables)}/{graph_variable_count} variables "
+        f"with {normalization_type} normalization"
     )
     if missing_nontrainable:
         print(
@@ -897,7 +924,7 @@ methods = {
 
 fig, ax = plt.subplots(1, 1, figsize=(4.8, 3.5))
 
-for method_name in ["two_lstm", "one_lstm", "beam_sweeping"]:
+for method_name in ["two_lstm",  "beam_sweeping"]:#"one_lstm",
     mean_sinr_db = 10 * np.log10(
         np.mean(sinr_results[method_name], axis=1) + 1e-12
     )

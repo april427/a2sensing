@@ -154,6 +154,8 @@ Wavelength = 3e8 / fc
 noiseSTD_per_dim = np.sqrt(0.5)
 noise_var = 2 * noiseSTD_per_dim**2  # Total noise variance
 
+bd_structural_amp = np.sqrt(0.4)
+
 # Tx/Rx configuration
 location_tx = np.array([0, 0, 0])                     # Tx center location 
 location_rx = np.array([0, 0, 0])                    # Tx and Rx are co-located
@@ -480,7 +482,14 @@ with tf.name_scope("active_sensing_agent"):
         active_user, depth=num_users, dtype=tf.float32,
         name="active_user_mask"
     )
-    
+
+
+    inactive_mask = tf.cast(1.0 - active_mask, tf.complex64)
+    H_b_structural = tf.cast(bd_structural_amp, tf.complex64) * tf.einsum(
+        'bu,burc->brc', inactive_mask, H_b_placeholder,
+        name="inactive_BD_structural_channel"
+    )
+
     for t in range(tau):
         'Initialization at t=0'
         if t == 0:
@@ -508,7 +517,7 @@ with tf.name_scope("active_sensing_agent"):
 
         # Keep the preamble-chip dimension explicit so this graph works for
         # every num_users/preamble_length without per-chip tensor definitions.
-        H_common = H_d_placeholder + H_r_placeholder
+        H_common = H_d_placeholder + H_r_placeholder + H_b_structural
         H_bd_chips = tf.einsum('bpu,burc->bprc', bd_chip_states, H_b_placeholder)
         H_eff = tf.expand_dims(H_common, axis=1) + H_bd_chips
 
@@ -666,8 +675,10 @@ with tf.name_scope("sinr_computation"):
     sig_BD_per_device = tf.abs(bd_amplitudes) ** 2 * lay['P']
     sig_BD = tf.reduce_sum(sig_BD_per_device, axis=1)
     
-    # Interference channel: H_d + H_r
-    H_interference = H_d_placeholder + H_r_placeholder  # (batch, N_rx, N_tx)
+    # Interference channel: H_d + H_r + structural mode of the inactive BDs
+    H_interference = (
+        H_d_placeholder + H_r_placeholder + H_b_structural
+    )  # (batch, N_rx, N_tx)
     
     # Interference power: P * |v^H (H_d + H_r) w|^2
     sig_int = tf.matmul(tf.linalg.adjoint(v_complex), tf.matmul(H_interference, w_complex))  # (batch, 1, 1)
@@ -991,7 +1002,7 @@ with tf.Session() as sess:
         saver.restore(sess, model_ckpt)
         best_val = float(sess.run(loss, feed_dict=feed_dict_val))
         print(f"Restored validation loss baseline: {best_val:.6f}")
-        n_epochs = 5 # If continue training
+        n_epochs = 10 # If continue training
     
     # Early stopping
     wait = 0
@@ -1424,14 +1435,6 @@ def fold_ula_azimuth(angle_rad, sector_start=-np.pi / 2):
 
 # Function to compute 2D beam pattern (azimuth only, elevation = 0)
 def compute_beam_pattern_2d(beamformer, N_h, array_role, num_points=360):
-    """Compute a Tx or Rx response versus the physical scene bearing.
-
-    ``generate_mimo_channel`` builds a monostatic path as
-    ``a_rx(-az) @ a_tx(az).T``. Consequently, the transmit response is
-    ``|a_tx(az).T w|^2`` and the receive response is
-    ``|v.H a_rx(-az)|^2``. Keeping those conventions explicit prevents the
-    plotted lobes from being mirrored relative to the XY scene.
-    """
     if array_role not in ('tx', 'rx'):
         raise ValueError("array_role must be 'tx' or 'rx'")
 

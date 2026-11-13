@@ -35,14 +35,14 @@ def dft_codebook(n, m):
         dft_matrix[:,i-1] = 1/np.sqrt(n) * np.array([np.exp(-1j * np.pi * j *(2 * i - 1 - m)/m) for j in range(n)])
     return dft_matrix
 
-methods = {
-    'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
-    'iteropti': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
-    'beam_sweep': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
-    'beam_sweep_csi': {'color': "#d8b99f", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
-    'sweep_dig': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
-    'iteropti_hat': {'color': '#2ca02c', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
-}
+# methods = {
+#     'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
+#     'iteropti': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
+#     'beam_sweep': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
+#     'beam_sweep_csi': {'color': "#d8b99f", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
+#     'sweep_dig': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
+#     'iteropti_hat': {'color': '#2ca02c', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
+# }
 
 
 def beam_groups(n, m, balanced=True):
@@ -79,16 +79,18 @@ def make_codebook(n, m):
     return grouped_dft_codebook(n, m) if CODEBOOK == 'grouped' else dft_codebook(n, m)
 
 
-def pair_sweep_size(tau):
-    """Beams per side of an analog Tx x analog Rx sweep that must fit in tau slots.
-
-    An analog receiver sees one scalar per slot, so every (v_i, w_j) pair costs a
-    slot of its own: m beams per side => m^2 slots. Under a budget of tau slots
-    the codebooks are therefore only sqrt(tau) wide, not tau wide -- unlike the
-    v = w sweep and the analog-Tx/digital-Rx sweep, which spend one slot per
-    transmit beam and can afford all tau of them.
+def pair_sweep_sizes(tau):
+    """Return the closest integer Tx/Rx factor pair whose product is ``tau``.
     """
-    return max(1, int(np.floor(np.sqrt(tau))))
+    tau = int(tau)
+    if tau < 1:
+        raise ValueError("tau must be a positive integer")
+
+    n_tx_beams = int(np.floor(np.sqrt(tau)))
+    while tau % n_tx_beams:
+        n_tx_beams -= 1
+    n_rx_beams = tau // n_tx_beams
+    return n_tx_beams, n_rx_beams
 
 
 #####################  sounding + channel estimation (shared)  #######################
@@ -255,11 +257,14 @@ def compute_beamformer_metrics_batch(H_d_batch, H_b_batch, H_r_batch, v_batch, w
         sig_bd.astype(np.float32),
         sig_int.astype(np.float32),
     )
-def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
+def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair_tx=None,
+                  CB_pair_rx=None, digital_tx='diag'):
 
     N = CB.shape[0]
-    if CB_pair is None:
-        CB_pair = make_codebook(N, pair_sweep_size(CB.shape[1]))
+    if CB_pair_tx is None or CB_pair_rx is None:
+        n_tx_pair, n_rx_pair = pair_sweep_sizes(CB.shape[1])
+        CB_pair_tx = make_codebook(H_b_hat.shape[1], n_tx_pair)
+        CB_pair_rx = make_codebook(H_b_hat.shape[0], n_rx_pair)
     numerator = np.abs(np.conj(CB).T @ H_b_hat @ CB)**2
     denominator = np.abs(np.conj(CB).T @ H_SI_hat @ CB)**2 + 1/Pvec
 
@@ -277,13 +282,13 @@ def sweep_designs(H_b_hat, H_SI_hat, CB, Pvec, CB_pair=None, digital_tx='diag'):
     v_dig = np.linalg.solve(Pvec*(b) @ np.conj(b).T + np.eye(N), Pvec*a)
     v_dig = v_dig / np.linalg.norm(v_dig)
 
-    # (c) analog Tx and analog Rx picked independently from the codebook.
-    # One slot per beam PAIR, so this sweep runs on the sqrt(tau)-wide codebook.
-    num_pair = np.abs(np.conj(CB_pair).T @ H_b_hat @ CB_pair)**2
-    den_pair = np.abs(np.conj(CB_pair).T @ H_SI_hat @ CB_pair)**2 + 1/Pvec
+    # (c) analog Tx and analog Rx picked independently from separate codebooks.
+    # Their sizes are exact factors of tau, so every sounding slot is used.
+    num_pair = np.abs(np.conj(CB_pair_rx).T @ H_b_hat @ CB_pair_tx)**2
+    den_pair = np.abs(np.conj(CB_pair_rx).T @ H_SI_hat @ CB_pair_tx)**2 + 1/Pvec
     best_rx, best_tx = np.unravel_index(np.argmax(num_pair / den_pair), num_pair.shape)
-    w_ana = CB_pair[:, best_tx][:, np.newaxis]
-    v_ana = CB_pair[:, best_rx][:, np.newaxis]
+    w_ana = CB_pair_tx[:, best_tx][:, np.newaxis]
+    v_ana = CB_pair_rx[:, best_rx][:, np.newaxis]
 
     return (w_same, w_same), (w_same, v_dig), (w_ana, v_ana)
 def sweep_sinr(w, v, H_b, H_SI, Pvec):
@@ -295,7 +300,7 @@ methods = {
     'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
     'iteropti': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
     'beam_sweep': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
-    'beam_sweep_csi': {'color': "#ff7f0e", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
+    'beam_sweep_csi': {'color': "#ff7f0e", 'marker': 's'},   # Orange squares    (analog Rx, perfect SI)
     'sweep_dig': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
     'iteropti_hat': {'color': '#2ca02c', 'marker': '*'}     # Brown stars       (digital Rx, perfect SI)
 }
@@ -320,7 +325,9 @@ tau = 10
 K = 1
 N_scatter = 5
 CB = make_codebook(N_tx, tau)
-CB_pair = make_codebook(N_tx, pair_sweep_size(tau))   # sqrt(tau) per side -> tau slots
+n_tx_pair, n_rx_pair = pair_sweep_sizes(tau)
+CB_pair_tx = make_codebook(N_tx, n_tx_pair)
+CB_pair_rx = make_codebook(N_rx, n_rx_pair)
 snr_const = [-10, -5, 0, 5, 10, 15]
 n_opt = 50 # samples taken for optimal beamforming
 
@@ -410,14 +417,14 @@ for i, snr in enumerate(snr_const):
               sinr_sweep_digiw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
 
-              ##### Analog Tx x analog Rx: one slot per beam PAIR, so the two
-              ##### codebooks are only sqrt(tau) wide to keep the sweep at tau slots.
-              num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
-              den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              ##### Analog Tx x analog Rx: one slot per beam pair. The Tx/Rx
+              ##### codebook sizes are exact factors, so all tau slots are used.
+              num_2b = np.abs(CB_pair_rx.conj().T @ H_b_hat @ CB_pair_tx)**2
+              den_2b = np.abs(CB_pair_rx.conj().T @ H_I_hat @ CB_pair_tx)**2 + 1/Pvec
               metric_2b = num_2b / den_2b
               best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
-              best_v = CB_pair[:, best_idx]        # row index -> Rx beam
-              best_theta = CB_pair[:, best_jdx]    # column index -> Tx beam
+              best_v = CB_pair_rx[:, best_idx]       # row index -> Rx beam
+              best_theta = CB_pair_tx[:, best_jdx]   # column index -> Tx beam
               sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_b @ best_theta)**2 / \
                                    (Pvec * np.abs(np.transpose(np.conj(best_v)) @ H_I @ best_theta)**2 + 1))
 
@@ -802,7 +809,9 @@ for i, n_tau in enumerate(tau):
        test_size = BD_loc.shape[0]
 
        CB = make_codebook(N_tx, n_tau)
-       CB_pair = make_codebook(N_tx, pair_sweep_size(n_tau))  # sqrt(tau) per side
+       n_tx_pair, n_rx_pair = pair_sweep_sizes(n_tau)
+       CB_pair_tx = make_codebook(N_tx, n_tx_pair)
+       CB_pair_rx = make_codebook(N_rx, n_rx_pair)
        M_b = ls_operator(CB)
        M_i = ls_operator(CB)
        H_b_hat_batch = []
@@ -834,7 +843,8 @@ for i, n_tau in enumerate(tau):
                      H_I_hat_batch.append(H_I_hat)
 
               (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                              sweep_designs(H_b_hat, H_I_hat, CB, Pvec, CB_pair)
+                     sweep_designs(H_b_hat, H_I_hat, CB, Pvec,
+                                   CB_pair_tx, CB_pair_rx)
               
               sinr_sweep_1b_anaw.append(sweep_sinr(w_same, v_same, H_b, H_I, Pvec))
               sinr_sweep_digiw.append(sweep_sinr(w_dig, v_dig, H_b, H_I, Pvec))
@@ -858,13 +868,13 @@ for i, n_tau in enumerate(tau):
               #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
               
               # ### Analog Tx and Rx
-              # # One slot per beam PAIR, so both codebooks are sqrt(tau) wide.
-              # num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
-              # den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              # # One slot per beam pair; the codebook sizes multiply to tau.
+              # num_2b = np.abs(CB_pair_rx.conj().T @ H_b_hat @ CB_pair_tx)**2
+              # den_2b = np.abs(CB_pair_rx.conj().T @ H_I_hat @ CB_pair_tx)**2 + 1/Pvec
               # metric_2b = num_2b / den_2b
               # best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
-              # v_test = CB_pair[:, best_idx][:, np.newaxis]      # row index -> Rx beam
-              # theta_test = CB_pair[:, best_jdx][:, np.newaxis]  # column index -> Tx beam
+              # v_test = CB_pair_rx[:, best_idx][:, np.newaxis]      # row -> Rx beam
+              # theta_test = CB_pair_tx[:, best_jdx][:, np.newaxis]  # column -> Tx beam
 
               # sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
               #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
@@ -996,11 +1006,18 @@ plt.tight_layout()
 #####################################################################################
 # ------------------------- Cell, Hidden state or both ----------------------------- #
 #####################################################################################
-
+methods = {
+    'proposed': {'color': '#d62728', 'marker': 'd'},         # Red diamonds
+    'two_lstm': {'color': '#2077b4', 'marker': 'o'},         # Blue circles
+    'cell': {'color': "#ff7f0e", 'marker': 's'},     # Orange pentagons  (analog Rx, est. SI)
+    'hidden': {'color': "#d8b99f", 'marker': 'p'},   # Orange squares    (analog Rx, perfect SI)
+    'fixedSI': {'color': "#9467bd", 'marker': 'v'},      # Brown triangles   (digital Rx, est. SI)
+}
 snr_const = 10 
 tau = [8,16,24]  
 K = 1
-
+N_tx = 36
+N_rx = 36
 sig_pow_opti_recal = []
 int_pow_opti_recal = []
 sinr_opti_recal = []
@@ -1018,12 +1035,12 @@ sinr_2_lstm_fixedSI_opti_sinr = []
 Pvec = 10**(snr_const/10) / (Wavelength**4 / (4 *np.pi *ref_dis)**4) / (N_tx)**2
 
 for i, n_tau in enumerate(tau):
-       filename = os.path.join('Mo_mimo_sinr', \
-            'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
-       data = scipy.io.loadmat(filename)
+       # filename = os.path.join('Mo_mimo_sinr', \
+       #      'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
+       # data = scipy.io.loadmat(filename)
 
-       sinr_test_2_lstm_fixedSI.append(data['sinr_learned'].squeeze())
-       sinr_2_lstm_fixedSI_opti_sinr.append(data['sinr_optimal'].squeeze())
+       # sinr_test_2_lstm_fixedSI.append(data['sinr_learned'].squeeze())
+       # sinr_2_lstm_fixedSI_opti_sinr.append(data['sinr_optimal'].squeeze())
 
        filename = os.path.join('Mo_mimo_sinr_modelsave', \
             'TEST_sinr_N_%d_%d_tau_%d_snr_%d_K_%d_Nsca_%d.mat' % (N_tx, N_rx, n_tau, snr_const, K, num_scatters))
@@ -1065,10 +1082,10 @@ ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2_lstm], \
        color=methods['two_lstm']['color'], linewidth=1.2, markersize=6,
        label='Two LSTM') 
 
-ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2_lstm_fixedSI], \
-       marker=methods['fixedSI']['marker'], linestyle='-',
-       color=methods['fixedSI']['color'], linewidth=1.2, markersize=6,
-       label='2 LSTM (Fixed SI)')
+# ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_2_lstm_fixedSI], \
+#        marker=methods['fixedSI']['marker'], linestyle='-',
+#        color=methods['fixedSI']['color'], linewidth=1.2, markersize=6,
+#        label='2 LSTM (Fixed SI)')
 
 ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_test_both], \
        marker=methods['proposed']['marker'], linestyle='-', 
@@ -1092,8 +1109,8 @@ ax.plot(tau, [10*np.log10(np.mean(p)) for p in sinr_2_lstm_fixedSI_opti_sinr], \
        color=methods['fixedSI']['color'], linewidth=1.2, markersize=6)
 
 
-ax.legend([ax.lines[0], ax.lines[1], ax.lines[2], ax.lines[3], ax.lines[4], ax.lines[5], ax.lines[6]],\
-           ['2 LSTM', '2 LSTM (Fixed SI)', '1 LSTM both', '1 Hidden State Only', '1 Cell State Only', '2 LSTM (Optimal)', '2 LSTM (Fixed SI) (Optimal)'],\
+ax.legend([ax.lines[0], ax.lines[1], ax.lines[2], ax.lines[3], ax.lines[4], ax.lines[5],] \
+           ['2 LSTM', '1 LSTM both', '1 Hidden State Only', '1 Cell State Only', '2 LSTM (Optimal)', '2 LSTM (Fixed SI) (Optimal)'],\
            loc='lower right', fontsize=9, frameon=True, fancybox=True, framealpha=0.6)
 
 ax.set_xlabel('Preamble Length')
@@ -1119,6 +1136,7 @@ N_bd         = 3
 snr_const    = [-10, -5, 0, 5, 10,15]
 
 noise_var    = 1.0      # matches mono_1lstm_mBD.py (2 * noiseSTD_per_dim**2)
+bd_structural_amp = np.sqrt(0.4)  # matches the inactive-BD structural mode
 N_RESTART    = 3        # random restarts of the alternating solver
 MAX_ITER     = 60
 BENCH_SEED   = 2024
@@ -1301,8 +1319,9 @@ for i, snr in enumerate(snr_const):
        # This single sweep serves every baseline -- it is both the beam sweep and
        # the pilot phase for the LS estimate.
        CB   = dft_codebook(N_tx, tau)
-       CB_pair = dft_codebook(N_tx, pair_sweep_size(tau))  # sqrt(tau) per side
-       CB_pair_rx = dft_codebook(N_rx, pair_sweep_size(tau))  # analog Rx side
+       n_tx_pair, n_rx_pair = pair_sweep_sizes(tau)
+       CB_pair_tx = dft_codebook(N_tx, n_tx_pair)
+       CB_pair_rx = dft_codebook(N_rx, n_rx_pair)
        M_b  = ls_operator(CB)
        M_i  = ls_operator(CB)
 
@@ -1322,8 +1341,10 @@ for i, snr in enumerate(snr_const):
               _, H_d, H_r, H_b = generate_mimo_channel(
                      location_tx, location_rx, scatter_loc, bd_loc,
                      N_tx, 1, N_rx, 1)
-              H_I = H_d + H_r
               u_star = int(active_user[j])
+              inactive_bd_mask = np.arange(H_b.shape[0]) != u_star
+              H_b_structural = bd_structural_amp * H_b[inactive_bd_mask].sum(axis=0)
+              H_I = H_d + H_r + H_b_structural
               H_b_true = H_b[u_star]      # scoring always uses the TRUE awake BD
 
               # ---------------- sensing + time despreading ----------------
@@ -1364,10 +1385,10 @@ for i, snr in enumerate(snr_const):
 
               # ------------- beam sweeping without knowing the BD identity -------------
               Zbd, Zc = sense_and_despread_pairs(
-                     H_I, H_b, u_star, CB_pair, CB_pair_rx, L, P, K_file,
+                     H_I, H_b, u_star, CB_pair_tx, CB_pair_rx, L, P, K_file,
                      noise_var, rng)
               v_ana, w_ana, u_hat_sw_a = design_sweep_blind_analog(
-                     Zbd, Zc, CB_pair, CB_pair_rx)
+                     Zbd, Zc, CB_pair_tx, CB_pair_rx)
               run['sweep_analog'].append(true_sinr(v_ana, w_ana, H_b_true, H_I, P))
               acc_sw_a += (u_hat_sw_a == u_star)
 
@@ -1457,9 +1478,9 @@ ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_digital']],
 ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['sweep_analog']],
        marker='s', linestyle='-', color='#ff7f0e', linewidth=1.2, markersize=6,
        label=r'Sweep (Analog $\mathbf{w}$)')
-ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['no_id']],
-       marker='x', linestyle=':', color='#7f7f7f', linewidth=1.2, markersize=6,
-       label='No identification')
+# ax.plot(snr_const, [10*np.log10(np.mean(p)) for p in bench['no_id']],
+#        marker='x', linestyle=':', color='#7f7f7f', linewidth=1.2, markersize=6,
+#        label='No identification')
 
 
 ax.set_xlabel('Effective SNR [dB]')
@@ -1563,7 +1584,9 @@ for i, n_tau in enumerate(tau):
        test_size = BD_loc.shape[0]
 
        CB = make_codebook(N_tx, n_tau)
-       CB_pair = make_codebook(N_tx, pair_sweep_size(n_tau))  # sqrt(tau) per side
+       n_tx_pair, n_rx_pair = pair_sweep_sizes(n_tau)
+       CB_pair_tx = make_codebook(N_tx, n_tx_pair)
+       CB_pair_rx = make_codebook(N_rx, n_rx_pair)
        M_b = ls_operator(CB)
        M_i = ls_operator(CB)
 
@@ -1584,7 +1607,8 @@ for i, n_tau in enumerate(tau):
               H_I_hat = (Ybar_c @ M_i) / np.sqrt(Pvec)
 
               (w_same, v_same), (w_dig, v_dig), (w_ana, v_ana) = \
-                              sweep_designs(H_b_hat, H_I_hat, CB, Pvec, CB_pair)
+                     sweep_designs(H_b_hat, H_I_hat, CB, Pvec,
+                                   CB_pair_tx, CB_pair_rx)
               
               sinr_sweep_1b_anaw.append(sweep_sinr(w_same, v_same, H_b, H_I, Pvec))
               sinr_sweep_digiw.append(sweep_sinr(w_dig, v_dig, H_b, H_I, Pvec))
@@ -1608,13 +1632,13 @@ for i, n_tau in enumerate(tau):
               #                      (Pvec * np.abs(np.transpose(np.conj(theta_test)) @ H_I @ theta_test)**2 + 1))
               
               # ### Analog Tx and Rx
-              # # One slot per beam PAIR, so both codebooks are sqrt(tau) wide.
-              # num_2b = np.abs(CB_pair.conj().T @ H_b_hat @ CB_pair)**2
-              # den_2b = np.abs(CB_pair.conj().T @ H_I_hat @ CB_pair)**2 + 1/Pvec
+              # # One slot per beam pair; the codebook sizes multiply to tau.
+              # num_2b = np.abs(CB_pair_rx.conj().T @ H_b_hat @ CB_pair_tx)**2
+              # den_2b = np.abs(CB_pair_rx.conj().T @ H_I_hat @ CB_pair_tx)**2 + 1/Pvec
               # metric_2b = num_2b / den_2b
               # best_idx, best_jdx = np.unravel_index(np.argmax(metric_2b), metric_2b.shape)
-              # v_test = CB_pair[:, best_idx][:, np.newaxis]      # row index -> Rx beam
-              # theta_test = CB_pair[:, best_jdx][:, np.newaxis]  # column index -> Tx beam
+              # v_test = CB_pair_rx[:, best_idx][:, np.newaxis]      # row -> Rx beam
+              # theta_test = CB_pair_tx[:, best_jdx][:, np.newaxis]  # column -> Tx beam
 
               # sinr_sweep_2b_anaw.append(Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_b @ theta_test)**2 / \
               #                      (Pvec * np.abs(np.transpose(np.conj(v_test)) @ H_I @ theta_test)**2 + 1))
